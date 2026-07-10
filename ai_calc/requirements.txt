@@ -1,0 +1,3 @@
+psutil
+pandas
+huggingface_hub
