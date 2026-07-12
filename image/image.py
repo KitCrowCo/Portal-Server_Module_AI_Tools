@@ -16,7 +16,7 @@ TOOL_META = {"label": "Image", "group": "model_tools", "icon": "&#x1F5BC;", "des
 
 router = APIRouter(redirect_slashes=False)
 _P = "/module/ai_tools/image"
-DATA_DIR = Path("/app/data/module_assets/ai_tools/image")
+DATA_DIR = Path("/app/data/ai_tools/image")
 PROMPTS_DIR = DATA_DIR / "prompts"
 JOB_RECORDS_DIR = DATA_DIR / "job_records"
 INPAINT_DIR = DATA_DIR / "inpaint_inputs"
