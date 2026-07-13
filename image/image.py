@@ -763,7 +763,7 @@ async def system_clear_error():
 
 def _settings_html():
     g = _SETTINGS.get_group("defaults")
-    return f"""<div style="padding:1.5rem;max-width:36rem">
+    return f"""<div style="padding:1.5rem; max-width:36rem; height:100%; overflow-y:auto; box-sizing:border-box;">
         <h2 style="margin:0 0 1rem;font-size:1rem">Image Settings</h2>
         <form hx-post="{_u("settings/save")}" hx-target="#img-settings-status" style="display:flex;flex-direction:column;gap:.5rem">
             {g.render(g.load())}
