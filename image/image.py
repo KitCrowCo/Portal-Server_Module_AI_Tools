@@ -37,7 +37,8 @@ def _conn_options(values=None): return [("", "(none)")] + [(c["_id"], f'{c.get("
 
 def init_tool(env: dict, prefix: str):
     global ENV, UI, WS, IM, TM, _SETTINGS, _P, _gallery_tool, thumb_data_uri
-    ENV = env; _P = prefix.rstrip("/")
+    ENV = env
+    _P = prefix.rstrip("/")
     UI = env["templates"].env.globals.get("UI")
     WS = env["ws"]
     for d in (PROMPTS_DIR, JOB_RECORDS_DIR, INPAINT_DIR):
@@ -62,7 +63,7 @@ def init_tool(env: dict, prefix: str):
                         "inpaint":  {"id":"inpaint","order":1,"label":"Inpaint","icon":"&#x1F58C;"},
                         "gallery":  {"id":"gallery","order":2,"label":"Gallery","icon":"&#x1F5BC;"},
                         "settings": {"id":"settings","order":3,"label":"Settings","icon":"&#x2699;"}}, "active":"generate"})
-    
+
     thumb_data_uri = bi.thumb_data_uri
     _gallery_tool = bi.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image", nesting_level=2, file_manager=_fm())
     # Tab-switch wrapper: update bottom toolbar on tab focus
@@ -78,7 +79,7 @@ def init_tool(env: dict, prefix: str):
 
     for _intent in ("open", "focus", "close"):
         IM.scripts[f"image_{_intent}_tab"] = [_wrap_tab_action(getattr(TM, f"_{_intent}"))]
-        
+
     async def _im_save_mask(request, payload, imr):
         print(f"[image_save_mask] called. mask_data length={len(payload.get('mask_data',''))}")
         mask_data = payload.get("mask_data", "")
@@ -107,25 +108,24 @@ def init_tool(env: dict, prefix: str):
         imr.oob(f'<span style="color:#00ffa2">&#x2713; Saved {_esc(fname)}</span>', "img-mask-status")
         imr.oob(f'<input id="img-mask-path" type="hidden" value="{_esc(rel_path)}">', "img-mask-path", swap="outerHTML")
         return imr
-    
+
     async def _im_select_mask(request, payload, imr):
         rel = payload.get("path", "")
         imr.oob(f'<input id="img-mask-path" type="hidden" name="mask_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-mask-path", swap="outerHTML")
         imr.oob(f'<span id="img-mask-status" style="font-size:.7rem;color:var(--text_muted);flex:1">&#x2713; Using saved mask: {_esc(rel)}</span>', "img-mask-status")
         return imr
-    
+
     async def _im_select_reference(request, payload, imr):
         rel = payload.get("path", "")
         imr.oob(f'<input id="img-ref-path" type="hidden" name="reference_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-ref-path", swap="outerHTML")
         imr.oob(f'<span id="img-ref-status" style="font-size:.65rem;color:var(--text_muted)">Reference: {_esc(rel)}</span>', "img-ref-status", swap="outerHTML")
         return imr
     IM.scripts["image_select_reference"] = [_im_select_reference]
-
     IM.scripts["image_select_mask"] = [_im_select_mask]
     IM.scripts["image_save_mask"] = [_im_save_mask]
     IM.scripts["image_assemble_gif"] = [_im_assemble_gif]
     print("[image] ready")
-    
+
 def _ensure_worker():
     global _WORKER_TASK
     if _WORKER_TASK is None or _WORKER_TASK.done(): _WORKER_TASK = asyncio.create_task(_queue_worker())
@@ -405,35 +405,20 @@ async def generate_submit(request: Request):
     if prompt["status"] != "ready": return HTMLResponse('<span style="color:#ff5f5f">Prompt not encoded yet</span>')
     loras = [{"path": f.get(f"lora_{i}", ""), "scale": float(f.get(f"lora_{i}_scale", 1.0) or 1.0)} for i in range(3) if f.get(f"lora_{i}", "")]
     is_sequence = f.get("is_sequence") == "1"
-    base_form = {"width": int(f.get("width", 512)), "height": int(f.get("height", 512)),
-                 "steps": int(f.get("steps", 4)), "cfg": float(f.get("cfg", 1.0)),
-                 "shift": float(f.get("shift", 1.0)), "seed": int(f.get("seed", -1)),
-                 "batch": max(1, min(int(f.get("batch", 1)), 20 if not is_sequence else 1)),
-                 "output_prefix": f.get("output_prefix", "img").strip() or "img",
-                 "loras": loras,
-                 "offload_mode": f.get("offload_mode", "none")}
+    base_form = {"width": int(f.get("width", 512)), "height": int(f.get("height", 512)), "steps": int(f.get("steps", 4)), "cfg": float(f.get("cfg", 1.0)), "shift": float(f.get("shift", 1.0)), "seed": int(f.get("seed", -1)), "batch": max(1, min(int(f.get("batch", 1)), 20 if not is_sequence else 1)), "output_prefix": f.get("output_prefix", "img").strip() or "img", "loras": loras, "offload_mode": f.get("offload_mode", "none")}
     if is_sequence:
         base_form["num_frames"] = max(2, min(int(f.get("num_frames", 8) or 8), 120))
         base_form["frame_strength"] = float(f.get("frame_strength", 0.35) or 0.35)
     await _ui_state(request, {"form": base_form})
     for i in range(base_form["batch"]):
         job_seed = base_form["seed"] if base_form["seed"] < 0 else base_form["seed"] + i
-        job = {"id": f"job_{uuid.uuid4().hex[:10]}",
-               "username": request.state.user.username,
-               "kind": "sequence" if is_sequence else "txt2img",
-               "status": "queued",
-               "prompt_id": prompt["id"],
-               "params": {**base_form, "seed": job_seed},
-               "batch_index": i,
-               "created": datetime.utcnow().isoformat()}
+        job = {"id": f"job_{uuid.uuid4().hex[:10]}", "username": request.state.user.username, "kind": "sequence" if is_sequence else "txt2img", "status": "queued", "prompt_id": prompt["id"], "params": {**base_form, "seed": job_seed}, "batch_index": i, "created": datetime.utcnow().isoformat()}
         _save("job", job)
     _ensure_worker()
     label = "GIF sequence" if is_sequence else f"{base_form['batch']} job(s)"
     return HTMLResponse(f'<span style="color:var(--accent)">&#x2713; Queued {label}</span>')
 
 # --- Inpainting ---
-
-# <input id="img-ref-path" type="hidden" name="reference_path" form="img-inpaint-form" value="">
 
 def _inpaint_panel_html(prompts, selected_prompt_id):
     """Canvas panel only — controls live in the bottom toolbar."""
@@ -552,16 +537,7 @@ async def inpaint_submit(request: Request):
         form["height"] = max(32, (ih // 32) * 32)
     except Exception as e:
         pass  # use form defaults
-    job = {"id": f"job_{uuid.uuid4().hex[:10]}",
-           "username": username,
-           "kind": "inpaint",
-           "status": "queued",
-           "prompt_id": prompt_id,
-           "image_path": image_path,
-           "mask_path": mask_path,   # relative path on shared volume
-           "reference_path": reference_path,
-           "params": {**form, "strength": strength},
-           "created": datetime.utcnow().isoformat()}
+    job = {"id": f"job_{uuid.uuid4().hex[:10]}", "username": username, "kind": "inpaint", "status": "queued", "prompt_id": prompt_id, "image_path": image_path, "mask_path": mask_path, "reference_path": reference_path, "params": {**form, "strength": strength}, "created": datetime.utcnow().isoformat()}
     _save("job", job)
     _ensure_worker()
     return HTMLResponse('<span style="color:var(--accent)">&#x2713; Inpaint queued</span>')
@@ -828,10 +804,8 @@ async def _im_assemble_gif(request, payload, imr):
         imr.oob('<span style="color:#ff5f5f">No sequence name</span>', "img-assemble-status")
         return imr
     out_name, n = assemble_gif(seq_dir, frame_ms=frame_ms, loop=loop)
-    if not out_name:
-        imr.oob(f'<span style="color:#ff5f5f">Need ≥2 frames, found {n}</span>', "img-assemble-status")
-    else:
-        imr.oob(f'<span style="color:var(--accent)">&#x2713; {n} frames → {out_name}</span>', "img-assemble-status")
+    if not out_name: imr.oob(f'<span style="color:#ff5f5f">Need ≥2 frames, found {n}</span>', "img-assemble-status")
+    else: imr.oob(f'<span style="color:var(--accent)">&#x2713; {n} frames → {out_name}</span>', "img-assemble-status")
     return imr
 
 def assemble_gif(sequence_dir: str, frame_ms: int = 120, fps=None, loop: bool = True, output_name=None):
