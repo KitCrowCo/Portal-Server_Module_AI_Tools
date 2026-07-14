@@ -440,12 +440,6 @@ def _inpaint_panel_html(prompts, selected_prompt_id):
                     </div>
                 </div>""")
 
-
-    ...
-    # replace the two static lines for img-mask-path / img-mask-status with:
-    # <input id="img-mask-path" type="hidden" name="mask_path" form="img-inpaint-form" value="{_esc(selected_mask)}">
-    # <span id="img-mask-status" ...>{mask_status}</span>
-
 def _bottom_toolbar_generate_html(sequence_state: dict):
     return f"""<div id="img-seq-fields" style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;padding:.4rem .6rem">
                    <span style="font-size:.7rem;color:var(--text_muted);text-transform:uppercase">Assemble GIF</span>
@@ -458,10 +452,7 @@ def _bottom_toolbar_generate_html(sequence_state: dict):
 
 def _bottom_toolbar_inpaint_html(prompts, selected_prompt_id, selected_mask=""):
     p_opts = "".join(f'<option value="{p["id"]}" {"selected" if p["id"]==selected_prompt_id else ""}>{_esc(p["title"])} {"&#x2713;" if p["status"]=="ready" else ""}</option>' for p in prompts)
-    # <input id="img-mask-path" type="hidden" name="mask_path" form="img-inpaint-form" value="{_esc(selected_mask)}">
-    # <span id="img-mask-status" ...>{mask_status}</span>
     mask_status = f"&#x2713; Using saved mask: {_esc(selected_mask)}" if selected_mask else "No mask saved yet — draw then Save Mask, or pick a saved one above."
-
     return f"""<div style="display:flex;flex-direction:column;gap:.05rem;padding:.05rem .2rem">
                    <input type="hidden" id="img-base-path" value="">
                    <div style="display:flex;gap:.05rem;flex-wrap:wrap;align-items:center">
