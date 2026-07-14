@@ -828,7 +828,7 @@ def assemble_gif(sequence_dir: str, frame_ms: int = 120, fps=None, loop: bool = 
 async def _render_panel(request, state):
     active = state.get("active", "generate")
     s = await _ui_state(request)
-    if active == "inpaint": return state, _inpaint_panel_html(_list("prompt"), s["selected_prompt_id"], s["selected_mask"])
+    if active == "inpaint": return state, _inpaint_panel_html(_list("prompt"), s["selected_prompt_id"])
     if active == "gallery": return state, f'<div style="height:100%">{_gallery_tool.render_shell()}</div>'
     if active == "settings": return state, _settings_html()
     conn = _conn("image_gen_conn_id")
