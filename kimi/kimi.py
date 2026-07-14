@@ -102,6 +102,8 @@ async def _left_panel(request):
                     <div style="padding:.5rem;border-top:var(--border-thick) solid var(--border)">
                         <button class="ui-btn" style="width:100%;justify-content:center" hx-post="{_u('ingest_selected')}" hx-target="#kg-ingest-log" hx-swap="innerHTML">&#x2191; Ingest Selected</button>
                         <div id="kg-ingest-log" style="font-size:.72rem;margin-top:.4rem;max-height:8rem;overflow-y:auto;font-family:var(--font-mono)"></div>
+                        <button class="ui-btn" style="width:100%;margin-top:.3rem" hx-post="{_u('sync_now')}" hx-target="#kg-sync-status" hx-swap="innerHTML">&#x21BB; Sync Now</button>
+                        <div id="kg-sync-status" style="font-size:.7rem;margin-top:.2rem"></div>
                     </div>
                     <div id="kg-modal"></div>
                 </div>"""
@@ -148,6 +150,8 @@ async def _panel_docs(request):
             if isinstance(rows, dict): rows = [v for vs in rows.values() for v in (vs if isinstance(vs, list) else [vs])]
             if rows and isinstance(rows[0], dict):
                 headers = list(rows[0].keys())
+                priority = [h for h in headers if any(k in h.lower() for k in ("file","path","name","source"))]
+                headers = priority + [h for h in headers if h not in priority]
                 body = UI.table(headers, [[str(row.get(h,""))[:80] for h in headers] for row in rows])
             else:
                 body = f'<pre style="font-size:.72rem;white-space:pre-wrap">{_esc(json.dumps(r, indent=2))}</pre>'
@@ -340,3 +344,8 @@ async def _scheduled_sync_loop():
         await asyncio.sleep(900)
 
 def right_panel() -> str: return """<div class="ait-rp"><div class="ait-rp-hd">Kimi</div><div style="font-size:.72rem;color:var(--text_muted);padding:.3rem">Knowledge Integration Manager - pick a knowledge group and ingest sources from the left panel.</div></div>"""
+
+@router.post("/sync_now", response_class=HTMLResponse)
+async def sync_now(request: Request):
+    asyncio.create_task(_run_sync_pass())
+    return HTMLResponse('<span style="color:var(--accent);font-size:.7rem">&#x2713; Sync started (running in background)</span>')

@@ -316,7 +316,7 @@ def _conv_item(c, active, org):
         </div>
         <details style="font-size:.6rem;color:var(--text_muted)" onclick="event.stopPropagation()"><summary style="list-style:none;cursor:pointer;user-select:none">&#x25B8;</summary><div style="display:flex;justify-content:space-between;padding:.15rem 0">{folder_sel}</div></details>
     </div>"""
-       
+
 def _left(username, active=""):
     global cfg
     org = _org(username)
@@ -563,11 +563,14 @@ async def admin(request: Request):
     if getattr(request.state.user, "role", "") != "admin": return HTMLResponse("Denied")
     all_data = cfg.get_all()
     group = cfg.get_group("general")
-    return HTMLResponse(f"""<form hx-post="{_u("admin","save")}" hx-target="#status" style="padding:0.5rem;">
-                                <div id="athena-admin-fields">{group.render(all_data.get("general", {}))}</div>
-                                <button type="submit" class="button" style="margin-top:1rem;">Save Settings</button>
-                                <div id="status" style="margin-top:0.5rem; font-size:0.75rem; color:#00ffa2;"></div>
-                            </form>""")
+    return HTMLResponse(f"""<div style="padding:0.5rem;position:relative">
+        <button type="button" class="close-btn" style="position:absolute;top:.2rem;right:.2rem" hx-get="{_u()}" hx-target="#ait-workspace" hx-swap="innerHTML">&#x2715;</button>
+        <form hx-post="{_u("admin","save")}" hx-target="#status">
+            <div id="athena-admin-fields">{group.render(all_data.get("general", {}))}</div>
+            <button type="submit" class="button" style="margin-top:1rem;">Save Settings</button>
+            <div id="status" style="margin-top:0.5rem; font-size:0.75rem; color:#00ffa2;"></div>
+        </form>
+    </div>""")
 
 @router.get("/admin/fields")
 async def admin_fields(request: Request):
