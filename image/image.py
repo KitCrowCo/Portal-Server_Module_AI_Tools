@@ -41,9 +41,7 @@ def init_tool(env: dict, prefix: str):
     _P = prefix.rstrip("/")
     UI = env["templates"].env.globals.get("UI")
     WS = env["ws"]
-    for d in (PROMPTS_DIR, JOB_RECORDS_DIR, INPAINT_DIR):
-        d.mkdir(parents=True, exist_ok=True)
-
+    for d in (PROMPTS_DIR, JOB_RECORDS_DIR, INPAINT_DIR): d.mkdir(parents=True, exist_ok=True)
     bi = env["tools"]["built_ins"]
     _SETTINGS = bi.SettingsPanel("Image", [bi.SettingsGroup("defaults", "Defaults", [
         bi.SettingField("text_encoder_conn_id", "Text Encoder Connection", "select", "", options=_conn_options),
@@ -56,14 +54,12 @@ def init_tool(env: dict, prefix: str):
         bi.SettingField("vae_tiling", "VAE Tiling", "checkbox", True),
         bi.SettingField("offload_mode", "Memory Offload Mode", "select", "none", options=[("none", "None (fastest, most VRAM)"), ("vae_cpu", "VAE CPU Offload (~1 GB freed, slower)")]),
     ], json_path=str(DATA_DIR / "settings.json"))])
-
     IM = env["InterfaceManager"](nesting_level=2, db_path="ai_tools/image_im.db")
     TM = bi.TabManager(namespace="image", tab_bar_id="img-tab-bar", content_id="img-panel", render_content_fn=_render_panel, intent_prefix="image", IM=IM, scope="user", nesting_level=2, allow_new=False, closable=False,
         empty={"tabs": {"generate": {"id":"generate","order":0,"label":"Generate","icon":"&#x25B6;"},
                         "inpaint":  {"id":"inpaint","order":1,"label":"Inpaint","icon":"&#x1F58C;"},
                         "gallery":  {"id":"gallery","order":2,"label":"Gallery","icon":"&#x1F5BC;"},
                         "settings": {"id":"settings","order":3,"label":"Settings","icon":"&#x2699;"}}, "active":"generate"})
-
     thumb_data_uri = bi.thumb_data_uri
     _gallery_tool = bi.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image", nesting_level=2, file_manager=_fm())
     # Tab-switch wrapper: update bottom toolbar on tab focus
@@ -77,8 +73,7 @@ def init_tool(env: dict, prefix: str):
             return imr
         return _h
 
-    for _intent in ("open", "focus", "close"):
-        IM.scripts[f"image_{_intent}_tab"] = [_wrap_tab_action(getattr(TM, f"_{_intent}"))]
+    for _intent in ("open", "focus", "close"): IM.scripts[f"image_{_intent}_tab"] = [_wrap_tab_action(getattr(TM, f"_{_intent}"))]
 
     async def _im_save_mask(request, payload, imr):
         print(f"[image_save_mask] called. mask_data length={len(payload.get('mask_data',''))}")

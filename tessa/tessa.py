@@ -21,7 +21,7 @@ DATA_DIR = Path("./data/ai_tools/tessa")
 PROJ_DIR = DATA_DIR / "projects"
 
 ENV = {}
-UI = WS = IM = CM = _SETTINGS = None
+UI = WS = IM = CM = BI = PE = _SETTINGS = None
 _ACTIVE: set = set()
 _STOP: dict = {}
 _PIPE_TASKS: dict = {}
@@ -45,7 +45,7 @@ STEP_PROMPTS_FILE = DATA_DIR / "step_prompts.json"
 
 def _load_step_prompts(): return json.loads(STEP_PROMPTS_FILE.read_text()) if STEP_PROMPTS_FILE.exists() else []
 def _save_step_prompts(p): STEP_PROMPTS_FILE.write_text(json.dumps(p, indent=2))
-    
+
 def _list_projects(username):
     if not PROJ_DIR.exists(): return []
     out = []
@@ -148,27 +148,55 @@ def get_model_options(values=None):
     return [(m, m) for m in list_models_sync(conn)] if conn else []
 
 def init_tool(env:dict, prefix:str):
-    global ENV, UI, WS, IM, CM, _SETTINGS
+    global ENV, UI, WS, IM, CM, BI, PE, _SETTINGS, AIM
     ENV = env
     UI = env["templates"].env.globals.get("UI")
     WS = env["ws"]
     for d in (PROJ_DIR, KG_DIR, DATA_DIR/"versions"): d.mkdir(parents=True, exist_ok=True)
-    bi = env["tools"]["built_ins"]
-    conn_opts = [("","(none)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in list_conns()]
-    _SETTINGS = bi.SettingsPanel("Tessa", [
-        bi.SettingsGroup("defaults", "Defaults", [
-            bi.SettingField("title", "Title", "text", "Tessa"),
-            bi.SettingField("conn_id", "Default Connection", "select", options=conn_opts),
-            bi.SettingField("model", "Default Model", "select", options=get_model_options),
-            bi.SettingField("model_ctx", "Context Tokens", "number", 32768),
-            bi.SettingField("system_prompt", "Default System Prompt", "textarea", "You are a helpful AI assistant."),
-            bi.SettingField("chunk_tokens", "Default Chunk Tokens", "number", 6000),
-            bi.SettingField("auto_snapshot", "Auto-snapshot on save", "checkbox", False),
-        ], json_path=str(DATA_DIR / "settings.json")),
-    ])
+    BI = env["tools"]["built_ins"]
+    AIM = ENV["tools"]["ai_manager"]
+    _SETTINGS = BI.SettingsPanel("Tessa", [BI.SettingsGroup("defaults", "Defaults", [BI.SettingField("title", "Title", "text", "Tessa"),
+                                                                                     BI.SettingField("conn_id", "Default Connection", "select", options=[("","(none)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in list_conns()]),
+                                                                                     BI.SettingField("model", "Default Model", "select", options=get_model_options),
+                                                                                     BI.SettingField("model_ctx", "Context Tokens", "number", 32768),
+                                                                                     BI.SettingField("system_prompt", "Default System Prompt", "textarea", "You are a helpful AI assistant."),
+                                                                                     BI.SettingField("chunk_tokens", "Default Chunk Tokens", "number", 6000),
+                                                                                     BI.SettingField("auto_snapshot", "Auto-snapshot on save", "checkbox", False)], json_path=str(DATA_DIR / "settings.json"))])
     IM = env["InterfaceManager"](nesting_level=2, db_path="tessa_im.db")
-    CM = bi.ChatManager(namespace="tessa", base_url=_u(), view_style="bubble", stream_toggle=True, think_toggle=True, stop_enabled=True, pin_enabled=True, allow_edit=True, allow_delete=True, allow_copy=True, show_info=False, markdown_mode="standard", placeholder="Chat about this project\u2026 (Ctrl+Enter)", branch_id=IM.branch_id, nesting_level=2)
+    CM = BI.ChatManager(namespace="tessa", base_url=_u(), view_style="bubble", stream_toggle=True, think_toggle=True, stop_enabled=True, pin_enabled=True, allow_edit=True, allow_delete=True, allow_copy=True, show_info=False, markdown_mode="standard", placeholder="Chat about this project\u2026 (Ctrl+Enter)", branch_id=IM.branch_id, nesting_level=2)
+
+    class _TessaEditor(BI.PortalEditor):
+        """PortalEditor already turns save/settings/preview/rename/search/info/clean/toggle_task into IM intents when constructed with IM
+        Only override the two/three methods that need to persist into Tessa's own per-project JSON instead of a FileManager file."""
+        async def _get_doc_from_state(self, request, payload):
+            pid = payload.get("branch", "default"); doc = _load(pid)
+            return {"id": pid, "title": (doc or {}).get("title","Untitled"), "content": payload.get("content", (doc or {}).get("content","")), "settings": (doc or {}).get("settings",{})}
+        async def _im_save(self, request, payload, imr):
+            pid = payload.get("branch", "default"); doc = _load(pid)
+            if not doc or doc.get("username") != request.state.user.username: return imr.raw('<span style="color:#ff5f5f;font-size:.7rem">&#x26A0; denied</span>')
+            doc["content"] = payload.get("content", ""); _save(doc)
+            s = doc.get("settings", {})
+            imr.oob(self.render_preview(doc["content"], zoom=s.get("zoom",1.0), task_interactive=s.get("interactive",False), doc_id=pid), f"editor-preview-{pid}")
+            return imr.raw('<span style="color:var(--accent);font-size:.7rem">&#x2713;</span>')
+        async def _im_settings(self, request, payload, imr):
+            pid = payload.get("branch", "default"); doc = _load(pid)
+            if not doc: return imr
+            s = doc.setdefault("settings", {})
+            for k in ("view","wrap","font","zoom","border","interactive"):
+                if k in payload: s[k] = payload[k]
+            _save(doc)
+            return imr.raw(self.render_shell({"id": pid, "title": doc.get("title","Untitled"), "content": doc.get("content",""), "settings": s}, include_css=False))
+        async def _im_rename(self, request, payload, imr):
+            pid = payload.get("branch", ""); doc = _load(pid)
+            if doc:
+                doc["title"] = payload.get("value","").strip() or "Untitled"; _save(doc)
+                imr.oob(_proj_list_html(request.state.user.username, pid), "tessa-proj-list")
+            return imr.raw(f'<input id="doc-title-{pid}" type="text" value="{_esc(payload.get("value",""))}" name="value" class="doc-title-input">')
+    PE = _TessaEditor(base_url=_u(), autosave_delay="2000ms", enable_graphviz=True, enable_ai=True, IM=IM, nesting_level=2, intent_prefix="tessa_doc")
     IM.scripts["submit"] = [_handle_submit]
+    IM.scripts.update({"tessa_doc_apply_ai": [_h_doc_apply_ai], "tessa_doc_conn": [_h_doc_conn], "tessa_doc_model": [_h_doc_model], "tessa_doc_ctx": [_h_doc_ctx], "tessa_files_toggle": [_h_files_toggle]})
+    AIM.steps.register_step_type("chunked_file_pass", _step_tessa_file_pass, "Chunked File Pass",{"conn_id":"select","model":"select","system_prompt":"textarea","user_template":"textarea","chunk_tokens":"number","use_selected":"checkbox","input_source":"text","result_key":"text"})
+    AIM.steps.register_step_type("chunked_synthesis", _step_tessa_synthesis, "Chunked Synthesis", {"conn_id":"select","model":"select","system_prompt":"textarea","user_template":"textarea","chunk_tokens":"number","result_key":"text"})
     print("[tessa] ready")
 
 # --- Chat Stream ---
@@ -230,148 +258,6 @@ async def _do_stream(username, payload, pid):
     finally:
         _STREAM_TASKS.pop(pid, None)
 
-# --- Pipeline Execution ---
-
-async def _run_pipeline(pid, pl_id, username):
-    doc = _load(pid)
-    if not doc: return
-    pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-    if not pl: return
-    pl["state"] = "running"; _save(doc)
-
-    async def _push():
-        d2 = _load(pid)
-        if not d2: return
-        p2 = next((p for p in d2.get("pipelines",[]) if p["id"]==pl_id), None)
-        if not p2: return
-        card = f'<div id="tessa-pipeline-{pl_id}" hx-swap-oob="outerHTML">{_pipeline_card(d2, p2)}</div>'
-        bar  = f'<div id="tessa-pipe-bar" hx-swap-oob="innerHTML">{_pipe_progress_html(d2, pl_id)}</div>'
-        await WS.send_personal_message(card + bar, username)
-
-    for idx in range(pl.get("current_step",0), len(pl.get("steps",[]))):
-        doc = _load(pid); pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-        if not pl or pl.get("state") != "running": break
-        if _STOP.pop(f"pl_{pl_id}", False): pl["state"] = "paused"; _save(doc); await _push(); return
-        step = pl["steps"][idx]; step["state"] = "running"; pl["current_step"] = idx
-        _save(doc); await _push()
-        ok = await _exec_step(pid, pl_id, step, username)
-        doc = _load(pid); pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-        if not pl: break
-        if not ok:
-            if step.get("state") != "paused": step["state"] = "error"
-            _save(doc); await _push(); break
-        step["state"] = "done"; pl["current_step"] = idx+1; _save(doc); await _push()
-        if step.get("pause_after") and idx+1 < len(pl.get("steps",[])):
-            pl["state"] = "paused"; _save(doc); await _push(); return
-
-    _STOP.pop(f"pl_{pl_id}", None)
-    doc = _load(pid); pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-    if pl and pl.get("state") == "running":
-        pl["state"] = "paused" if any(s.get("state")=="paused" for s in pl.get("steps",[])) else "done"
-        _save(doc)
-    await _push()
-    _PIPE_TASKS.pop(pl_id, None)
-    doc = _load(pid)
-    if doc:
-        ed = ENV["tools"]["built_ins"].PortalEditor(base_url=_u())
-        await WS.send_personal_message(f'<div id="tessa-center" hx-swap-oob="innerHTML">{ed.render_shell(doc)}</div>', username)
-
-async def _exec_step(pid, pl_id, step, username):
-    doc = _load(pid)
-    conn = get_conn(step.get("conn_id","") or doc.get("conn_id",""))
-    model = step.get("model","") or doc.get("model","")
-    if not conn or not model: step["state"] = "error"; return False
-
-    num_ctx = step.get("model_ctx", doc.get("model_ctx", 32768))
-    chunk_tokens = step.get("chunk_tokens", 6000)
-    sys_p = step.get("system_prompt","").strip()
-    tpl = step.get("user_template","").strip() or "{chunk_content}"
-    sep = step.get("output_separator","\n\n---\n\n")
-    prog = step.setdefault("progress", {"file_queue":[],"files_done":[],"current_file":"","log":[]})
-
-    def _save_prog():
-        d = _load(pid)
-        pl = next((p for p in d.get("pipelines",[]) if p["id"]==pl_id), None)
-        if pl:
-            s = next((s for s in pl.get("steps",[]) if s.get("id")==step.get("id")), None)
-            if s: s["progress"] = prog
-            _save(d)
-
-    if step.get("type") == "synthesis":
-        doc = _load(pid); content = doc.get("content","").strip()
-        if not content: step["state"] = "done"; return True
-        chunks = _chunk_text(content, chunk_tokens)
-        for ci, chunk in enumerate(chunks):
-            if _STOP.get(f"pl_{pl_id}"): step["state"] = "paused"; return False
-            user_msg = tpl.replace("{chunk_content}",chunk).replace("{chunk_number}",str(ci+1)).replace("{chunks_total}",str(len(chunks)))
-            msgs = ([] if not sys_p else [{"role":"system","content":sys_p}]) + [{"role":"user","content":user_msg}]
-            full = ""
-            async for text, _tb, done, err in _stream(conn, msgs, model, num_ctx):
-                if _STOP.get(f"pl_{pl_id}"): step["state"] = "paused"; return False
-                if err: prog["log"].append(f"Err chunk {ci+1}: {err[:60]}"); break
-                if text: full += text
-                if full: await WS.send_personal_message(f"""<div id="tessa-pl-stream-{pl_id}" hx-swap-oob="innerHTML"><code style="font-size:.63rem">{_esc(full[-200:])}</code></div><div id="tessa-pl-stream-active" hx-swap-oob="innerHTML"><code style="font-size:.63rem">{_esc(full[-400:])}</code></div>""", username)
-                if done: break
-            if full:
-                doc = _load(pid)
-                doc["content"] += f"\n\n{full.strip()}{sep}"
-                _save(doc)
-        step["state"] = "done"
-        return True
-
-    # file_pass
-    if not prog.get("file_queue") and not prog.get("files_done"):
-        if step.get("use_selected"):
-            doc_cur = _load(pid)
-            prog["file_queue"] = sorted(f for f in (doc_cur.get("selected_files",[]) if doc_cur else []) if (KG_DIR/f).is_file())
-        else:
-            src = step.get("input_source","").strip("/")
-            base = KG_DIR/src if src else KG_DIR
-            prog["file_queue"] = sorted(str(f.relative_to(KG_DIR)) for f in base.rglob("*") if f.is_file() and not f.name.startswith(".")) if base.exists() else []
-        if not prog["file_queue"]:
-            step["state"] = "done"; _save_prog(); return True
-
-    while prog.get("file_queue"):
-        if _STOP.pop(f"pl_{pl_id}", False): step["state"] = "paused"; _save_prog(); return False
-        cur = prog["file_queue"][0]
-        prog["current_file"] = cur; prog["current_chunk"] = 0; prog["chunks_total"] = 0
-        _save_prog()
-        try: file_content = (KG_DIR/cur).read_text(encoding="utf-8", errors="ignore")
-        except Exception as e: prog["log"].append(f"Read error {cur}: {e}"); prog["file_queue"].pop(0); continue
-
-        chunks = _chunk_text(file_content, chunk_tokens)
-        prog["chunks_total"] = len(chunks); _save_prog()
-
-        for ci, chunk in enumerate(chunks):
-            if _STOP.pop(f"pl_{pl_id}", False): step["state"] = "paused"; _save_prog(); return False
-            prog["current_chunk"] = ci + 1; _save_prog()
-            user_msg = (tpl.replace("{file_name}", pathlib.Path(cur).name).replace("{file_path}", cur)
-                           .replace("{chunk_number}", str(ci+1)).replace("{chunks_total}", str(len(chunks)))
-                           .replace("{chunk_content}", chunk))
-            msgs = ([] if not sys_p else [{"role":"system","content":sys_p}]) + [{"role":"user","content":user_msg}]
-            full = ""
-            async for text, _tb, done, err in _stream(conn, msgs, model, num_ctx):
-                if _STOP.get(f"pl_{pl_id}"): step["state"] = "paused"; _save_prog(); return False
-                if err: prog["log"].append(f"Err {cur} c{ci+1}: {err[:60]}"); break
-                if text: full += text
-                if full: await WS.send_personal_message(
-                    f"""<div id="tessa-pl-stream-{pl_id}" hx-swap-oob="innerHTML"><code style="font-size:.63rem">{_esc(full[-200:])}</code></div>""", username)
-                if done: break
-            if full:
-                doc = _load(pid)
-                doc["content"] += f"\n\n<!-- {_esc(step.get('name','step'))} | {_esc(cur)} chunk {ci+1}/{len(chunks)} -->\n{full.strip()}{sep}"
-                _save(doc)
-            prog["log"] = (prog["log"] + [f"{cur} c{ci+1}/{len(chunks)} +{_tok(full)}t"])[-30:]
-
-        prog["files_done"].append(prog["file_queue"].pop(0))
-        prog["current_file"] = ""; prog["current_chunk"] = 0; prog["chunks_total"] = 0
-        _save_prog()
-        d = _load(pid)
-        if d: await WS.send_personal_message(f'<div id="tessa-pipe-bar" hx-swap-oob="innerHTML">{_pipe_progress_html(d, pl_id)}</div>', username)
-
-    step["state"] = "done"
-    return True
-    
 # --- HTML Builders ---
 
 def _proj_list_html(username, active_id=""):
@@ -396,207 +282,296 @@ def _kg_html(doc):
     tree = UI.tree(items=KG_DIR, mode="file", selectable=True, selected=selected, post_url=_u("files/toggle", pid), target="#tessa-kg-section", swap="outerHTML") if KG_DIR.exists() else '<div style="font-size:.7rem;color:var(--text_muted);padding:.2rem .4rem">No knowledge files yet.</div>'
     return (f"""<div id="tessa-kg-section" style="border-top:var(--border-thick) solid var(--border)"><details><summary style="padding:.3rem .45rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.3rem">&#x1F4DA; Knowledge {badge}</summary><div style="max-height:28vh;overflow-y:auto;padding:.25rem .4rem">{tree}</div><form hx-post="{_u("kg/upload",pid)}" hx-target="#tessa-kg-section" hx-swap="outerHTML" hx-encoding="multipart/form-data" style="padding:.2rem .4rem;border-top:var(--border-thick) solid var(--border)"><label class="btn-icon" style="cursor:pointer;font-size:.7rem;width:100%;justify-content:center" title="Upload knowledge files">&#x2B06; Upload files<input type="file" name="files" multiple style="display:none" onchange="this.closest('form').requestSubmit()"></label></form></details></div>""")
 
-def _kg_dir_selector_html(selected="", base=None, depth=0):
-    base = base or KG_DIR
-    if not base.exists(): return '<div style="color:var(--text_muted);font-size:.7rem;padding:.3rem">No knowledge files.</div>'
-    pad = f"padding-left:{.4 + depth*.8:.1f}rem"
-    out = ""
-    if depth == 0:
-        sel_style = "background:var(--accent_dim);color:var(--accent);" if selected == "" else ""
-        out += f'<div class="kg-dir-opt" data-path="" style="{sel_style}padding:.22rem .4rem;cursor:pointer;font-size:.74rem;border-bottom:var(--border-thick) solid var(--border)" onclick="setStepSrc(this,\'\')">/ All files</div>'
-    for d in sorted([x for x in base.iterdir() if x.is_dir() and not x.name.startswith(".")], key=lambda x: x.name):
-        rel = str(d.relative_to(KG_DIR))
-        sel_style = "background:var(--accent_dim);color:var(--accent);" if rel == selected else ""
-        fc = sum(1 for _ in d.rglob("*") if _.is_file())
-        out += f'<div class="kg-dir-opt" data-path="{rel}" style="{sel_style}{pad};padding:.22rem .4rem;cursor:pointer;font-size:.74rem;border-bottom:var(--border-thick) solid var(--border)" onclick="setStepSrc(this,\'{rel}\')">\u25B6 {d.name}/ <span style="opacity:.5;font-size:.63rem">({fc})</span></div>'
-        out += _kg_dir_selector_html(selected, d, depth+1)
-    return out
-
-def _pipe_progress_html(doc=None, pl_id=None):
-    """Bottom bar content: compact when idle, detailed when running."""
-    if not doc: return '<div style="padding:.2rem .8rem;font-size:.72rem;color:var(--text_muted);display:flex;align-items:center;gap:.5rem">&#x26A1; No active pipeline <span style="opacity:.4;font-size:.65rem">- run one from the left panel</span></div>'
-    pls = doc.get("pipelines", [])
-    running = [p for p in pls if p.get("state") in ("running", "paused")]
-    if not running:
-        done = [p for p in pls if p.get("state")=="done"]
-        err  = [p for p in pls if p.get("state")=="error"]
-        parts = []
-        if done: parts.append(f'<span style="color:#3d9aff">&#x2713; {len(done)} done</span>')
-        if err:  parts.append(f'<span style="color:#ff5f5f">&#x26A0; {len(err)} error</span>')
-        return f'<div style="padding:.2rem .8rem;font-size:.72rem;color:var(--text_muted);display:flex;align-items:center;gap:.5rem">&#x26A1; Pipelines &mdash; {" ".join(parts) if parts else "all idle"}</div>'
-
-    pl = next((p for p in running if p["id"]==pl_id), running[0])
-    pid = doc["id"]; state = pl.get("state","idle"); col = S_COL.get(state,"var(--text_muted)")
-    cur_step = next((s for s in pl.get("steps",[]) if s.get("state")=="running"), None)
-    prog = (cur_step or {}).get("progress",{})
-    f_done = len(prog.get("files_done",[])); f_q = len(prog.get("file_queue",[])); f_total = f_done+f_q
-    chunk_n = prog.get("current_chunk",0); chunk_t = prog.get("chunks_total",0)
-    cur_file = _esc(prog.get("current_file",""))
-    log = prog.get("log",[])[-3:]
-    log_html = "".join(f'<div style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text_muted);font-size:.63rem">{_esc(l)}</div>' for l in log)
-    pct = int(f_done/max(f_total,1)*100) if f_total else 0
-    step_name = _esc((cur_step or {}).get("name",""))
-    chunk_info = f" | chunk {chunk_n}/{chunk_t}" if chunk_t else ""
-    stop_btn = f'<button class="cm-qbtn" style="color:#ff4444;flex-shrink:0;font-size:.75rem" hx-post="{_u("pipeline/stop",pid,pl["id"])}" hx-swap="none" title="Stop">&#x25FC; Stop</button>' if state=="running" else f'<span style="font-size:.65rem;color:#ffcc00">Paused</span>'
-    return (f"""<div style="display:flex;align-items:flex-start;gap:.8rem;padding:.25rem .8rem;height:100%;box-sizing:border-box;overflow:hidden">
-        <div style="flex:0 0 14rem;display:flex;flex-direction:column;gap:.1rem;overflow:hidden">
-            <div style="display:flex;align-items:center;gap:.3rem"><span style="font-weight:600;font-size:.78rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{_esc(pl.get("name",""))}</span>{stop_btn}</div>
-            <div style="font-size:.68rem;color:{col}">{state}{f" - {step_name}" if step_name else ""}</div>
-            <div style="font-size:.63rem;color:var(--text_muted)">{f_done}/{f_total} files{chunk_info}</div>
-            {"<div style=height:.3rem;background:var(--border);border-radius:.15rem;margin-top:.1rem><div style=height:100%;width:"+str(pct)+r"%;background:#00ffa2;border-radius:.15rem></div></div>" if f_total else ""}
-        </div>
-        <div style="flex:0 0 16rem;display:flex;flex-direction:column;gap:.06rem;overflow:hidden;border-left:var(--border-thick) solid var(--border);padding-left:.6rem">
-            <div style="font-size:.63rem;color:var(--text_muted)">Current file:</div>
-            <div style="font-size:.68rem;font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{cur_file or "(none)"}</div>
-            {f'<div style="font-size:.6rem;color:var(--accent)">chunk {chunk_n} of {chunk_t}</div>' if chunk_t else ""}
-        </div>
-        <div style="flex:1;min-width:0;border-left:var(--border-thick) solid var(--border);padding-left:.6rem;overflow:hidden">
-            <div style="font-size:.63rem;color:var(--text_muted);margin-bottom:.1rem">Log:</div>
-            {log_html}
-        </div>
-        <div id="tessa-pl-stream-active" style="flex:0 0 18rem;border-left:var(--border-thick) solid var(--border);padding-left:.6rem;font-size:.63rem;font-family:var(--font-mono);overflow:hidden;max-height:6rem;color:var(--text_muted)"></div>
-    </div>""")
-    
-def _pipeline_card(doc, pl):
-    pid = doc["id"]; pl_id = pl["id"]; state = pl.get("state","idle"); col = S_COL.get(state,"var(--text_muted)")
-    steps = pl.get("steps",[])
-    dots = "".join(f'<span style="width:.4rem;height:.4rem;border-radius:50%;background:{S_COL.get(s.get("state","idle"),"var(--text_muted)")};display:inline-block;margin:.05rem" title="{_esc(s.get("name",""))}"></span>' for s in steps)
-    cur = next((s for s in steps if s.get("state")=="running"), None)
-    prog = cur.get("progress",{}) if cur else {}
-    prog_txt = _esc(prog.get("current_file",""))
-    f_done = len(prog.get("files_done",[])); f_q = len(prog.get("file_queue",[]))
-    prog_html = f'<div style="font-size:.63rem;color:var(--text_muted);font-family:var(--font-mono)">{prog_txt}{"  "+str(f_done)+"/"+str(f_done+f_q) if (f_done+f_q) else ""}</div>' if prog_txt else ""
-    log = (cur.get("progress",{}).get("log",[]) if cur else [])[-2:]
-    log_html = "".join(f'<div style="font-size:.6rem;color:var(--text_muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{_esc(l)}</div>' for l in log)
-    run_btn  = f'<button class="cm-qbtn" hx-post="{_u("pipeline/run",pid,pl_id)}" hx-swap="none" title="Run">&#x25B6;</button>' if state in ("idle","paused","done","error") else ""
-    stop_btn = f'<button class="cm-qbtn" style="color:#ff4444" hx-post="{_u("pipeline/stop",pid,pl_id)}" hx-swap="none" title="Stop">&#x25FC;</button>' if state == "running" else ""
-    edit_btn = f'<button class="cm-qbtn" hx-get="{_u("pipeline/edit",pid,pl_id)}" hx-target="#tessa-modal" hx-swap="innerHTML" title="{"View (stop to edit)" if state=="running" else "Edit pipeline"}">{"&#x1F441;" if state=="running" else "&#x270E;"}</button>'
-    del_btn  = f'<button class="cm-qbtn" style="color:#ff5f5f" hx-delete="{_u("pipeline",pid,pl_id)}" hx-target="#tessa-pipeline-{pl_id}" hx-swap="outerHTML" hx-confirm="Delete?" title="Delete">&#x2715;</button>' if state != "running" else ""
-    return (f"""<div id="tessa-pipeline-{pl_id}" style="padding:.45rem .55rem;border-bottom:var(--border-thick) solid var(--border)"><div style="display:flex;align-items:center;gap:.3rem"><span style="flex:1;font-size:.78rem;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{_esc(pl.get("name",""))}</span><span style="font-size:.65rem;color:{col}">{state}</span>{run_btn}{stop_btn}{edit_btn}{del_btn}</div><div style="display:flex;gap:.08rem;margin:.1rem 0">{dots}</div>{prog_html}{log_html}<div id="tessa-pl-stream-{pl_id}" style="font-size:.63rem;color:var(--text_muted);max-height:2rem;overflow:hidden"></div></div>""")
-
 def _pipelines_html(doc):
     pid = doc["id"]; pls = doc.get("pipelines",[])
     cards = "".join(_pipeline_card(doc, pl) for pl in pls) or '<div style="font-size:.72rem;color:var(--text_muted);padding:.3rem .4rem">No pipelines. Click + to create one.</div>'
     return (f"""<div id="tessa-pipelines-section" style="border-top:var(--border-thick) solid var(--border)"><details open><summary style="padding:.3rem .45rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.3rem">&#x26A1; Pipelines<button class="btn-icon" style="margin-left:auto;font-size:.7rem" hx-get="{_u("pipeline/new_form",pid)}" hx-target="#tessa-pl-editor" hx-swap="innerHTML" onclick="event.stopPropagation()">+</button></summary><div>{cards}</div><div id="tessa-pl-editor"></div></details></div>""")
 
-def _left_bottom_html(doc): return _kg_html(doc) + _pipelines_html(doc)
+def _left_bottom_html(doc): return _kg_html(doc) + _pipelines_panel_html(doc["id"])
 
 def _left_panel(username, doc):
     pid = doc["id"]
     return (f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden"><div style="flex-shrink:0;padding:.35rem .5rem;border-bottom:var(--border-thick) solid var(--border);display:flex;align-items:center;gap:.3rem"><button class="btn-icon" style="font-size:1.1rem" hx-post="{_u("new")}" hx-target="#tessa-center" hx-swap="innerHTML" title="New project">+</button><span style="font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);flex:1">Tessa</span><button class="btn-icon" style="font-size:.75rem" hx-get="{_u("settings")}" hx-target="#tessa-center" hx-swap="innerHTML" title="Settings">&#x2699;</button></div><div id="tessa-proj-list" style="flex:1;min-height:0;overflow-y:auto">{_proj_list_html(username, pid)}</div><div id="tessa-left-bottom" style="flex-shrink:0;overflow-y:auto;border-top:var(--border-thick) solid var(--border)">{_left_bottom_html(doc)}</div></div>""")
 
-# --- Pipeline Edit HTML ---
+# -- Pipeline Run --
 
-def _pl_edit_html(doc, pl):
-    pid = doc["id"]; pl_id = pl["id"]
-    rows = "".join(_step_row(doc, pl, s, i) for i, s in enumerate(pl.get("steps",[])))
-    empty_state = '' if rows else '<div style="font-size:.75rem;color:var(--text_muted);padding:.5rem .3rem">No steps yet. Click + below.</div>'
-    return (f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
-                    <div style="flex-shrink:0;padding:.4rem .5rem;border-bottom:var(--border-thick) solid var(--border);display:flex;align-items:center;gap:.3rem">
-                        <input type="text" value="{_esc(pl.get("name",""))}" class="module-select" style="flex:1;font-size:.78rem" name="name" hx-post="{_u("pipeline/rename",pid,pl_id)}" hx-trigger="change" hx-include="this" hx-swap="none" placeholder="Pipeline name">
-                        <button class="btn-icon" style="font-size:.7rem" title="Reset all step progress" hx-post="{_u("pipeline/reset",pid,pl_id)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" hx-confirm="Reset all progress?" onclick="document.getElementById('tessa-modal').style.display='none';document.getElementById('tessa-modal').innerHTML=''">&#x21BA;</button>
-                    </div>
-                    <div class="tessa-pl-layout" style="display:flex;flex:1;min-height:0;overflow:hidden">
-                        <div class="tessa-pl-steps" style="flex:0 0 min(14rem,38%);border-right:var(--border-thick) solid var(--border);display:flex;flex-direction:column;overflow:hidden">
-                            <div style="flex:1;overflow-y:auto">{empty_state}{rows}</div>
-                            <div style="border-top:var(--border-thick) solid var(--border);padding:.3rem .4rem;flex-shrink:0">
-                                <button class="btn-icon" style="font-size:.75rem;width:100%;justify-content:center" hx-get="{_u("pipeline/step_form",pid,pl_id)}" hx-target="#tessa-modal-step-editor" hx-swap="innerHTML">+ Add Step</button>
-                            </div>
-                        </div>
-                        <div id="tessa-modal-step-editor" style="flex:1;overflow-y:auto">
-                            <div style="padding:2rem;color:var(--text_muted);font-size:.82rem;text-align:center">Select a step to edit, or add one.</div>
-                        </div>
-                    </div>
-                </div>""")
+async def _step_tessa_file_pass(config: dict, ctx) -> dict:
+    """Iterates selected/knowledge files, chunks each, runs a chat call per chunk, and appends results directly into the target project's document with a separator
+    - persists after every chunk so a stopped job leaves real partial progress, matching prior behavior."""
+    pid = config["project_id"]
+    conn = get_conn(config.get("conn_id",""))
+    model = config.get("model","")
+    if not conn or not model: raise RuntimeError("tessa_file_pass: connection/model not configured")
+    num_ctx, chunk_tokens = config.get("model_ctx", 32768), config.get("chunk_tokens", 6000)
+    sys_p, tpl, sep = config.get("system_prompt",""), config.get("user_template","") or "{chunk_content}", config.get("output_separator","\n\n---\n\n")
+    if config.get("use_selected"):
+        doc = _load(pid); files = sorted(f for f in (doc.get("selected_files",[]) if doc else []) if (KG_DIR/f).is_file())
+    else:
+        base = KG_DIR/config.get("input_source","").strip("/") if config.get("input_source") else KG_DIR
+        files = sorted(str(f.relative_to(KG_DIR)) for f in base.rglob("*") if f.is_file() and not f.name.startswith(".")) if base.exists() else []
+    result_key = config.get("result_key","file_pass")
+    for fi, rel in enumerate(files):
+        try: text = (KG_DIR/rel).read_text(encoding="utf-8", errors="ignore")
+        except Exception: continue
+        chunks = _chunk_text(text, chunk_tokens)
+        for ci, chunk in enumerate(chunks):
+            user_msg = tpl.replace("{file_name}", Path(rel).name).replace("{file_path}", rel).replace("{chunk_number}", str(ci+1)).replace("{chunks_total}", str(len(chunks))).replace("{chunk_content}", chunk)
+            msgs = ([] if not sys_p else [{"role":"system","content":sys_p}]) + [{"role":"user","content":user_msg}]
+            full = ""
+            async for text_piece, _tb, done, err in _stream(conn, msgs, model, num_ctx):
+                if err: raise RuntimeError(f"{rel} chunk {ci+1}: {err}")
+                if text_piece: full += text_piece; await ctx.stream(result_key, text_piece)
+                if done: break
+            if full:
+                doc = _load(pid)
+                if doc: doc["content"] += f"\n\n<!-- file_pass | {rel} chunk {ci+1}/{len(chunks)} -->\n{full.strip()}{sep}"; _save(doc)
+            await ctx.push("file_pass_progress", {"file": rel, "chunk": ci+1, "chunks_total": len(chunks), "file_index": fi+1, "files_total": len(files)})
+    ctx.scratch[result_key] = {"files_processed": len(files)}
+    return ctx.scratch[result_key]
 
-def _step_row(doc, pl, step, idx):
-    pid = doc["id"]; pl_id = pl["id"]; sid = step["id"]; col = S_COL.get(step.get("state","idle"),"var(--text_muted)")
-    prog = step.get("progress",{})
-    f_done = len(prog.get("files_done",[]))
-    f_q = len(prog.get("file_queue",[]))
-    f_total = f_done+f_q
-    count = f' <span style="font-size:.6rem;color:var(--text_muted)">({f_done}/{f_total})</span>' if f_total else ""
-    return (f"""<div style="display:flex;align-items:center;gap:.3rem;padding:.22rem .4rem;border-bottom:var(--border-thick) solid var(--border);font-size:.75rem"><span style="width:.45rem;height:.45rem;border-radius:50%;background:{col};flex-shrink:0"></span><span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{_esc(step.get("name",""))}{count}</span><span style="font-size:.6rem;color:var(--text_muted);flex-shrink:0">{step.get("type","")}</span><button class="btn-icon" style="font-size:.65rem" hx-get="{_u("pipeline/step_form",pid,pl_id,sid)}" hx-target="#tessa-modal-step-editor" hx-swap="innerHTML" title="Edit step">&#x270E;</button><button class="btn-icon" style="font-size:.65rem;color:#ff5f5f" hx-delete="{_u("pipeline/step",pid,pl_id,sid)}" hx-target="#tessa-modal-step-editor" hx-swap="innerHTML" hx-confirm="Remove step?" title="Remove">&#x2715;</button></div>""")
+async def _step_tessa_synthesis(config: dict, ctx) -> dict:
+    """Chunks the project's CURRENT document content and re-synthesizes chunk by chunk, appending (not replacing) - matches prior accumulate-don't-overwrite behavior."""
+    pid = config["project_id"]
+    conn = get_conn(config.get("conn_id",""))
+    model = config.get("model","")
+    if not conn or not model: raise RuntimeError("tessa_synthesis: connection/model not configured")
+    num_ctx, chunk_tokens = config.get("model_ctx", 32768), config.get("chunk_tokens", 6000)
+    sys_p, tpl, sep = config.get("system_prompt",""), config.get("user_template","") or "{chunk_content}", config.get("output_separator","\n\n---\n\n")
+    result_key = config.get("result_key","synthesis")
+    doc = _load(pid); content = (doc.get("content","") if doc else "").strip()
+    if not content: ctx.scratch[result_key] = {"chunks_processed": 0}; return ctx.scratch[result_key]
+    chunks = _chunk_text(content, chunk_tokens)
+    for ci, chunk in enumerate(chunks):
+        user_msg = tpl.replace("{chunk_content}",chunk).replace("{chunk_number}",str(ci+1)).replace("{chunks_total}",str(len(chunks)))
+        msgs = ([] if not sys_p else [{"role":"system","content":sys_p}]) + [{"role":"user","content":user_msg}]
+        full = ""
+        async for text_piece, _tb, done, err in _stream(conn, msgs, model, num_ctx):
+            if err: raise RuntimeError(f"chunk {ci+1}: {err}")
+            if text_piece: full += text_piece; await ctx.stream(result_key, text_piece)
+            if done: break
+        if full:
+            doc = _load(pid)
+            if doc: doc["content"] += f"\n\n{full.strip()}{sep}"; _save(doc)
+        await ctx.push("synthesis_progress", {"chunk": ci+1, "chunks_total": len(chunks)})
+    ctx.scratch[result_key] = {"chunks_processed": len(chunks)}
+    return ctx.scratch[result_key]
 
-def _step_form_html(doc, pl_id, step=None):
-    pid = doc["id"]; s = step or {}; sid = s.get("id",""); is_new = not sid
-    action = _u("pipeline/step/add",pid,pl_id) if is_new else _u("pipeline/step/save",pid,pl_id,sid)
-    c_opts = conn_opts_html(s.get("conn_id","") or doc.get("conn_id",""))
-    m_opts = model_opts_html(s.get("conn_id","") or doc.get("conn_id",""), s.get("model",""))
-    t_opts = "".join(f'<option value="{v}" {"selected" if v==s.get("type","file_pass") else ""}>{l}</option>' for v,l in [("file_pass","File Pass - process knowledge files"),("synthesis","Synthesis - restructure document content")])
-    sep = (s.get("output_separator","\n\n---\n\n") or "\n\n---\n\n").replace("\n","\\n")
-    nsep = "\n"
-    del_btn = f'<button type="button" class="btn-icon" style="color:#ff5f5f" hx-delete="{_u("pipeline/step",pid,pl_id,sid)}" hx-target="#tessa-modal-step-editor" hx-swap="innerHTML" hx-confirm="Remove step?">Remove Step</button>' if not is_new else ""
-    back_btn = f'<button type="button" class="btn-icon" hx-get="{_u("pipeline/edit",pid,pl_id)}" hx-target="#tessa-modal-inner" hx-swap="innerHTML">&#x2190; Back</button>'
-    kg_tree = _kg_dir_selector_html(s.get("input_source",""))
-    prompt_save_url = _u("pipeline/step/prompt/save"); prompt_list_url = _u("pipeline/step/prompts")
-    return f"""<form id="step-edit-form" hx-post="{action}" hx-target="#tessa-modal-step-editor" hx-swap="innerHTML" style="display:flex;flex-direction:column;gap:.32rem;padding:.75rem">
-        <div style="display:flex;align-items:center;gap:.3rem;margin-bottom:.2rem">{back_btn}<span style="font-size:.82rem;font-weight:600;color:var(--accent)">{"New Step" if is_new else "Edit: "+_esc(s.get("name",""))}</span></div>
-        <input type="text" name="name" value="{_esc(s.get("name","New Step"))}" class="module-select" style="font-size:.78rem" required placeholder="Step name">
-        <select name="type" class="module-select" style="font-size:.73rem">{t_opts}</select>
-        <div style="display:flex;gap:.3rem">
-            <div style="flex:1"><label style="font-size:.65rem;color:var(--text_muted)">Connection</label><select name="conn_id" class="module-select" style="font-size:.73rem" hx-post="{_u("pipeline/step_models",pid,pl_id)}" hx-trigger="change" hx-include="[name=conn_id]" hx-target="#tessa-step-model-wrap" hx-swap="innerHTML">{c_opts}</select></div>
-            <div id="tessa-step-model-wrap" style="flex:1"><label style="font-size:.65rem;color:var(--text_muted)">Model</label><select name="model" class="module-select" style="font-size:.73rem">{m_opts}</select></div>
+def _project_pipelines(pid: str) -> list: return [p for p in AIM.engine.list_pipelines() if p.get("project_id") == pid]
+
+def _new_pipeline_for_project(pid: str, name: str) -> dict:
+    pl = AIM.engine.new_pipeline(owner="tessa", name=name)
+    pl["project_id"], pl["tags"] = pid, ["tessa"]
+    AIM.engine.save_pipeline(pl)
+    return pl
+
+def _recompute_next(flow: dict):
+    """next is derived, never authored directly - every node's next = ids of nodes that list it in their own prev. Keeps the graph internally consistent regardless of edit order."""
+    for n in flow["nodes"]: n["next"] = []
+    by_id = {n["id"]: n for n in flow["nodes"]}
+    for n in flow["nodes"]:
+        for p in n.get("prev", []):
+            if p in by_id: by_id[p]["next"].append(n["id"])
+
+def _step_type_options(selected="") -> str:
+    return "".join(f'<option value="{t["type"]}" {"selected" if t["type"]==selected else ""}>{_esc(t.get("label",t["type"]))}</option>' for t in AIM.steps.list_step_types())
+
+def _step_config_form_fields(step_type: str, config: dict, pid: str) -> str:
+    """Renders form fields from the step type's own config_schema - the same schema each
+    register_step_type() call already declares. conn_id/model get connection-aware widgets;
+    everything else falls back to its declared field type (textarea/checkbox/number/text)."""
+    spec = AIM.steps.get_step_type(step_type)
+    schema = (spec or {}).get("config_schema", {})
+    out = ""
+    for field, ftype in schema.items():
+        val = config.get(field, "")
+        if field == "conn_id":
+            opts = "".join(f'<option value="{c["_id"]}" {"selected" if c["_id"]==val else ""}>{_esc(c.get("display_name",c["_id"]))}</option>' for c in list_conns(get_all=True))
+            out += f"""<label style="font-size:.65rem;color:var(--text_muted)">Connection<select name="cfg_conn_id" class="module-select" style="font-size:.73rem" hx-post="{_u("step_models",pid)}" hx-trigger="change" hx-include="this" hx-target="#step-model-wrap-model" hx-swap="innerHTML"><option value="">(none)</option>{opts}</select></label>"""
+        elif field == "model":
+            out += f'<div id="step-model-wrap-model"><label style="font-size:.65rem;color:var(--text_muted)">Model<input type="text" name="cfg_model" value="{_esc(str(val))}" class="module-select" style="font-size:.73rem" placeholder="pick a connection above to list models"></label></div>'
+        elif ftype == "textarea": out += f'<label style="font-size:.65rem;color:var(--text_muted)">{field}<textarea name="cfg_{field}" class="module-select" rows="3" style="font-size:.72rem;font-family:var(--font-mono)">{_esc(str(val))}</textarea></label>'
+        elif ftype == "checkbox": out += f'<label style="display:flex;gap:.3rem;align-items:center;font-size:.74rem"><input type="checkbox" name="cfg_{field}" value="1" {"checked" if val else ""}> {field}</label>'
+        elif ftype == "number": out += f'<label style="font-size:.65rem;color:var(--text_muted)">{field}<input type="number" name="cfg_{field}" value="{_esc(str(val or 0))}" class="module-select" style="font-size:.73rem"></label>'
+        else: out += f'<label style="font-size:.65rem;color:var(--text_muted)">{field}<input type="text" name="cfg_{field}" value="{_esc(str(val))}" class="module-select" style="font-size:.73rem"></label>'
+    return out
+
+def _node_multiselect(nodes: list, selected: list, exclude_id: str = "") -> str:
+    opts = "".join(f'<option value="{n["id"]}" {"selected" if n["id"] in selected else ""}>{_esc(n["id"])} ({_esc(n.get("type",""))})</option>' for n in nodes if n["id"] != exclude_id)
+    return f'<select name="prev" multiple class="module-select" style="font-size:.7rem;min-height:4rem">{opts}</select>'
+
+def _node_form_html(pid: str, pl: dict, node: dict = None) -> str:
+    nodes = pl.get("flow", {}).get("nodes", [])
+    nid, is_new = (node or {}).get("id", ""), not (node or {}).get("id")
+    ntype, config, prev = (node or {}).get("type", ""), (node or {}).get("config", {}), (node or {}).get("prev", [])
+    cfg_fields = _step_config_form_fields(ntype, config, pid) if ntype else '<div style="color:var(--text_muted);font-size:.72rem">Pick a step type to configure it.</div>'
+    action = _u("pipeline_node_save",pid,pl["id"],nid) if not is_new else _u("pipeline_node_add",pid,pl["id"])
+    del_btn = f'<button type="button" class="btn-icon" style="color:#ff5f5f" hx-post="{_u("pipeline_node_delete",pid,pl["id"],nid)}" hx-target="#tessa-node-editor" hx-swap="innerHTML" hx-confirm="Remove node?">Remove</button>' if not is_new else ""
+    return f"""<form hx-post="{action}" hx-target="#tessa-node-editor" hx-swap="innerHTML" style="display:flex;flex-direction:column;gap:.35rem;padding:.6rem">
+        <span style="font-weight:600;font-size:.8rem;color:var(--accent)">{"New Node" if is_new else "Edit: "+_esc(nid)}</span>
+        <label style="font-size:.65rem;color:var(--text_muted)">Step Type<select name="type" class="module-select" style="font-size:.73rem" hx-post="{_u("pipeline_node_type_change",pid,pl["id"])}" hx-trigger="change" hx-include="this" hx-target="#tessa-node-cfg" hx-swap="innerHTML">{_step_type_options(ntype)}</select></label>
+        <div id="tessa-node-cfg" style="display:flex;flex-direction:column;gap:.3rem">{cfg_fields}</div>
+        <label style="font-size:.65rem;color:var(--text_muted)">Runs after</label>{_node_multiselect(nodes, prev, nid)}
+        <div style="display:flex;gap:.3rem"><button type="submit" class="button" style="flex:1">{"Add Node" if is_new else "Save Node"}</button>{del_btn}</div>
+    </form>"""
+
+def _parse_node_form(form) -> tuple: return {k[4:]: v for k, v in form.items() if k.startswith("cfg_")}, form.getlist("prev")
+
+@router.post("/pipeline_node_type_change/{pid}/{pl_id}", response_class=HTMLResponse)
+async def pipeline_node_type_change(pid: str, pl_id: str, request: Request):
+    form = await request.form(); return HTMLResponse(_step_config_form_fields(form.get("type",""), {}, pid))
+
+@router.post("/step_models/{pid}", response_class=HTMLResponse)
+async def step_models(pid: str, request: Request):
+    form = await request.form(); conn = get_conn(form.get("cfg_conn_id",""))
+    models = list_models_sync(conn) if conn else []
+    opts = "".join(f'<option value="{m}">{m}</option>' for m in models) or '<option value="">No models</option>'
+    return HTMLResponse(f'<label style="font-size:.65rem;color:var(--text_muted)">Model<select name="cfg_model" class="module-select" style="font-size:.73rem">{opts}</select></label>')
+
+@router.get("/pipeline_node_form/{pid}/{pl_id}", response_class=HTMLResponse)
+async def pipeline_node_form_new(pid: str, pl_id: str):
+    pl = AIM.engine.load_pipeline(pl_id); return HTMLResponse(_node_form_html(pid, pl) if pl else "")
+
+@router.get("/pipeline_node_form/{pid}/{pl_id}/{nid}", response_class=HTMLResponse)
+async def pipeline_node_form_edit(pid: str, pl_id: str, nid: str):
+    pl = AIM.engine.load_pipeline(pl_id)
+    if not pl: return HTMLResponse("")
+    node = next((n for n in pl.get("flow",{}).get("nodes",[]) if n["id"]==nid), None)
+    return HTMLResponse(_node_form_html(pid, pl, node))
+
+@router.post("/pipeline_node_add/{pid}/{pl_id}", response_class=HTMLResponse)
+async def pipeline_node_add(pid: str, pl_id: str, request: Request):
+    form = await request.form(); pl = AIM.engine.load_pipeline(pl_id)
+    if not pl: return HTMLResponse("")
+    config, prev = _parse_node_form(form)
+    flow = pl.setdefault("flow", {"nodes": []})
+    flow["nodes"].append({"id": f"n_{uuid.uuid4().hex[:8]}", "type": form.get("type",""), "config": config, "prev": prev, "next": []})
+    _recompute_next(flow); AIM.engine.save_pipeline(pl)
+    return HTMLResponse(_pipeline_editor_html(pid, pl))
+
+@router.post("/pipeline_node_save/{pid}/{pl_id}/{nid}", response_class=HTMLResponse)
+async def pipeline_node_save(pid: str, pl_id: str, nid: str, request: Request):
+    form = await request.form(); pl = AIM.engine.load_pipeline(pl_id)
+    if not pl: return HTMLResponse("")
+    flow = pl.setdefault("flow", {"nodes": []})
+    node = next((n for n in flow["nodes"] if n["id"] == nid), None)
+    if not node: return HTMLResponse("")
+    config, prev = _parse_node_form(form)
+    node["type"], node["config"], node["prev"] = form.get("type", node["type"]), config, prev
+    _recompute_next(flow); AIM.engine.save_pipeline(pl)
+    return HTMLResponse(_pipeline_editor_html(pid, pl))
+
+@router.post("/pipeline_node_delete/{pid}/{pl_id}/{nid}", response_class=HTMLResponse)
+async def pipeline_node_delete(pid: str, pl_id: str, nid: str):
+    pl = AIM.engine.load_pipeline(pl_id)
+    if not pl: return HTMLResponse("")
+    flow = pl.setdefault("flow", {"nodes": []})
+    flow["nodes"] = [n for n in flow["nodes"] if n["id"] != nid]
+    for n in flow["nodes"]: n["prev"] = [p for p in n.get("prev", []) if p != nid]
+    _recompute_next(flow); AIM.engine.save_pipeline(pl)
+    return HTMLResponse(_pipeline_editor_html(pid, pl))
+
+def _pipeline_editor_html(pid: str, pl: dict) -> str:
+    nodes = pl.get("flow", {}).get("nodes", [])
+    rows = "".join(f"""<div style="display:flex;align-items:center;gap:.3rem;padding:.22rem .4rem;border-bottom:var(--border-thick) solid var(--border);font-size:.73rem">
+        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="after: {', '.join(n.get('prev',[])) or '(start)'}">{_esc(n["id"])} <span style="color:var(--text_muted)">({_esc(n.get("type",""))})</span></span>
+        <button class="btn-icon" style="font-size:.65rem" hx-get="{_u("pipeline_node_form",pid,pl["id"],n["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">&#x270E;</button>
+    </div>""" for n in nodes) or '<div style="font-size:.72rem;color:var(--text_muted);padding:.4rem">No nodes yet.</div>'
+    return f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+        <div style="flex-shrink:0;padding:.4rem .5rem;border-bottom:var(--border-thick) solid var(--border);display:flex;align-items:center;gap:.3rem">
+            <input type="text" value="{_esc(pl.get("name",""))}" class="module-select" style="flex:1;font-size:.78rem" hx-post="{_u("pipeline_rename",pid,pl["id"])}" hx-trigger="change" hx-swap="none" name="name">
+            <span style="font-size:.65rem;color:var(--text_muted)">tags: {", ".join(pl.get("tags",[]))}</span>
         </div>
-        <div style="display:flex;gap:.3rem">
-            <div style="flex:1"><label style="font-size:.65rem;color:var(--text_muted)">Context tokens</label><input type="number" name="model_ctx" value="{s.get("model_ctx",32768)}" class="module-select" style="font-size:.73rem"></div>
-            <div style="flex:1"><label style="font-size:.65rem;color:var(--text_muted)">Chunk tokens (0=no split)</label><input type="number" name="chunk_tokens" value="{s.get("chunk_tokens",6000)}" class="module-select" style="font-size:.73rem"></div>
-        </div>
-        <label style="font-size:.65rem;color:var(--text_muted)">Knowledge Source
-            <div style="max-height:8rem;overflow-y:auto;border:var(--border-thick) solid var(--border);border-radius:var(--radius);margin-top:.2rem">{kg_tree}</div>
-            <input type="hidden" name="input_source" id="step-input-src" value="{_esc(s.get("input_source",""))}">
-        </label>
-        <label style="display:flex;align-items:center;gap:.35rem;font-size:.76rem"><input type="checkbox" name="use_selected" value="1" {"checked" if s.get("use_selected") else ""}> Use document's selected files only (overrides above)</label>
-        <details style="border:var(--border-thick) solid var(--border);border-radius:var(--radius);padding:.4rem"><summary style="cursor:pointer;font-size:.72rem;color:var(--text_muted);list-style:none;user-select:none">&#x1F4BE; Saved Prompts</summary>
-            <div id="step-prompt-list" hx-get="{prompt_list_url}" hx-trigger="load" hx-swap="innerHTML" style="margin-top:.3rem"></div>
-            <div style="display:flex;gap:.3rem;margin-top:.35rem">
-                <input type="text" id="step-prompt-name" placeholder="Save current as..." class="module-select" style="flex:1;font-size:.72rem">
-                <button type="button" class="btn-icon" style="font-size:.75rem" onclick="saveStepPrompt('{prompt_save_url}','{prompt_list_url}')">Save</button>
+        <div style="display:flex;flex:1;min-height:0;overflow:hidden">
+            <div style="flex:0 0 16rem;border-right:var(--border-thick) solid var(--border);display:flex;flex-direction:column;overflow:hidden">
+                <div style="flex:1;overflow-y:auto">{rows}</div>
+                <button class="btn-icon" style="font-size:.75rem;padding:.4rem" hx-get="{_u("pipeline_node_form",pid,pl["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">+ Add Node</button>
             </div>
-        </details>
-        <label style="font-size:.65rem;color:var(--text_muted)">System Prompt<textarea name="system_prompt" class="module-select" rows="4" style="font-family:var(--font-mono);font-size:.72rem;resize:vertical">{_esc(s.get("system_prompt",""))}</textarea></label>
-        <label style="font-size:.65rem;color:var(--text_muted)">User Template <span style="font-size:.6rem;opacity:.7">{{file_name}} {{file_path}} {{chunk_number}} {{chunks_total}} {{chunk_content}}</span><textarea name="user_template" class="module-select" rows="3" style="font-family:var(--font-mono);font-size:.72rem;resize:vertical">{_esc(s.get("user_template", "File: {{file_name}} (chunk {{chunk_number}}/{{chunks_total}})"+nsep+nsep+"{{chunk_content}}"))}</textarea></label>
-        <label style="font-size:.65rem;color:var(--text_muted)">Output separator ({nsep}=newline)<input type="text" name="output_separator" value="{_esc(sep)}" class="module-select" style="font-size:.72rem;font-family:var(--font-mono)"></label>
-        <label style="display:flex;align-items:center;gap:.3rem;font-size:.76rem"><input type="checkbox" name="pause_after" value="1" {"checked" if s.get("pause_after") else ""}> Pause after this step completes</label>
-        <div style="display:flex;gap:.3rem;margin-top:.2rem"><button type="submit" class="button" style="flex:1;font-size:.8rem;margin-top:0">{"Add Step" if is_new else "Save Step"}</button>{del_btn}</div>
-    </form>
-    <script>
-    function setStepSrc(el, path) {{
-        document.getElementById('step-input-src').value = path;
-        document.querySelectorAll('.kg-dir-opt').forEach(function(d) {{ d.style.background=''; d.style.color=''; }});
-        el.style.background='var(--accent_dim)'; el.style.color='var(--accent)';
-    }}
-    function loadStepPrompt(system, template) {{
-        var f = document.getElementById('step-edit-form');
-        var sp = f.querySelector('[name="system_prompt"]'); var ut = f.querySelector('[name="user_template"]');
-        if(sp) sp.value=system; if(ut) ut.value=template;
-    }}
-    async function saveStepPrompt(saveUrl, listUrl) {{
-        var name = document.getElementById('step-prompt-name').value.trim(); if(!name) return;
-        var f = document.getElementById('step-edit-form');
-        var fd = new FormData();
-        fd.append('name', name);
-        fd.append('system_prompt', f.querySelector('[name="system_prompt"]')?.value || '');
-        fd.append('user_template', f.querySelector('[name="user_template"]')?.value || '');
-        await fetch(saveUrl, {{method:'POST', body:fd}});
-        htmx.ajax('GET', listUrl, {{target:'#step-prompt-list', swap:'innerHTML'}});
-        document.getElementById('step-prompt-name').value='';
-    }}
-    </script>"""
-                   
+            <div id="tessa-node-editor" style="flex:1;overflow-y:auto"><div style="padding:2rem;color:var(--text_muted);font-size:.8rem;text-align:center">Select or add a node.</div></div>
+        </div>
+    </div>"""
+
+@router.post("/pipeline_rename/{pid}/{pl_id}", response_class=HTMLResponse)
+async def pipeline_rename(pid: str, pl_id: str, request: Request):
+    form = await request.form(); pl = AIM.engine.load_pipeline(pl_id)
+    if pl: pl["name"] = form.get("name","").strip() or pl["name"]; AIM.engine.save_pipeline(pl)
+    return HTMLResponse("")
+
+@router.get("/pipeline_editor/{pid}/{pl_id}", response_class=HTMLResponse)
+async def pipeline_editor_route(pid: str, pl_id: str):
+    pl = AIM.engine.load_pipeline(pl_id)
+    if not pl: return HTMLResponse("")
+    return HTMLResponse(f"""<div class="glass" style="width:min(92vw,70rem);height:min(85vh,48rem);overflow:hidden;display:flex;flex-direction:column;padding:0">
+        <div style="display:flex;align-items:center;padding:.4rem .6rem;border-bottom:var(--border-thick) solid var(--border);flex-shrink:0">
+            <span style="font-weight:600;color:var(--accent);font-size:.85rem">Pipeline Editor</span>
+            <button onclick="document.getElementById('tessa-modal').style.display='none';document.getElementById('tessa-modal').innerHTML=''" style="margin-left:auto;background:none;border:none;cursor:pointer;font-size:1.1rem;color:var(--text_muted)">&#x2715;</button>
+        </div>
+        <div style="flex:1;min-height:0;overflow:hidden">{_pipeline_editor_html(pid, pl)}</div>
+    </div><script>document.getElementById("tessa-modal").style.display="flex";</script>""")
+
+def _pipelines_panel_html(pid: str) -> str:
+    pls = _project_pipelines(pid)
+    cards = "".join(_pipeline_card_html(pid, pl) for pl in pls) or '<div style="font-size:.72rem;color:var(--text_muted);padding:.3rem .4rem">No pipelines. Click + to create one.</div>'
+    return f"""<div id="tessa-pipelines-section" style="border-top:var(--border-thick) solid var(--border)">
+        <details open><summary style="padding:.3rem .45rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.3rem">&#x26A1; Pipelines
+        <button class="btn-icon" style="margin-left:auto;font-size:.7rem" hx-get="{_u("pipeline_new_form",pid)}" hx-target="#tessa-pl-new" hx-swap="innerHTML" onclick="event.stopPropagation()">+</button></summary>
+        <div id="tessa-pl-new"></div><div>{cards}</div></details></div>"""
+
+def _pipeline_card_html(pid: str, pl: dict) -> str:
+    pl_id = pl["id"]
+    return f"""<div class="glass" style="padding:.4rem .5rem;margin:.2rem .3rem;font-size:.75rem">
+        <div style="display:flex;align-items:center;gap:.3rem">
+            <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" hx-get="{_u("pipeline_editor",pid,pl_id)}" hx-target="#tessa-modal" hx-swap="innerHTML">{_esc(pl.get("name",""))}</span>
+            <button class="btn-icon" style="color:#ff5f5f;font-size:.7rem" hx-post="{_u("pipeline_delete",pid,pl_id)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" hx-confirm="Delete pipeline?">&#x2715;</button>
+        </div>
+        <div id="tessa-status-{pl_id}" data-job="" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">
+            <button class="cm-qbtn" hx-post="{_u("pipeline_run",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x25B6; Run</button>
+            <span class="tessa-status-label" style="font-size:.65rem;color:var(--text_muted)">idle</span>
+        </div>
+        <div class="tessa-status-log" style="font-size:.62rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>
+    </div>"""
+
+@router.post("/pipeline_new_form/{pid}", response_class=HTMLResponse)  # note: fixed to GET below via decorator swap in file
+async def _unused(): pass
+
+@router.get("/pipeline_new_form/{pid}", response_class=HTMLResponse)
+async def pipeline_new_form(pid: str):
+    return HTMLResponse(f'<form hx-post="{_u("pipeline_create",pid)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" style="display:flex;gap:.3rem;padding:.3rem"><input type="text" name="name" class="module-select" placeholder="Pipeline name" style="flex:1;font-size:.75rem" required autofocus><button type="submit" class="button" style="margin-top:0;font-size:.72rem">Create</button></form>')
+
+@router.post("/pipeline_create/{pid}", response_class=HTMLResponse)
+async def pipeline_create(pid: str, request: Request):
+    form = await request.form(); _new_pipeline_for_project(pid, form.get("name","Pipeline").strip() or "Pipeline")
+    return HTMLResponse(_pipelines_panel_html(pid))
+
+@router.post("/pipeline_delete/{pid}/{pl_id}", response_class=HTMLResponse)
+async def pipeline_delete(pid: str, pl_id: str):
+    AIM.engine.delete_pipeline(pl_id); return HTMLResponse(_pipelines_panel_html(pid))
+
+@router.post("/pipeline_run/{pid}/{pl_id}", response_class=HTMLResponse)
+async def pipeline_run(pid: str, pl_id: str, request: Request):
+    job_id, err = AIM.engine.submit(request.state.user.username, kind="id", pipeline_id=pl_id)
+    label = f'<span style="color:#ff5f5f">error: {_esc(err)}</span>' if err else '<span style="color:#00ffa2">running</span>'
+    run_btn = f'<button class="cm-qbtn" hx-post="{_u("pipeline_run",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x25B6; Run</button>' if err else ""
+    stop_btn = "" if err else f'<button class="cm-qbtn" style="color:#ff4444" hx-post="{_u("pipeline_stop",pid,pl_id,job_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x25FC; Stop</button>'
+    return HTMLResponse(f"""<div id="tessa-status-{pl_id}" data-job="{job_id or ''}" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">{run_btn}{stop_btn}<span class="tessa-status-label" style="font-size:.65rem">{label}</span></div><div class="tessa-status-log" style="font-size:.62rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>""")
+
+@router.post("/pipeline_stop/{pid}/{pl_id}/{job_id}", response_class=HTMLResponse)
+async def pipeline_stop(pid: str, pl_id: str, job_id: str):
+    AIM.engine.stop(job_id)
+    return HTMLResponse(f'<div id="tessa-status-{pl_id}" data-job="{job_id}" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem"><span class="tessa-status-label" style="font-size:.65rem;color:#ffcc00">stopping&#x2026;</span></div><div class="tessa-status-log" style="font-size:.62rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>')
+
 # --- Main View Builder ---
 
 def _project_view(request, doc, models=None):
     username = request.state.user.username
-    ed = ENV["tools"]["built_ins"].PortalEditor(base_url=_u())
     is_working = doc["id"] in _ACTIVE
-    return (ed.render_shell(doc) + f"""<div id="tessa-conn-bar-content" hx-swap-oob="outerHTML">{_conn_bar_html(doc, list_conns(), models or [])}</div><div id="tessa-chat-area" hx-swap-oob="outerHTML"><div id="tessa-chat-area" style="height:100%;overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username, is_working=is_working, stop_url=_u("stop",doc["id"]) if is_working else "")}</div></div><div id="tessa-proj-list" hx-swap-oob="innerHTML">{_proj_list_html(username, doc["id"])}</div><div id="tessa-left-bottom" hx-swap-oob="innerHTML">{_left_bottom_html(doc)}</div>""")
+    return (PE.render_shell(doc) + f"""<div id="tessa-conn-bar-content" hx-swap-oob="outerHTML">{_conn_bar_html(doc, list_conns(), models or [])}</div><div id="tessa-chat-area" hx-swap-oob="outerHTML"><div id="tessa-chat-area" style="height:100%;overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username, is_working=is_working, stop_url=_u("stop",doc["id"]) if is_working else "")}</div></div><div id="tessa-proj-list" hx-swap-oob="innerHTML">{_proj_list_html(username, doc["id"])}</div><div id="tessa-left-bottom" hx-swap-oob="innerHTML">{_left_bottom_html(doc)}</div>""")
 
 # --- Routes: Main ---
 
 @router.get("")
 @router.get("/")
 async def root(request: Request):
+    global CM, PE, BI
     user = request.state.user
     username = user.username
     did = await ENV["get_state"](request, scope="user", namespace="tessa", key="active_pid")
@@ -609,18 +584,24 @@ async def root(request: Request):
     conn = get_conn(doc.get("conn_id",""))
     models = await list_models_async(conn) if conn else []
     if not doc.get("model") and models: doc["model"] = models[0]; _save(doc)
-    ed = ENV["tools"]["built_ins"].PortalEditor(base_url=_u())
     chat = f'<div id="tessa-chat-area" style="height:100%; overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username)}</div>'
     top = f'<div style="position:relative"><div id="tessa-conn-bar-content">{_conn_bar_html(doc, list_conns(), models)}</div></div>'
-    pipe_bar = f'<div id="tessa-pipe-bar" style="height:100%; overflow:hidden">{_pipe_progress_html(doc)}</div>'
+
+    TESSA_SCRIPT = """['step_start','step_done','error','done','stopped'].forEach(k => document.addEventListener('pipeline:'+k, function(e){
+                        var el = Array.from(document.querySelectorAll('[id^="tessa-status-"]')).find(x => x.dataset.job === e.detail.job_id);
+                        if(!el) return;
+                        var label = el.querySelector('.tessa-status-label'), log = el.querySelector('.tessa-status-log');
+                        if(label) label.textContent = k === 'step_start' ? ('running: '+(e.detail.name||e.detail.type)) : k;
+                        if(log){ var line=document.createElement('div'); line.textContent = k+(e.detail.node?' ('+e.detail.node+')':'')+(e.detail.message?': '+e.detail.message:''); log.appendChild(line); log.scrollTop = log.scrollHeight; }
+                    }));"""
+
     return ENV["templates"].TemplateResponse(name="base.html", request=request, context={
         "request": request, "user": user, "nesting_level": 2, "shell_id": IM.branch_id, "code_mirror": True,
         "toolbars": {"top": UI.toolbar(side="top", content=top, size="3rem", overlay=False, start_open=True, locked=True, nesting_level=2),
                      "left":  UI.toolbar(side="left", content=_left_panel(username, doc), size="18rem", overlay=False, start_open=True, resizable=True, nesting_level=2),
-                     "right": UI.toolbar(side="right", content=chat, size="22rem", overlay=False, start_open=True, resizable=True, nesting_level=2, id="tessa-right"),
-                     "bottom": UI.toolbar(side="bottom", content=pipe_bar, size="7rem", overlay=False, start_open=True, resizable=True, nesting_level=2, id="tessa-bottom")},
-        "content": f"""<div id="tessa-center">{ed.render_shell(doc)}</div><div id="tessa-modal" onclick="if(event.target===this){{this.style.display='none'; this.innerHTML=''}}"></div>""",
-        "extra_css": CSS + CM.CSS + ed.CSS, "extra_script": ENV["tools"]["built_ins"].PORTAL_EDITOR_JS + CM.SCRIPT})
+                     "right": UI.toolbar(side="right", content=chat, size="22rem", overlay=False, start_open=True, resizable=True, nesting_level=2, id="tessa-right")},
+        "content": f"""<div id="tessa-center">{PE.render_shell(doc)}</div><div id="tessa-modal" onclick="if(event.target===this){{this.style.display='none'; this.innerHTML=''}}"></div>""",
+        "extra_css": CSS + CM.CSS + PE.CSS, "extra_script": BI.PORTAL_EDITOR_JS + CM.SCRIPT + TESSA_SCRIPT})
 
 @router.post("/new", response_class=HTMLResponse)
 async def new_project(request: Request):
@@ -650,84 +631,49 @@ async def delete_project(pid: str, request: Request):
 
 # --- Routes: Document ---
 
-@router.post("/doc/save/{pid}")
-async def doc_save(pid: str, request: Request):
-    form = await request.form(); doc = _load(pid)
-    if not doc or doc.get("username") != request.state.user.username: return HTMLResponse("")
-    doc["content"] = form.get("content","")
-    cfg = _SETTINGS.get_group("defaults").load() if _SETTINGS else {}
-    if cfg.get("auto_snapshot_on_save",False) and doc["content"].strip():
-        vdir = DATA_DIR/"versions"/pid; vdir.mkdir(parents=True, exist_ok=True)
-        (vdir/f'{datetime.utcnow().strftime("%Y%m%dT%H%M%S")}.json').write_text(json.dumps({"content":doc["content"], "title":doc.get("title",""), "saved":doc.get("modified","")}, indent=2))
-        for old in sorted(vdir.glob("*.json"))[:-30]: old.unlink()
-    _save(doc); return HTMLResponse("")
+async def _h_doc_apply_ai(request, payload, imr):
+    pid = payload.get("branch",""); doc = _load(pid)
+    if not doc or doc.get("username") != request.state.user.username: return imr
+    last_ai = next((m["content"] for m in reversed(doc.get("conversation",[])) if m.get("role")=="assistant" and not m.get("deleted")), None)
+    if last_ai: doc["content"] = last_ai; _save(doc)
+    return imr.raw(PE.render_shell(doc))
 
-@router.post("/doc/rename/{pid}")
-async def doc_rename(pid: str, request: Request):
-    form = await request.form(); doc = _load(pid)
-    if not doc or doc.get("username") != request.state.user.username: return HTMLResponse("")
-    doc["title"] = form.get("value","").strip() or "Untitled"; _save(doc)
-    new_input = (f"""<input id="doc-title-{pid}" type="text" value="{_esc(doc["title"])}" name="value" hx-post="{_u("doc/rename",pid)}" hx-trigger="change" hx-target="#doc-title-{pid}" hx-swap="outerHTML" hx-include="this" style="background:transparent;border:none;border-bottom:var(--border-thick) solid var(--border);color:var(--text);font-size:.88rem;font-weight:600;padding:.2rem .3rem;outline:none;flex:1;min-width:5rem;">""")
-    return HTMLResponse(new_input + f'<div id="tessa-proj-list" hx-swap-oob="innerHTML">{_proj_list_html(request.state.user.username, pid)}</div>')
+async def _h_doc_conn(request, payload, imr):
+    pid = payload.get("branch",""); doc = _load(pid)
+    if not doc: return imr
+    doc["conn_id"] = payload.get("value",""); _save(doc)
+    conn = get_conn(doc["conn_id"]); models = await list_models_async(conn) if conn else []
+    cur = doc.get("model",""); opts = "".join(f'<option value="{m}" {"selected" if m==cur else ""}>{m}</option>' for m in models) or '<option value="">No models</option>'
+    imr.oob(f"""<select class="module-select" style="font-size:.72rem;max-width:11rem" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_model","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none">{opts}</select>""", "tessa-model-wrap")
+    return imr
 
-@router.post("/doc/settings/{pid}")
-async def doc_settings(pid: str, request: Request):
-    form = dict(await request.form()); doc = _load(pid)
-    if not doc or doc.get("username") != request.state.user.username: return HTMLResponse("")
-    s = doc.setdefault("settings",{})
-    for k in ("view","font"):
-        if k in form: s[k] = form[k]
-    for k in ("wrap","border","interactive"):
-        if k in form: s[k] = form[k] == "true"
-    if "zoom" in form:
-        try: s["zoom"] = max(0.6, min(float(form["zoom"]), 2.0))
-        except ValueError: pass
-    _save(doc); return HTMLResponse(ENV["tools"]["built_ins"].PortalEditor(base_url=_u()).render_shell(doc))
+async def _h_doc_model(request, payload, imr):
+    doc = _load(payload.get("branch",""))
+    if doc: doc["model"] = payload.get("value",""); _save(doc)
+    return imr
 
-@router.get("/doc/info/{pid}")
-async def doc_info(pid: str): return HTMLResponse(ENV["tools"]["built_ins"].PortalEditor(base_url=_u()).info_html(_load(pid) or {}))
+async def _h_doc_ctx(request, payload, imr):
+    doc = _load(payload.get("branch",""))
+    if doc: doc["model_ctx"] = max(512, int(payload.get("value",32768) or 32768)); _save(doc)
+    return imr
 
-@router.get("/doc/search_form/{pid}")
-async def doc_search_form(pid: str): return HTMLResponse(ENV["tools"]["built_ins"].PortalEditor(base_url=_u()).search_form_html(pid))
+async def _h_files_toggle(request, payload, imr):
+    pid, path = payload.get("branch",""), payload.get("path","")
+    is_dir = str(payload.get("is_dir","false")) == "true"
+    doc = _load(pid)
+    if not doc: return imr
+    files = set(doc.get("selected_files",[]))
+    if is_dir:
+        full = KG_DIR/path
+        children = {str(f.relative_to(KG_DIR)) for f in full.rglob("*") if f.is_file() and not f.name.startswith(".")} if full.is_dir() else set()
+        files = files - children if children and children.issubset(files) else files | children
+    else: files.discard(path) if path in files else files.add(path)
+    doc["selected_files"] = list(files); _save(doc)
+    imr.oob(_kg_html(doc), "tessa-kg-section", swap="outerHTML")
+    return imr
 
 @router.get("/doc/search_close/{pid}")
 async def doc_search_close(pid: str): return HTMLResponse("")
-
-@router.post("/doc/search/{pid}")
-async def doc_search(pid: str, request: Request):
-    form = await request.form()
-    doc = _load(pid)
-    return HTMLResponse(ENV["tools"]["built_ins"].PortalEditor(base_url=_u()).search_results_html(doc or {}, form.get("query",""), bool(form.get("regex"))))
-
-@router.post("/doc/apply_ai/{pid}")
-async def doc_apply_ai(pid: str, request: Request):
-    doc = _load(pid)
-    if not doc or doc.get("username") != request.state.user.username: return HTMLResponse("")
-    last_ai = next((m["content"] for m in reversed(doc.get("conversation",[])) if m.get("role")=="assistant" and not m.get("deleted")), None)
-    if last_ai: doc["content"] = last_ai; _save(doc)
-    return HTMLResponse(ENV["tools"]["built_ins"].PortalEditor(base_url=_u()).render_shell(doc))
-
-@router.post("/doc/conn/{pid}")
-async def doc_conn(pid: str, request: Request):
-    form = await request.form(); doc = _load(pid)
-    if not doc: return HTMLResponse(f'<select name="model" class="module-select" style="font-size:.72rem"><option>-</option></select>')
-    doc["conn_id"] = form.get("conn_id",""); _save(doc)
-    conn = get_conn(doc["conn_id"]); models = await list_models_async(conn) if conn else []
-    cur = doc.get("model","")
-    opts = "".join(f'<option value="{m}" {"selected" if m==cur else ""}>{m}</option>' for m in models) or '<option value="">No models</option>'
-    return HTMLResponse(f'<select class="module-select" style="font-size:.72rem;max-width:11rem" name="model" hx-post="{_u("doc/model",pid)}" hx-trigger="change" hx-include="[name=model]" hx-swap="none">{opts}</select>')
-
-@router.post("/doc/model/{pid}")
-async def doc_model(pid: str, request: Request):
-    form = await request.form(); doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    doc["model"] = form.get("model",""); _save(doc); return HTMLResponse("")
-
-@router.post("/doc/ctx/{pid}")
-async def doc_ctx(pid: str, request: Request):
-    form = await request.form(); doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    doc["model_ctx"] = max(512, int(form.get("model_ctx",32768) or 32768)); _save(doc); return HTMLResponse("")
 
 @router.post("/stop/{pid}")
 async def stop_stream(pid: str):
@@ -735,6 +681,13 @@ async def stop_stream(pid: str):
     task = _STREAM_TASKS.pop(pid, None)
     if task and not task.done(): task.cancel()
     return HTMLResponse("")
+
+@router.post("/doc/toggle_task/{pid}")
+async def doc_toggle_task(pid: str, request: Request):
+    form = await request.form(); doc = _load(pid)
+    if not doc or doc.get("username") != request.state.user.username: return HTMLResponse("")
+    doc["content"] = PE._flip_task(doc.get("content",""), int(form.get("idx", -1))); _save(doc)
+    return HTMLResponse(PE.render_preview(doc["content"], task_interactive=True, doc_id=pid))
 
 # --- Routes: Messages ---
 
@@ -868,126 +821,6 @@ async def kg_upload(pid: str, request: Request, files: list[UploadFile] = File(.
 
 # --- Routes: Pipelines ---
 
-@router.get("/pipeline/new_form/{pid}", response_class=HTMLResponse)
-async def pipeline_new_form(pid: str): return HTMLResponse(f'<form hx-post="{_u("pipeline/create",pid)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" style="padding:.4rem;display:flex;gap:.3rem"><input type="text" name="name" class="module-select" placeholder="Pipeline name" style="flex:1;font-size:.78rem" required autofocus><button type="submit" class="button" style="margin-top:0;font-size:.75rem">Create</button></form>')
-
-@router.post("/pipeline/create/{pid}", response_class=HTMLResponse)
-async def pipeline_create(pid: str, request: Request):
-    form = await request.form(); doc = _load(pid)
-    if not doc or doc.get("username") != request.state.user.username: return HTMLResponse("")
-    pl = {"id":f"pl_{uuid.uuid4().hex[:8]}","name":form.get("name","Pipeline").strip(),"state":"idle","current_step":0,"steps":[]}
-    doc.setdefault("pipelines",[]).append(pl); _save(doc)
-    return HTMLResponse(_pipelines_html(doc))
-
-@router.delete("/pipeline/{pid}/{pl_id}", response_class=HTMLResponse)
-async def pipeline_delete(pid: str, pl_id: str, request: Request):
-    task = _PIPE_TASKS.pop(pl_id, None)
-    if task: task.cancel()
-    _STOP[f"pl_{pl_id}"] = True
-    doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    doc["pipelines"] = [p for p in doc.get("pipelines",[]) if p["id"] != pl_id]; _save(doc)
-    return HTMLResponse("")  # hx-swap="outerHTML" targets the card itself
-
-@router.get("/pipeline/edit/{pid}/{pl_id}", response_class=HTMLResponse)
-async def pipeline_edit(pid: str, pl_id: str):
-    doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-    if not pl: return HTMLResponse("")
-    inner = _pl_edit_html(doc, pl)
-    return HTMLResponse(f"""<div id="tessa-modal-inner" class="glass" style="width:min(92vw,64rem);height:min(85vh,45rem);overflow:hidden;display:flex;flex-direction:column;position:relative;padding:0"><div style="display:flex;align-items:center;padding:.5rem .75rem;border-bottom:var(--border-thick) solid var(--border);flex-shrink:0"><span style="font-weight:600;color:var(--accent);font-size:.9rem">&#x26A1; Pipeline Editor &mdash; {_esc(pl.get("name",""))}</span><button onclick="document.getElementById('tessa-modal').style.display='none';document.getElementById('tessa-modal').innerHTML=''" style="margin-left:auto;background:none;border:none;cursor:pointer;font-size:1.2rem;color:var(--text_muted);padding:.2rem .4rem">&#x2715;</button></div><div style="flex:1;min-height:0;overflow:hidden">{inner}</div></div><script>document.getElementById("tessa-modal").style.display="flex";</script>""")
-
-@router.post("/pipeline/rename/{pid}/{pl_id}", response_class=HTMLResponse)
-async def pipeline_rename(pid: str, pl_id: str, request: Request):
-    form = await request.form(); doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-    if pl: pl["name"] = form.get("name","").strip() or pl["name"]; _save(doc)
-    return HTMLResponse("")
-
-@router.post("/pipeline/reset/{pid}/{pl_id}", response_class=HTMLResponse)
-async def pipeline_reset(pid: str, pl_id: str):
-    doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-    if pl:
-        pl["state"] = "idle"; pl["current_step"] = 0
-        for s in pl.get("steps",[]): s["state"] = "idle"; s.pop("progress", None)
-        _save(doc)
-    return HTMLResponse(_pipelines_html(doc))
-
-@router.post("/pipeline/run/{pid}/{pl_id}", response_class=HTMLResponse)
-async def pipeline_run(pid: str, pl_id: str, request: Request):
-    user = request.state.user
-    doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-    if not pl or pl.get("state") == "running": return HTMLResponse("")
-    if pl.get("state") in ("done","error"): pl["current_step"] = 0
-    for s in pl.get("steps",[]): s.get("state") != "done" and s.pop("progress", None)
-    _STOP.pop(f"pl_{pl_id}", None)
-    task = asyncio.create_task(_run_pipeline(pid, pl_id, user.username))
-    _PIPE_TASKS[pl_id] = task
-    return HTMLResponse("")  # pipeline card updates via WS OOB
-
-@router.post("/pipeline/stop/{pid}/{pl_id}", response_class=HTMLResponse)
-async def pipeline_stop(pid: str, pl_id: str, request: Request):
-    _STOP[f"pl_{pl_id}"] = True
-
-    user = request.state.user
-    doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-    if not pl: return HTMLResponse("")
-    pl["state"] = "done"
-    return HTMLResponse("")  # pipeline card updates via WS OOB
-
-@router.get("/pipeline/step_form/{pid}/{pl_id}", response_class=HTMLResponse)
-async def step_form_new(pid: str, pl_id: str):
-    doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    return HTMLResponse(_step_form_html(doc, pl_id))
-
-@router.get("/pipeline/step_form/{pid}/{pl_id}/{sid}", response_class=HTMLResponse)
-async def step_form_edit(pid: str, pl_id: str, sid: str):
-    doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-    if not pl: return HTMLResponse("")
-    step = next((s for s in pl.get("steps",[]) if s.get("id")==sid), None)
-    return HTMLResponse(_step_form_html(doc, pl_id, step))
-
-@router.post("/pipeline/step/add/{pid}/{pl_id}", response_class=HTMLResponse)
-async def step_add(pid: str, pl_id: str, request: Request):
-    form = await request.form(); doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-    if not pl: return HTMLResponse("")
-    step = _step_from_form(form)
-    pl.setdefault("steps",[]).append(step); _save(doc)
-    return HTMLResponse(_pl_edit_html(doc, pl))
-
-@router.post("/pipeline/step/save/{pid}/{pl_id}/{sid}", response_class=HTMLResponse)
-async def step_save(pid: str, pl_id: str, sid: str, request: Request):
-    form = await request.form()
-    doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-    if not pl: return HTMLResponse("")
-    for s in pl.get("steps",[]):
-        if s.get("id") == sid: s.update(_step_from_form(form, sid)); break
-    _save(doc); return HTMLResponse(_pl_edit_html(doc, pl))
-
-@router.delete("/pipeline/step/{pid}/{pl_id}/{sid}", response_class=HTMLResponse)
-async def step_delete(pid: str, pl_id: str, sid: str, request: Request):
-    doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    pl = next((p for p in doc.get("pipelines",[]) if p["id"]==pl_id), None)
-    if not pl: return HTMLResponse("")
-    pl["steps"] = [s for s in pl.get("steps",[]) if s.get("id") != sid]; _save(doc)
-    return HTMLResponse(_pl_edit_html(doc, pl))
-
 def _step_from_form(form, existing_id=None):
     sep = form.get("output_separator","\n\n---\n\n").replace("\\n","\n")
     return {"id": existing_id or f"stp_{uuid.uuid4().hex[:8]}",
@@ -1005,13 +838,6 @@ def _step_from_form(form, existing_id=None):
             "pause_after": bool(form.get("pause_after")),
             "state": "idle"}
 
-@router.post("/pipeline/step_models/{pid}/{pl_id}", response_class=HTMLResponse)
-async def pipeline_step_models(pid: str, pl_id: str, request: Request):
-    form = await request.form(); cid = form.get("conn_id","")
-    conn = get_conn(cid); models = list_models_sync(conn) if conn else []
-    opts = "".join(f'<option value="{m}">{m}</option>' for m in models) or '<option value="">No models</option>'
-    return HTMLResponse(f'<label style="font-size:.65rem;color:var(--text_muted)">Model<select name="model" class="module-select" style="font-size:.73rem">{opts}</select></label>')
-
 # --- Routes: Settings ---
 
 @router.get("/settings", response_class=HTMLResponse)
@@ -1023,33 +849,6 @@ async def settings_page(request: Request):
 async def settings_save(request: Request):
     form = dict(await request.form()); _SETTINGS.get_group("defaults").save(form)
     return HTMLResponse('<span style="color:#00ffa2">&#x2713; Saved</span>')
-
-@router.get("/pipeline/step/prompts", response_class=HTMLResponse)
-async def step_prompts():
-    prompts = _load_step_prompts()
-    if not prompts: return HTMLResponse('<div style="color:var(--text_muted);font-size:.72rem;padding:.3rem">No saved prompts.</div>')
-    rows = "".join(f"""<div style="display:flex;align-items:center;gap:.3rem;padding:.2rem 0;border-bottom:var(--border-thick) solid var(--border)"><span style="flex:1;font-size:.75rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{_esc(p["name"])}</span><button class="cm-qbtn" type="button" onclick="loadStepPrompt({json.dumps(p.get("system_prompt",""))},{json.dumps(p.get("user_template",""))})" title="Load into form">&#x21B3;</button><button class="cm-qbtn" type="button" style="color:#ff5f5f" hx-delete="{_u("pipeline/step/prompt",p["id"])}" hx-target="#step-prompt-list" hx-swap="innerHTML">&#x2715;</button></div>""" for p in prompts)
-    return HTMLResponse(f'<div id="step-prompt-list">{rows}</div>')
-
-@router.post("/pipeline/step/prompt/save", response_class=HTMLResponse)
-async def step_prompt_save(request: Request):
-    form = await request.form(); prompts = _load_step_prompts()
-    prompts.append({"id": uuid.uuid4().hex[:8], "name": form.get("name","Untitled"), "system_prompt": form.get("system_prompt",""), "user_template": form.get("user_template","")})
-    _save_step_prompts(prompts)
-    return await step_prompts()
-
-@router.delete("/pipeline/step/prompt/{pid}", response_class=HTMLResponse)
-async def step_prompt_delete(pid: str):
-    _save_step_prompts([p for p in _load_step_prompts() if p["id"] != pid])
-    return await step_prompts()
-
-@router.post("/doc/toggle_task/{pid}")
-async def doc_toggle_task(pid: str, request: Request):
-    form = await request.form(); doc = _load(pid)
-    if not doc or doc.get("username") != request.state.user.username: return HTMLResponse("")
-    ed = ENV["tools"]["built_ins"].PortalEditor(base_url=_u())
-    doc["content"] = ed._flip_task(doc.get("content",""), int(form.get("idx", -1))); _save(doc)
-    return HTMLResponse(ed.render_preview(doc["content"], task_interactive=True, doc_id=pid))
 
 # --- CSS ---
 
