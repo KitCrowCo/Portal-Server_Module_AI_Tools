@@ -24,11 +24,6 @@ def list_conns(conn_type="ollama", get_all = False) -> list:
         except: pass
     return out
 
-# def get_conn(conn_id="", conn_type="ollama"):
-#     for c in list_conns(conn_type):
-#         if not conn_id or c["_id"] == conn_id: return c
-#     return None
-
 def get_conn(conn_id="", conn_type="ollama"):
     """Explicit id always resolves regardless of type - a user's actual selection shouldn't be filtered out by whatever default type a caller happens to use. Empty id falls back to 'first of conn_type'."""
     if conn_id: return next((c for c in list_conns(get_all=True) if c["_id"] == conn_id), None)
@@ -39,14 +34,18 @@ def _base(conn) -> str:
     return f"{'https' if v.get('tls') else 'http'}://{v.get('host','127.0.0.1')}:{v.get('port', 11434)}{v.get('base_path','')}"
 
 def list_models_sync(conn) -> list:
-    with httpx.Client(timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)) as c:
-        r = c.get(f"{_base(conn)}/api/tags")
-        return sorted(m["name"] for m in r.json().get("models",[])) if r.status_code==200 else []
+    try:
+        with httpx.Client(timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)) as c:
+            r = c.get(f"{_base(conn)}/api/tags")
+            return sorted(m["name"] for m in r.json().get("models",[])) if r.status_code==200 else []
+    except: return []
 
 async def list_models_async(conn) -> list:
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=4.0, read=8.0, write=4.0, pool=4.0)) as c:
-        r = await c.get(f"{_base(conn)}/api/tags")
-        return sorted(m["name"] for m in r.json().get("models",[])) if r.status_code==200 else []
+    try: 
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=4.0, read=8.0, write=4.0, pool=4.0)) as c:
+            r = await c.get(f"{_base(conn)}/api/tags")
+            return sorted(m["name"] for m in r.json().get("models",[])) if r.status_code==200 else []
+    except: return []
 
 def tok_estimate(text: str) -> int: return max(1, len(str(text)) // 4) # Fast 4-chars-per-token estimate for English prose.
 

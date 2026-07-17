@@ -13,6 +13,7 @@ from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse
 import openpyxl
 import shutil
+
 from modules.ai_tools.ai_utils import (get_conn, list_conns, list_models_sync, list_models_async, _base, tok_estimate, conn_opts_html, model_opts_html, KG_DIR)
 
 # #*************************************************
@@ -33,18 +34,21 @@ router = APIRouter(redirect_slashes=False)
 ENV: dict = {}
 _P = "/module/ai_tools/athena"
 DATA_DIR = Path("./data/ai_tools/athena")
+KG_DIR = Path("./data/ai_tools/_knowledge")
+COMMON_DIR = Path("./data/_common")
 
 UI = None
 WS = None
 IM = None
 CM = None
+AIM = None
 cfg = {}
 
 def _u(*p): return "/".join(s.strip("/") for s in [_P,*p] if s)
 
 # --- Athena Initialization ---
 def init_tool(env:dict, prefix:str):
-    global ENV, _P, UI, WS, IM, CM, cfg
+    global ENV, _P, UI, WS, IM, CM, AIM, cfg
     ENV = env
     _P = prefix.rstrip("/")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -53,7 +57,7 @@ def init_tool(env:dict, prefix:str):
     WS=ENV["ws"]
     IM=ENV["InterfaceManager"](nesting_level=2, db_path="ai_tools/athena/im_registry.db")
     built_ins = ENV["tools"]["built_ins"]
-
+    AIM = ENV["tools"]["ai_manager"]
     # Configure Athena using the agnostic framework
     cfg = built_ins.SettingsPanel("Athena Settings", [
             built_ins.SettingsGroup("general", "General", [
@@ -148,8 +152,8 @@ def get_connection_options(values=None): return [(c["_id"], c.get("display_name"
 
 def get_model_options(values=None):
     conn_id = (values or {}).get("conn_id") or cfg.get("conn_id","")
-    conn = get_conn(conn_id) if conn_id else None
-    return [(m, m) for m in list_models_sync(conn)] if conn else []
+    conn = AIM.get_conn(conn_id) if conn_id else None
+    return [(m, m) for m in AIM.list_models_sync(conn)] if conn else []
 
 async def _stream_ollama(conn, msgs, model, ctx, think=False, images=None):
     if images and msgs: msgs[-1]["images"] = images

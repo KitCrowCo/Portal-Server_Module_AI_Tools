@@ -10,7 +10,6 @@ from pathlib import Path
 import httpx
 from fastapi import APIRouter, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse
-from modules.ai_tools.ai_utils import (get_conn, list_conns, list_models_sync, list_models_async, _base, tok_estimate, conn_opts_html, model_opts_html, KG_DIR)
 
 TOOL_META = {"label": "Tessa", "icon": "&#x1F4C4;", "description": "AI document workspace and pipeline builder", "singleton": True} #"persistence": "user"}
 
@@ -19,15 +18,15 @@ router = APIRouter(redirect_slashes=False)
 _P = "/module/ai_tools/tessa"
 DATA_DIR = Path("./data/ai_tools/tessa")
 PROJ_DIR = DATA_DIR / "projects"
-
+COMMON_ROOT = Path("./data/_common")
+KG_DIR = Path("./data/ai_tools/_knowledge")
+COMMON_DIR = Path("./data/_common")
 ENV = {}
-UI = WS = IM = CM = BI = PE = _SETTINGS = None
+UI = WS = IM = CM = BI = PE = AIM = _SETTINGS = None
 _ACTIVE: set = set()
 _STOP: dict = {}
 _PIPE_TASKS: dict = {}
 _STREAM_TASKS: dict = {}
-
-S_COL = {"idle":"var(--text_muted)", "running":"#00ffa2", "paused":"#ffcc00", "done":"#3d9aff", "error":"#ff5f5f"}
 
 # --- Helpers ---
 
@@ -85,7 +84,7 @@ async def _stream(conn, messages, model, num_ctx, think=False):
     tb = ""
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=3000.0, write=5.0, pool=5.0)) as c:
-            async with c.stream("POST", f"{_base(conn)}/api/chat", json=pl) as resp:
+            async with c.stream("POST", f"{AIM._base(conn)}/api/chat", json=pl) as resp:
                 if resp.status_code != 200: yield "", "", True, f"HTTP {resp.status_code}"; return
                 async for line in resp.aiter_lines():
                     if not line: continue
@@ -131,8 +130,12 @@ def _files_content(selected):
     return "\n\n".join(parts)
 
 def _chunk_text(text, max_tokens):
+    text = str(text)
+    try: max_tokens = int(max_tokens)
+    except (TypeError, ValueError): max_tokens = 6000
     if max_tokens <= 0 or _tok(text) <= max_tokens: return [text]
-    chars = max_tokens * 4; chunks = []
+    chars = max_tokens * 4
+    chunks = []
     while len(text) > chars:
         split = text.rfind("\n", 0, chars)
         if split <= 0: split = chars
@@ -144,8 +147,8 @@ def _chunk_text(text, max_tokens):
 # --- Init ---
 
 def get_model_options(values=None):
-    conn = get_conn((values or {}).get("conn_id",""))
-    return [(m, m) for m in list_models_sync(conn)] if conn else []
+    conn = AIM.get_conn((values or {}).get("conn_id",""))
+    return [(m, m) for m in AIM.list_models_sync(conn)] if conn else []
 
 def init_tool(env:dict, prefix:str):
     global ENV, UI, WS, IM, CM, BI, PE, _SETTINGS, AIM
@@ -156,7 +159,7 @@ def init_tool(env:dict, prefix:str):
     BI = env["tools"]["built_ins"]
     AIM = ENV["tools"]["ai_manager"]
     _SETTINGS = BI.SettingsPanel("Tessa", [BI.SettingsGroup("defaults", "Defaults", [BI.SettingField("title", "Title", "text", "Tessa"),
-                                                                                     BI.SettingField("conn_id", "Default Connection", "select", options=[("","(none)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in list_conns()]),
+                                                                                     BI.SettingField("conn_id", "Default Connection", "select", options=[("","(none)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in AIM.list_conns()]),
                                                                                      BI.SettingField("model", "Default Model", "select", options=get_model_options),
                                                                                      BI.SettingField("model_ctx", "Context Tokens", "number", 32768),
                                                                                      BI.SettingField("system_prompt", "Default System Prompt", "textarea", "You are a helpful AI assistant."),
@@ -195,8 +198,8 @@ def init_tool(env:dict, prefix:str):
     PE = _TessaEditor(base_url=_u(), autosave_delay="2000ms", enable_graphviz=True, enable_ai=True, IM=IM, nesting_level=2, intent_prefix="tessa_doc")
     IM.scripts["submit"] = [_handle_submit]
     IM.scripts.update({"tessa_doc_apply_ai": [_h_doc_apply_ai], "tessa_doc_conn": [_h_doc_conn], "tessa_doc_model": [_h_doc_model], "tessa_doc_ctx": [_h_doc_ctx], "tessa_files_toggle": [_h_files_toggle]})
-    AIM.steps.register_step_type("chunked_file_pass", _step_tessa_file_pass, "Chunked File Pass",{"conn_id":"select","model":"select","system_prompt":"textarea","user_template":"textarea","chunk_tokens":"number","use_selected":"checkbox","input_source":"text","result_key":"text"})
-    AIM.steps.register_step_type("chunked_synthesis", _step_tessa_synthesis, "Chunked Synthesis", {"conn_id":"select","model":"select","system_prompt":"textarea","user_template":"textarea","chunk_tokens":"number","result_key":"text"})
+    AIM.steps.register_step_type("chunked_file_pass", _step_tessa_file_pass, "Chunked File Pass", {"conn_id": "select", "model": "select", "model_ctx": "number", "system_prompt": "textarea", "user_template": "textarea", "chunk_tokens": "number", "use_selected": "checkbox", "input_source": "text", "result_key": "text"})
+    AIM.steps.register_step_type("chunked_synthesis", _step_tessa_synthesis, "Chunked Synthesis", {"conn_id": "select", "model": "select", "model_ctx": "number", "system_prompt": "textarea", "user_template": "textarea", "chunk_tokens": "number", "result_key": "text"})
     print("[tessa] ready")
 
 # --- Chat Stream ---
@@ -218,7 +221,7 @@ async def _do_stream(username, payload, pid):
     try:
         doc = _load(pid)
         if not doc or doc.get("username") != username: await _err("Project not found."); return
-        conn = get_conn(doc.get("conn_id","")); model = doc.get("model","")
+        conn = AIM.get_conn(doc.get("conn_id","")); model = doc.get("model","")
         if not conn: await _err("No connection configured. Set one in the top bar."); return
         if not model: await _err("No model selected. Choose one in the top bar."); return
         num_ctx = doc.get("model_ctx", 32768)
@@ -272,22 +275,49 @@ def _proj_list_html(username, active_id=""):
 
 def _conn_bar_html(doc, conns, models):
     pid = doc["id"]; cid = doc.get("conn_id",""); mdl = doc.get("model",""); ctx = doc.get("model_ctx",32768)
-    c_opts = conn_opts_html(cid) or '<option value="">No connections</option>'
-    m_opts = "".join(f'<option value="{m}" {"selected" if m==mdl else ""}>{m}</option>' for m in models) or model_opts_html(cid, mdl)
-    return (f"""<div style="display:flex;align-items:center;gap:.4rem;height:100%;padding:0 .5rem;overflow:hidden;"><select class="module-select" style="font-size:.72rem;max-width:8rem;flex-shrink:0" name="conn_id" hx-post="{_u("doc/conn",pid)}" hx-trigger="change" hx-target="#tessa-model-wrap" hx-swap="innerHTML" hx-include="[name=conn_id]">{c_opts}</select><div id="tessa-model-wrap" style="flex-shrink:0"><select class="module-select" style="font-size:.72rem;max-width:11rem" name="model" hx-post="{_u("doc/model",pid)}" hx-trigger="change" hx-include="[name=model]" hx-swap="none">{m_opts}</select></div><label style="font-size:.63rem;color:var(--text_muted);white-space:nowrap;flex-shrink:0">ctx <input type="number" name="model_ctx" value="{ctx}" min="512" max="262144" class="module-select" style="width:4.5rem;font-size:.65rem;padding:.2rem .3rem" hx-post="{_u("doc/ctx",pid)}" hx-trigger="change" hx-include="[name=model_ctx]" hx-swap="none"></label><button class="btn-icon" style="font-size:.65rem;flex-shrink:0;margin-left:auto" hx-get="{_u("settings")}" hx-target="#tessa-center" hx-swap="innerHTML" title="Tessa Settings">&#x2699;</button></div>""")
+    c_opts = AIM.conn_opts_html(cid) or '<option value="">No connections</option>'
+    m_opts = "".join(f'<option value="{m}" {"selected" if m==mdl else ""}>{m}</option>' for m in models) or AIM.model_opts_html(cid, mdl)
+    return f"""<div style="display:flex;align-items:center;gap:.4rem;height:100%;padding:0 .5rem;overflow:hidden;">
+        <select class="module-select" style="font-size:.72rem;max-width:8rem;flex-shrink:0" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_conn","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-target="#tessa-model-wrap" hx-swap="innerHTML" hx-include="this">{c_opts}</select>
+        <div id="tessa-model-wrap" style="flex-shrink:0"><select class="module-select" style="font-size:.72rem;max-width:11rem" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_model","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none">{m_opts}</select></div>
+        <label style="font-size:.63rem;color:var(--text_muted);white-space:nowrap;flex-shrink:0">ctx <input type="number" name="value" value="{ctx}" min="512" max="262144" class="module-select" style="width:4.5rem;font-size:.65rem;padding:.2rem .3rem" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_ctx","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none"></label>
+        <button class="btn-icon" style="font-size:.65rem;flex-shrink:0;margin-left:auto" hx-get="{_u("settings")}" hx-target="#tessa-center" hx-swap="innerHTML" title="Tessa Settings">&#x2699;</button>
+    </div>"""
 
 def _kg_html(doc):
     pid = doc["id"]; selected = set(doc.get("selected_files",[]))
     badge = f'<span style="background:var(--accent_dim);color:var(--accent);border-radius:.2rem;padding:.05rem .3rem;font-size:.6rem">{len(selected)}</span>' if selected else ""
-    tree = UI.tree(items=KG_DIR, mode="file", selectable=True, selected=selected, post_url=_u("files/toggle", pid), target="#tessa-kg-section", swap="outerHTML") if KG_DIR.exists() else '<div style="font-size:.7rem;color:var(--text_muted);padding:.2rem .4rem">No knowledge files yet.</div>'
-    return (f"""<div id="tessa-kg-section" style="border-top:var(--border-thick) solid var(--border)"><details><summary style="padding:.3rem .45rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.3rem">&#x1F4DA; Knowledge {badge}</summary><div style="max-height:28vh;overflow-y:auto;padding:.25rem .4rem">{tree}</div><form hx-post="{_u("kg/upload",pid)}" hx-target="#tessa-kg-section" hx-swap="outerHTML" hx-encoding="multipart/form-data" style="padding:.2rem .4rem;border-top:var(--border-thick) solid var(--border)"><label class="btn-icon" style="cursor:pointer;font-size:.7rem;width:100%;justify-content:center" title="Upload knowledge files">&#x2B06; Upload files<input type="file" name="files" multiple style="display:none" onchange="this.closest('form').requestSubmit()"></label></form></details></div>""")
+    tree = UI.tree(items=KG_DIR, mode="file", selectable=True, selected=selected, post_url="/im/in", target="#tessa-kg-section", swap="outerHTML",
+                   extra_vals={"type": "tessa_files_toggle", "branch": pid, "lvl": 2}) if KG_DIR.exists() else '<div style="font-size:.7rem;color:var(--text_muted);padding:.2rem .4rem">No knowledge files yet.</div>'
+    return f"""<div id="tessa-kg-section" style="border-top:var(--border-thick) solid var(--border)"><details><summary style="padding:.3rem .45rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.3rem">&#x1F4DA; Knowledge {badge}</summary><div style="max-height:28vh;overflow-y:auto;padding:.25rem .4rem">{tree}</div><form hx-post="{_u("kg/upload",pid)}" hx-target="#tessa-kg-section" hx-swap="outerHTML" hx-encoding="multipart/form-data" style="padding:.2rem .4rem;border-top:var(--border-thick) solid var(--border)"><label class="btn-icon" style="cursor:pointer;font-size:.7rem;width:100%;justify-content:center" title="Upload knowledge files">&#x2B06; Upload files<input type="file" name="files" multiple style="display:none" onchange="this.closest('form').requestSubmit()"></label></form></details></div>"""
 
-def _pipelines_html(doc):
-    pid = doc["id"]; pls = doc.get("pipelines",[])
-    cards = "".join(_pipeline_card(doc, pl) for pl in pls) or '<div style="font-size:.72rem;color:var(--text_muted);padding:.3rem .4rem">No pipelines. Click + to create one.</div>'
-    return (f"""<div id="tessa-pipelines-section" style="border-top:var(--border-thick) solid var(--border)"><details open><summary style="padding:.3rem .45rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.3rem">&#x26A1; Pipelines<button class="btn-icon" style="margin-left:auto;font-size:.7rem" hx-get="{_u("pipeline/new_form",pid)}" hx-target="#tessa-pl-editor" hx-swap="innerHTML" onclick="event.stopPropagation()">+</button></summary><div>{cards}</div><div id="tessa-pl-editor"></div></details></div>""")
+def _shadow_store_for(root: Path) -> "BI.ShadowStore": return BI.ShadowStore(BI.FileManager(root), root / "_shadow")
 
-def _left_bottom_html(doc): return _kg_html(doc) + _pipelines_panel_html(doc["id"])
+def _shadow_panel_html(pid: str) -> str:
+    wiki_rows = BI.shadow_review_html(_shadow_store_for(COMMON_ROOT), _u("shadow/wiki/accept")+"/{path}", _u("shadow/wiki/reject")+"/{path}", _u("shadow/wiki/diff")+"/{path}", list_id="shadow-list-wiki")
+    kg_rows = BI.shadow_review_html(_shadow_store_for(KG_DIR), _u("shadow/kg/accept")+"/{path}", _u("shadow/kg/reject")+"/{path}", _u("shadow/kg/diff")+"/{path}", list_id="shadow-list-kg")
+    return f"""<div id="tessa-shadow-section" style="border-top:var(--border-thick) solid var(--border)">
+        <details><summary style="padding:.3rem .45rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none">&#x1F441; Pending Reviews</summary>
+        <div style="max-height:26vh;overflow-y:auto;padding:.2rem .3rem">
+            <div style="font-size:.65rem;color:var(--text_muted);text-transform:uppercase;padding:.2rem 0">Wiki</div><div id="shadow-list-wiki">{wiki_rows}</div>
+            <div style="font-size:.65rem;color:var(--text_muted);text-transform:uppercase;padding:.4rem 0 .2rem">Knowledge</div><div id="shadow-list-kg">{kg_rows}</div>
+        </div></details></div>"""
+
+@router.post("/shadow/{scope}/accept/{rel_path:path}", response_class=HTMLResponse)
+async def shadow_accept(scope: str, rel_path: str):
+    shadow = _shadow_store_for(COMMON_ROOT if scope == "wiki" else KG_DIR); shadow.accept(rel_path)
+    return HTMLResponse(BI.shadow_review_html(shadow, _u(f"shadow/{scope}/accept")+"/{path}", _u(f"shadow/{scope}/reject")+"/{path}", _u(f"shadow/{scope}/diff")+"/{path}", list_id=f"shadow-list-{scope}"))
+
+@router.post("/shadow/{scope}/reject/{rel_path:path}", response_class=HTMLResponse)
+async def shadow_reject(scope: str, rel_path: str):
+    shadow = _shadow_store_for(COMMON_ROOT if scope == "wiki" else KG_DIR); shadow.reject(rel_path)
+    return HTMLResponse(BI.shadow_review_html(shadow, _u(f"shadow/{scope}/accept")+"/{path}", _u(f"shadow/{scope}/reject")+"/{path}", _u(f"shadow/{scope}/diff")+"/{path}", list_id=f"shadow-list-{scope}"))
+
+@router.get("/shadow/{scope}/diff/{rel_path:path}", response_class=HTMLResponse)
+async def shadow_diff_route(scope: str, rel_path: str):
+    return HTMLResponse(f'<pre style="white-space:pre-wrap;margin:0">{_esc(_shadow_store_for(COMMON_ROOT if scope == "wiki" else KG_DIR).diff(rel_path))}</pre>')
+
+def _left_bottom_html(doc): return _kg_html(doc) + _pipelines_panel_html(doc["id"]) + _shadow_panel_html(doc["id"])
 
 def _left_panel(username, doc):
     pid = doc["id"]
@@ -299,13 +329,14 @@ async def _step_tessa_file_pass(config: dict, ctx) -> dict:
     """Iterates selected/knowledge files, chunks each, runs a chat call per chunk, and appends results directly into the target project's document with a separator
     - persists after every chunk so a stopped job leaves real partial progress, matching prior behavior."""
     pid = config["project_id"]
-    conn = get_conn(config.get("conn_id",""))
+    conn = AIM.get_conn(config.get("conn_id",""))
     model = config.get("model","")
     if not conn or not model: raise RuntimeError("tessa_file_pass: connection/model not configured")
     num_ctx, chunk_tokens = config.get("model_ctx", 32768), config.get("chunk_tokens", 6000)
-    sys_p, tpl, sep = config.get("system_prompt",""), config.get("user_template","") or "{chunk_content}", config.get("output_separator","\n\n---\n\n")
+    sys_p, tpl, sep = config.get("system_prompt",""), config.get("user_template","") or "{chunk_content}", config.get("output_separator") or "\n\n---\n\n"
     if config.get("use_selected"):
-        doc = _load(pid); files = sorted(f for f in (doc.get("selected_files",[]) if doc else []) if (KG_DIR/f).is_file())
+        doc = _load(pid)
+        files = sorted(f for f in (doc.get("selected_files",[]) if doc else []) if (KG_DIR/f).is_file())
     else:
         base = KG_DIR/config.get("input_source","").strip("/") if config.get("input_source") else KG_DIR
         files = sorted(str(f.relative_to(KG_DIR)) for f in base.rglob("*") if f.is_file() and not f.name.startswith(".")) if base.exists() else []
@@ -332,11 +363,11 @@ async def _step_tessa_file_pass(config: dict, ctx) -> dict:
 async def _step_tessa_synthesis(config: dict, ctx) -> dict:
     """Chunks the project's CURRENT document content and re-synthesizes chunk by chunk, appending (not replacing) - matches prior accumulate-don't-overwrite behavior."""
     pid = config["project_id"]
-    conn = get_conn(config.get("conn_id",""))
+    conn = AIM.get_conn(config.get("conn_id",""))
     model = config.get("model","")
     if not conn or not model: raise RuntimeError("tessa_synthesis: connection/model not configured")
     num_ctx, chunk_tokens = config.get("model_ctx", 32768), config.get("chunk_tokens", 6000)
-    sys_p, tpl, sep = config.get("system_prompt",""), config.get("user_template","") or "{chunk_content}", config.get("output_separator","\n\n---\n\n")
+    sys_p, tpl, sep = config.get("system_prompt",""), config.get("user_template","") or "{chunk_content}", config.get("output_separator") or "\n\n---\n\n"
     result_key = config.get("result_key","synthesis")
     doc = _load(pid); content = (doc.get("content","") if doc else "").strip()
     if not content: ctx.scratch[result_key] = {"chunks_processed": 0}; return ctx.scratch[result_key]
@@ -376,20 +407,26 @@ def _step_type_options(selected="") -> str:
     return "".join(f'<option value="{t["type"]}" {"selected" if t["type"]==selected else ""}>{_esc(t.get("label",t["type"]))}</option>' for t in AIM.steps.list_step_types())
 
 def _step_config_form_fields(step_type: str, config: dict, pid: str) -> str:
-    """Renders form fields from the step type's own config_schema - the same schema each
-    register_step_type() call already declares. conn_id/model get connection-aware widgets;
-    everything else falls back to its declared field type (textarea/checkbox/number/text)."""
+    """Renders form fields from the step type's own config_schema - the same schema each register_step_type() call already declares.
+    conn_id/model get connection-aware widgets; everything else falls back to its declared field type (textarea/checkbox/number/text)."""
     spec = AIM.steps.get_step_type(step_type)
     schema = (spec or {}).get("config_schema", {})
     out = ""
     for field, ftype in schema.items():
         val = config.get(field, "")
         if field == "conn_id":
-            opts = "".join(f'<option value="{c["_id"]}" {"selected" if c["_id"]==val else ""}>{_esc(c.get("display_name",c["_id"]))}</option>' for c in list_conns(get_all=True))
+            opts = "".join(f'<option value="{c["_id"]}" {"selected" if c["_id"]==val else ""}>{_esc(c.get("display_name",c["_id"]))}</option>' for c in AIM.list_conns(get_all=True))
             out += f"""<label style="font-size:.65rem;color:var(--text_muted)">Connection<select name="cfg_conn_id" class="module-select" style="font-size:.73rem" hx-post="{_u("step_models",pid)}" hx-trigger="change" hx-include="this" hx-target="#step-model-wrap-model" hx-swap="innerHTML"><option value="">(none)</option>{opts}</select></label>"""
         elif field == "model":
             out += f'<div id="step-model-wrap-model"><label style="font-size:.65rem;color:var(--text_muted)">Model<input type="text" name="cfg_model" value="{_esc(str(val))}" class="module-select" style="font-size:.73rem" placeholder="pick a connection above to list models"></label></div>'
-        elif ftype == "textarea": out += f'<label style="font-size:.65rem;color:var(--text_muted)">{field}<textarea name="cfg_{field}" class="module-select" rows="3" style="font-size:.72rem;font-family:var(--font-mono)">{_esc(str(val))}</textarea></label>'
+        elif isinstance(ftype, (list, tuple)):
+            opts = "".join(f'<option value="{_esc(str(o))}" {"selected" if str(o)==str(val or ftype[0])==str(o) else ""}>{_esc(str(o))}</option>' for o in ftype)
+            out += f'<label style="font-size:.65rem;color:var(--text_muted)">{field}<select name="cfg_{field}" class="module-select" style="font-size:.73rem">{opts}</select></label>'
+        elif ftype == "textarea":
+            ta_id = f"cfg-ta-{field}"
+            out += f'<label style="font-size:.65rem;color:var(--text_muted)">{field}<textarea id="{ta_id}" name="cfg_{field}" class="module-select" rows="3" style="font-size:.72rem;font-family:var(--font-mono)">{_esc(str(val))}</textarea></label>'
+            out += f'<div style="font-size:.6rem;color:var(--text_muted);margin:-.1rem 0 .1rem">Reusable text snippets — pick one below to append into this field, or save what you\'ve typed as a new one.</div>'
+            out += AIM.prompt_block_picker_fragment(ta_id)
         elif ftype == "checkbox": out += f'<label style="display:flex;gap:.3rem;align-items:center;font-size:.74rem"><input type="checkbox" name="cfg_{field}" value="1" {"checked" if val else ""}> {field}</label>'
         elif ftype == "number": out += f'<label style="font-size:.65rem;color:var(--text_muted)">{field}<input type="number" name="cfg_{field}" value="{_esc(str(val or 0))}" class="module-select" style="font-size:.73rem"></label>'
         else: out += f'<label style="font-size:.65rem;color:var(--text_muted)">{field}<input type="text" name="cfg_{field}" value="{_esc(str(val))}" class="module-select" style="font-size:.73rem"></label>'
@@ -407,29 +444,53 @@ def _node_form_html(pid: str, pl: dict, node: dict = None) -> str:
     action = _u("pipeline_node_save",pid,pl["id"],nid) if not is_new else _u("pipeline_node_add",pid,pl["id"])
     del_btn = f'<button type="button" class="btn-icon" style="color:#ff5f5f" hx-post="{_u("pipeline_node_delete",pid,pl["id"],nid)}" hx-target="#tessa-node-editor" hx-swap="innerHTML" hx-confirm="Remove node?">Remove</button>' if not is_new else ""
     return f"""<form hx-post="{action}" hx-target="#tessa-node-editor" hx-swap="innerHTML" style="display:flex;flex-direction:column;gap:.35rem;padding:.6rem">
-        <span style="font-weight:600;font-size:.8rem;color:var(--accent)">{"New Node" if is_new else "Edit: "+_esc(nid)}</span>
-        <label style="font-size:.65rem;color:var(--text_muted)">Step Type<select name="type" class="module-select" style="font-size:.73rem" hx-post="{_u("pipeline_node_type_change",pid,pl["id"])}" hx-trigger="change" hx-include="this" hx-target="#tessa-node-cfg" hx-swap="innerHTML">{_step_type_options(ntype)}</select></label>
-        <div id="tessa-node-cfg" style="display:flex;flex-direction:column;gap:.3rem">{cfg_fields}</div>
-        <label style="font-size:.65rem;color:var(--text_muted)">Runs after</label>{_node_multiselect(nodes, prev, nid)}
-        <div style="display:flex;gap:.3rem"><button type="submit" class="button" style="flex:1">{"Add Node" if is_new else "Save Node"}</button>{del_btn}</div>
-    </form>"""
+                   <span style="font-weight:600;font-size:.8rem;color:var(--accent)">{"New Node" if is_new else "Edit: "+_esc(nid)}</span>
+                   <input type="text" name="name" value="{_esc((node or {}).get('name',''))}" placeholder="Node name (e.g. 'Fix grammar pass')" class="module-select" style="font-size:.8rem">
+                   <label style="font-size:.7rem;color:var(--text_muted)">
+                       Step Type
+                       <select name="type" class="module-select" style="font-size:.7rem" hx-post="{_u("pipeline_node_type_change",pid,pl["id"])}" hx-trigger="change" hx-include="this" hx-target="#tessa-node-cfg" hx-swap="innerHTML">
+                           {_step_type_options(ntype)}
+                       </select>
+                   </label>
+                   <div id="tessa-node-cfg" style="display:flex;flex-direction:column;gap:.3rem">{cfg_fields}</div>
+                   <label style="font-size:.7rem;color:var(--text_muted)">Runs after</label>
+                   {_node_multiselect(nodes, prev, nid)}
+                   <div style="display:flex;gap:.1rem"><button type="submit" class="button" style="flex:1">{"Add Node" if is_new else "Save Node"}</button>{del_btn}</div>
+               </form>"""
 
-def _parse_node_form(form) -> tuple: return {k[4:]: v for k, v in form.items() if k.startswith("cfg_")}, form.getlist("prev")
+def _parse_node_form(form, step_type: str = "") -> tuple:
+    """Coerces cfg_* form values to their schema-declared type (number->int/float, checkbox->bool) at the one place that knows the schema, instead of leaving raw strings for step bodies to guess at.
+    Also guarantees every schema field is represented (unchecked checkboxes -> False)."""
+    schema = (AIM.steps.get_step_type(step_type) or {}).get("config_schema", {})
+    config = {}
+    for field, ftype in schema.items():
+        raw = form.get(f"cfg_{field}")
+        if ftype == "number":
+            try: config[field] = int(raw)
+            except (ValueError, TypeError):
+                try: config[field] = float(raw)
+                except (ValueError, TypeError): config[field] = 0
+        elif ftype == "checkbox": config[field] = raw is not None
+        else: config[field] = raw or ""
+    return config, form.getlist("prev")
 
 @router.post("/pipeline_node_type_change/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_node_type_change(pid: str, pl_id: str, request: Request):
-    form = await request.form(); return HTMLResponse(_step_config_form_fields(form.get("type",""), {}, pid))
+    form = await request.form()
+    print("******************")
+    return HTMLResponse(_step_config_form_fields(form.get("type",""), {}, pid))
 
 @router.post("/step_models/{pid}", response_class=HTMLResponse)
 async def step_models(pid: str, request: Request):
-    form = await request.form(); conn = get_conn(form.get("cfg_conn_id",""))
-    models = list_models_sync(conn) if conn else []
+    form = await request.form(); conn = AIM.get_conn(form.get("cfg_conn_id",""))
+    models = AIM.list_models_sync(conn) if conn else []
     opts = "".join(f'<option value="{m}">{m}</option>' for m in models) or '<option value="">No models</option>'
-    return HTMLResponse(f'<label style="font-size:.65rem;color:var(--text_muted)">Model<select name="cfg_model" class="module-select" style="font-size:.73rem">{opts}</select></label>')
+    return HTMLResponse(f'<label style="font-size:.6rem; color:var(--text_muted)">Model<select name="cfg_model" class="module-select" style="font-size:.7rem">{opts}</select></label>')
 
 @router.get("/pipeline_node_form/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_node_form_new(pid: str, pl_id: str):
-    pl = AIM.engine.load_pipeline(pl_id); return HTMLResponse(_node_form_html(pid, pl) if pl else "")
+    pl = AIM.engine.load_pipeline(pl_id)
+    return HTMLResponse(_node_form_html(pid, pl) if pl else "")
 
 @router.get("/pipeline_node_form/{pid}/{pl_id}/{nid}", response_class=HTMLResponse)
 async def pipeline_node_form_edit(pid: str, pl_id: str, nid: str):
@@ -442,9 +503,9 @@ async def pipeline_node_form_edit(pid: str, pl_id: str, nid: str):
 async def pipeline_node_add(pid: str, pl_id: str, request: Request):
     form = await request.form(); pl = AIM.engine.load_pipeline(pl_id)
     if not pl: return HTMLResponse("")
-    config, prev = _parse_node_form(form)
+    config, prev = _parse_node_form(form, form.get("type", ""))
     flow = pl.setdefault("flow", {"nodes": []})
-    flow["nodes"].append({"id": f"n_{uuid.uuid4().hex[:8]}", "type": form.get("type",""), "config": config, "prev": prev, "next": []})
+    flow["nodes"].append({"id": f"n_{uuid.uuid4().hex[:8]}", "name": form.get("name","").strip(), "type": form.get("type",""), "config": config, "prev": prev, "next": []})
     _recompute_next(flow); AIM.engine.save_pipeline(pl)
     return HTMLResponse(_pipeline_editor_html(pid, pl))
 
@@ -455,8 +516,8 @@ async def pipeline_node_save(pid: str, pl_id: str, nid: str, request: Request):
     flow = pl.setdefault("flow", {"nodes": []})
     node = next((n for n in flow["nodes"] if n["id"] == nid), None)
     if not node: return HTMLResponse("")
-    config, prev = _parse_node_form(form)
-    node["type"], node["config"], node["prev"] = form.get("type", node["type"]), config, prev
+    config, prev = _parse_node_form(form, form.get("type", node["type"]))
+    node["name"], node["type"], node["config"], node["prev"] = form.get("name","").strip(), form.get("type", node["type"]), config, prev
     _recompute_next(flow); AIM.engine.save_pipeline(pl)
     return HTMLResponse(_pipeline_editor_html(pid, pl))
 
@@ -472,23 +533,23 @@ async def pipeline_node_delete(pid: str, pl_id: str, nid: str):
 
 def _pipeline_editor_html(pid: str, pl: dict) -> str:
     nodes = pl.get("flow", {}).get("nodes", [])
-    rows = "".join(f"""<div style="display:flex;align-items:center;gap:.3rem;padding:.22rem .4rem;border-bottom:var(--border-thick) solid var(--border);font-size:.73rem">
-        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="after: {', '.join(n.get('prev',[])) or '(start)'}">{_esc(n["id"])} <span style="color:var(--text_muted)">({_esc(n.get("type",""))})</span></span>
-        <button class="btn-icon" style="font-size:.65rem" hx-get="{_u("pipeline_node_form",pid,pl["id"],n["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">&#x270E;</button>
-    </div>""" for n in nodes) or '<div style="font-size:.72rem;color:var(--text_muted);padding:.4rem">No nodes yet.</div>'
+    rows = "".join(f"""<div style="display:flex;align-items:center;gap:.3rem;padding:.2rem .3rem;border-bottom:var(--border-thick) solid var(--border);font-size:.7rem">
+                           <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="after: {', '.join(n.get('prev',[])) or '(start)'}">{_esc(n["id"])} <span style="color:var(--text_muted)">({_esc(n.get("type",""))})</span></span>
+                           <button class="btn-icon" style="font-size:.6rem" hx-get="{_u("pipeline_node_form",pid,pl["id"],n["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">&#x270E;</button>
+                       </div>""" for n in nodes) or '<div style="font-size:.7rem;color:var(--text_muted);padding:.4rem">No nodes yet.</div>'
     return f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
-        <div style="flex-shrink:0;padding:.4rem .5rem;border-bottom:var(--border-thick) solid var(--border);display:flex;align-items:center;gap:.3rem">
-            <input type="text" value="{_esc(pl.get("name",""))}" class="module-select" style="flex:1;font-size:.78rem" hx-post="{_u("pipeline_rename",pid,pl["id"])}" hx-trigger="change" hx-swap="none" name="name">
-            <span style="font-size:.65rem;color:var(--text_muted)">tags: {", ".join(pl.get("tags",[]))}</span>
-        </div>
-        <div style="display:flex;flex:1;min-height:0;overflow:hidden">
-            <div style="flex:0 0 16rem;border-right:var(--border-thick) solid var(--border);display:flex;flex-direction:column;overflow:hidden">
-                <div style="flex:1;overflow-y:auto">{rows}</div>
-                <button class="btn-icon" style="font-size:.75rem;padding:.4rem" hx-get="{_u("pipeline_node_form",pid,pl["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">+ Add Node</button>
-            </div>
-            <div id="tessa-node-editor" style="flex:1;overflow-y:auto"><div style="padding:2rem;color:var(--text_muted);font-size:.8rem;text-align:center">Select or add a node.</div></div>
-        </div>
-    </div>"""
+                   <div style="flex-shrink:0;padding:.4rem .5rem;border-bottom:var(--border-thick) solid var(--border);display:flex;align-items:center;gap:.3rem">
+                       <input type="text" value="{_esc(pl.get("name",""))}" class="module-select" style="flex:1;font-size:.8rem" hx-post="{_u("pipeline_rename",pid,pl["id"])}" hx-trigger="change" hx-swap="none" name="name">
+                       <span style="font-sizpre7rem;color:var(--text_muted)">tags: {", ".join(pl.get("tags",[]))}</span>
+                   </div>
+                   <div style="display:flex; flex:1; min-height:0; overflow:hidden">
+                       <div style="flex:0 0 16rem;border-right:var(--border-thick) solid var(--border);display:flex;flex-direction:column;overflow:hidden">
+                           <div style="flex:1;overflow-y:auto">{rows}</div>
+                           <button class="btn-icon" style="font-size:.7rem;padding:.2rem" hx-get="{_u("pipeline_node_form",pid,pl["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">+ Add Node</button>
+                       </div>
+                       <div id="tessa-node-editor" style="flex:1;overflow-y:auto"><div style="padding:2rem;color:var(--text_muted);font-size:.8rem;text-align:center">Select or add a node.</div></div>
+                   </div>
+               </div>"""
 
 @router.post("/pipeline_rename/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_rename(pid: str, pl_id: str, request: Request):
@@ -517,25 +578,25 @@ def _pipelines_panel_html(pid: str) -> str:
         <div id="tessa-pl-new"></div><div>{cards}</div></details></div>"""
 
 def _pipeline_card_html(pid: str, pl: dict) -> str:
-    pl_id = pl["id"]
-    return f"""<div class="glass" style="padding:.4rem .5rem;margin:.2rem .3rem;font-size:.75rem">
-        <div style="display:flex;align-items:center;gap:.3rem">
+    pl_id = pl["id"]; nodes = pl.get("flow", {}).get("nodes", [])
+    writes_note = '<div style="font-size:.6rem;color:var(--text_muted);margin-top:.1rem">Chunked steps append directly into this project\'s document.</div>' if any(n.get("type","").startswith("chunked_") for n in nodes) else ""
+    rows = "".join(f"""<tr data-node="{n["id"]}"><td style="font-size:.6rem;padding:.1rem .1rem">{_esc(n.get("name") or n["id"])}</td><td style="font-size:.6rem;color:var(--text_muted);padding:.1rem .3rem">{_esc(n.get("type",""))}</td><td class="tsn-status" style="font-size:.6rem;color:var(--text_muted);padding:.1rem .1rem">idle</td><td class="tsn-preview" style="font-size:.6rem;color:var(--text_muted);padding:.1rem .1rem;max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></td></tr>""" for n in nodes)
+    return f"""<div class="glass" style="padding:.2rem .2rem;margin:.1rem .1rem;font-size:.7rem">
+        <div style="display:flex;align-items:center;gap:.1rem">
             <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" hx-get="{_u("pipeline_editor",pid,pl_id)}" hx-target="#tessa-modal" hx-swap="innerHTML">{_esc(pl.get("name",""))}</span>
             <button class="btn-icon" style="color:#ff5f5f;font-size:.7rem" hx-post="{_u("pipeline_delete",pid,pl_id)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" hx-confirm="Delete pipeline?">&#x2715;</button>
         </div>
         <div id="tessa-status-{pl_id}" data-job="" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">
             <button class="cm-qbtn" hx-post="{_u("pipeline_run",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x25B6; Run</button>
-            <span class="tessa-status-label" style="font-size:.65rem;color:var(--text_muted)">idle</span>
+            <span class="tessa-status-label" style="font-size:.6rem;color:var(--text_muted)">idle</span>
         </div>
-        <div class="tessa-status-log" style="font-size:.62rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>
+        {writes_note}
+        <details style="margin-top:.25rem"><summary style="font-size:.6rem;color:var(--text_muted);cursor:pointer">Node status ({len(nodes)})</summary>
+        <table style="width:100%;border-collapse:collapse;margin-top:.2rem">{rows}</table></details>
     </div>"""
 
-@router.post("/pipeline_new_form/{pid}", response_class=HTMLResponse)  # note: fixed to GET below via decorator swap in file
-async def _unused(): pass
-
 @router.get("/pipeline_new_form/{pid}", response_class=HTMLResponse)
-async def pipeline_new_form(pid: str):
-    return HTMLResponse(f'<form hx-post="{_u("pipeline_create",pid)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" style="display:flex;gap:.3rem;padding:.3rem"><input type="text" name="name" class="module-select" placeholder="Pipeline name" style="flex:1;font-size:.75rem" required autofocus><button type="submit" class="button" style="margin-top:0;font-size:.72rem">Create</button></form>')
+async def pipeline_new_form(pid: str): return HTMLResponse(f'<form hx-post="{_u("pipeline_create",pid)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" style="display:flex;gap:.3rem;padding:.3rem"><input type="text" name="name" class="module-select" placeholder="Pipeline name" style="flex:1;font-size:.75rem" required autofocus><button type="submit" class="button" style="margin-top:0;font-size:.72rem">Create</button></form>')
 
 @router.post("/pipeline_create/{pid}", response_class=HTMLResponse)
 async def pipeline_create(pid: str, request: Request):
@@ -544,11 +605,12 @@ async def pipeline_create(pid: str, request: Request):
 
 @router.post("/pipeline_delete/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_delete(pid: str, pl_id: str):
-    AIM.engine.delete_pipeline(pl_id); return HTMLResponse(_pipelines_panel_html(pid))
+    AIM.engine.delete_pipeline(pl_id)
+    return HTMLResponse(_pipelines_panel_html(pid))
 
 @router.post("/pipeline_run/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_run(pid: str, pl_id: str, request: Request):
-    job_id, err = AIM.engine.submit(request.state.user.username, kind="id", pipeline_id=pl_id)
+    job_id, err = AIM.engine.submit(request.state.user.username, kind="id", pipeline_id=pl_id, extra_config={"project_id": pid})
     label = f'<span style="color:#ff5f5f">error: {_esc(err)}</span>' if err else '<span style="color:#00ffa2">running</span>'
     run_btn = f'<button class="cm-qbtn" hx-post="{_u("pipeline_run",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x25B6; Run</button>' if err else ""
     stop_btn = "" if err else f'<button class="cm-qbtn" style="color:#ff4444" hx-post="{_u("pipeline_stop",pid,pl_id,job_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x25FC; Stop</button>'
@@ -564,7 +626,7 @@ async def pipeline_stop(pid: str, pl_id: str, job_id: str):
 def _project_view(request, doc, models=None):
     username = request.state.user.username
     is_working = doc["id"] in _ACTIVE
-    return (PE.render_shell(doc) + f"""<div id="tessa-conn-bar-content" hx-swap-oob="outerHTML">{_conn_bar_html(doc, list_conns(), models or [])}</div><div id="tessa-chat-area" hx-swap-oob="outerHTML"><div id="tessa-chat-area" style="height:100%;overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username, is_working=is_working, stop_url=_u("stop",doc["id"]) if is_working else "")}</div></div><div id="tessa-proj-list" hx-swap-oob="innerHTML">{_proj_list_html(username, doc["id"])}</div><div id="tessa-left-bottom" hx-swap-oob="innerHTML">{_left_bottom_html(doc)}</div>""")
+    return (PE.render_shell(doc) + f"""<div id="tessa-conn-bar-content" hx-swap-oob="outerHTML">{_conn_bar_html(doc, AIM.list_conns(), models or [])}</div><div id="tessa-chat-area" hx-swap-oob="outerHTML"><div id="tessa-chat-area" style="height:100%;overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username, is_working=is_working, stop_url=_u("stop",doc["id"]) if is_working else "")}</div></div><div id="tessa-proj-list" hx-swap-oob="innerHTML">{_proj_list_html(username, doc["id"])}</div><div id="tessa-left-bottom" hx-swap-oob="innerHTML">{_left_bottom_html(doc)}</div>""")
 
 # --- Routes: Main ---
 
@@ -581,19 +643,19 @@ async def root(request: Request):
         doc = _load(docs[0]["id"]) if docs else None
     if not doc: doc = _new_project(user); _save(doc)
     await ENV["set_state"](request, doc["id"], scope="user", namespace="tessa", key="active_pid")
-    conn = get_conn(doc.get("conn_id",""))
-    models = await list_models_async(conn) if conn else []
+    conn = AIM.get_conn(doc.get("conn_id",""))
+    models = await AIM.list_models_async(conn) if conn else []
     if not doc.get("model") and models: doc["model"] = models[0]; _save(doc)
     chat = f'<div id="tessa-chat-area" style="height:100%; overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username)}</div>'
-    top = f'<div style="position:relative"><div id="tessa-conn-bar-content">{_conn_bar_html(doc, list_conns(), models)}</div></div>'
+    top = f'<div style="position:relative"><div id="tessa-conn-bar-content">{_conn_bar_html(doc, AIM.list_conns(), models)}</div></div>'
 
-    TESSA_SCRIPT = """['step_start','step_done','error','done','stopped'].forEach(k => document.addEventListener('pipeline:'+k, function(e){
-                        var el = Array.from(document.querySelectorAll('[id^="tessa-status-"]')).find(x => x.dataset.job === e.detail.job_id);
-                        if(!el) return;
-                        var label = el.querySelector('.tessa-status-label'), log = el.querySelector('.tessa-status-log');
-                        if(label) label.textContent = k === 'step_start' ? ('running: '+(e.detail.name||e.detail.type)) : k;
-                        if(log){ var line=document.createElement('div'); line.textContent = k+(e.detail.node?' ('+e.detail.node+')':'')+(e.detail.message?': '+e.detail.message:''); log.appendChild(line); log.scrollTop = log.scrollHeight; }
-                    }));"""
+    TESSA_SCRIPT = """['step_start','step_done','error'].forEach(k => document.addEventListener('pipeline:'+k, function(e){
+                            var row = document.querySelector('tr[data-node="'+e.detail.node+'"]');
+                            if(!row) return;
+                            var status = row.querySelector('.tsn-status'), preview = row.querySelector('.tsn-preview');
+                            if(status) status.textContent = k === 'step_start' ? 'running' : k;
+                            if(preview){ if(e.detail.message) preview.textContent = e.detail.message; else if(e.detail.preview) preview.textContent = Object.values(e.detail.preview).join(' | '); }
+                        }));"""
 
     return ENV["templates"].TemplateResponse(name="base.html", request=request, context={
         "request": request, "user": user, "nesting_level": 2, "shell_id": IM.branch_id, "code_mirror": True,
@@ -601,24 +663,25 @@ async def root(request: Request):
                      "left":  UI.toolbar(side="left", content=_left_panel(username, doc), size="18rem", overlay=False, start_open=True, resizable=True, nesting_level=2),
                      "right": UI.toolbar(side="right", content=chat, size="22rem", overlay=False, start_open=True, resizable=True, nesting_level=2, id="tessa-right")},
         "content": f"""<div id="tessa-center">{PE.render_shell(doc)}</div><div id="tessa-modal" onclick="if(event.target===this){{this.style.display='none'; this.innerHTML=''}}"></div>""",
-        "extra_css": CSS + CM.CSS + PE.CSS, "extra_script": BI.PORTAL_EDITOR_JS + CM.SCRIPT + TESSA_SCRIPT})
+        "extra_css": CSS + CM.CSS + PE.CSS, "extra_script": BI.PORTAL_EDITOR_JS + CM.SCRIPT + TESSA_SCRIPT + BI.PROMPT_BLOCK_JS})
 
 @router.post("/new", response_class=HTMLResponse)
 async def new_project(request: Request):
-    user = request.state.user; doc = _new_project(user); _save(doc)
+    doc = _new_project(request.state.user)
+    _save(doc)
     await ENV["set_state"](request, doc["id"], scope="user", namespace="tessa", key="active_pid")
     models = []
-    conn = get_conn(doc.get("conn_id",""))
-    if conn: models = await list_models_async(conn)
+    conn = AIM.get_conn(doc.get("conn_id",""))
+    if conn: models = await AIM.list_models_async(conn)
     return HTMLResponse(_project_view(request, doc, models))
 
 @router.get("/load/{pid}", response_class=HTMLResponse)
 async def load_project(pid: str, request: Request):
-    user = request.state.user; doc = _load(pid)
-    if not doc or doc.get("username") != user.username: return HTMLResponse("Not found", status_code=404)
+    doc = _load(pid)
+    if not doc or doc.get("username") != request.state.user.username: return HTMLResponse("Not found", status_code=404)
     await ENV["set_state"](request, pid, scope="user", namespace="tessa", key="active_pid")
-    conn = get_conn(doc.get("conn_id",""))
-    models = await list_models_async(conn) if conn else []
+    conn = AIM.get_conn(doc.get("conn_id",""))
+    models = await AIM.list_models_async(conn) if conn else []
     return HTMLResponse(_project_view(request, doc, models))
 
 @router.delete("/project/{pid}", response_class=HTMLResponse)
@@ -642,7 +705,7 @@ async def _h_doc_conn(request, payload, imr):
     pid = payload.get("branch",""); doc = _load(pid)
     if not doc: return imr
     doc["conn_id"] = payload.get("value",""); _save(doc)
-    conn = get_conn(doc["conn_id"]); models = await list_models_async(conn) if conn else []
+    conn = AIM.get_conn(doc["conn_id"]); models = await AIM.list_models_async(conn) if conn else []
     cur = doc.get("model",""); opts = "".join(f'<option value="{m}" {"selected" if m==cur else ""}>{m}</option>' for m in models) or '<option value="">No models</option>'
     imr.oob(f"""<select class="module-select" style="font-size:.72rem;max-width:11rem" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_model","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none">{opts}</select>""", "tessa-model-wrap")
     return imr
@@ -698,20 +761,31 @@ async def msg_delete(request: Request):
         d = _load(doc["id"])
         if not d: continue
         for m in d.get("conversation",[]):
-            if m.get("id") == mid: m["deleted"] = True; _save(d); return HTMLResponse("")
+            if m.get("id") == mid:
+                m["deleted"] = True
+                _save(d)
+                return HTMLResponse("")
     return HTMLResponse("")
 
 @router.get("/msg/edit_form/{mid}")
 async def msg_edit_form(mid: str, request: Request):
-    user = request.state.user
-    for doc in _list_projects(user.username):
+    for doc in _list_projects(request.state.user.username):
         d = _load(doc["id"])
         if not d: continue
         for m in d.get("conversation",[]):
             if m.get("id") != mid: continue
-            role_cls = "cm-me" if m.get("role")=="user" else "cm-other"
-            avatar = CM._avatar_html(m.get("user_name","?"))
-            return HTMLResponse(f'<div class="cm-msg {role_cls}" id="cm-msg-{mid}" data-msg-id="{mid}">{avatar}<div class="cm-bwrap" style="max-width:90%"><form hx-post="{_u("msg/edit_save",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML" style="display:flex;flex-direction:column;gap:.3rem;width:100%"><textarea name="content" class="cm-input" style="min-height:4rem;overflow-y:auto">{_esc(m.get("content",""))}</textarea><div style="display:flex;gap:.3rem"><button type="submit" class="button" style="font-size:.75rem;margin-top:0">Save</button><button type="button" class="btn-icon" hx-get="{_u("msg/cancel_edit",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML">Cancel</button></div></form></div></div>')
+            return HTMLResponse(f"""<div class="cm-msg {"cm-me" if m.get("role")=="user" else "cm-other"}" id="cm-msg-{mid}" data-msg-id="{mid}">
+                                        {CM._avatar_html(m.get("user_name","?"))}
+                                        <div class="cm-bwrap" style="max-width:90%">
+                                            <form hx-post="{_u("msg/edit_save",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML" style="display:flex;flex-direction:column;gap:.3rem;width:100%">
+                                                <textarea name="content" class="cm-input" style="min-height:4rem;overflow-y:auto">{_esc(m.get("content",""))}</textarea>
+                                                <div style="display:flex;gap:.3rem">
+                                                    <button type="submit" class="button" style="font-size:.75rem;margin-top:0">Save</button>
+                                                    <button type="button" class="btn-icon" hx-get="{_u("msg/cancel_edit",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML">Cancel</button>
+                                                </div>
+                                            </form>
+                                        </div>
+                                    </div>""")
     return HTMLResponse("")
 
 @router.post("/msg/edit_save/{mid}")
@@ -729,8 +803,7 @@ async def msg_edit_save(mid: str, request: Request):
 
 @router.get("/msg/cancel_edit/{mid}")
 async def msg_cancel_edit(mid: str, request: Request):
-    user = request.state.user
-    for doc in _list_projects(user.username):
+    for doc in _list_projects(request.state.user.username):
         d = _load(doc["id"])
         if not d: continue
         for m in d.get("conversation",[]):
@@ -741,19 +814,31 @@ async def msg_cancel_edit(mid: str, request: Request):
 
 @router.post("/msg/retry/{mid}")
 async def msg_retry(mid: str, request: Request):
-    user = request.state.user
-    for doc in _list_projects(user.username):
+    for doc in _list_projects(request.state.user.username):
         d = _load(doc["id"])
         if not d: continue
         msgs = d.get("conversation",[]); idx = next((i for i,m in enumerate(msgs) if m.get("id")==mid), None)
         if idx is None: continue
         m = msgs[idx]; role_cls = "cm-me" if m.get("role")=="user" else "cm-other"
-        return HTMLResponse(f'<div class="cm-msg {role_cls}" id="cm-msg-{mid}" data-msg-id="{mid}">{CM._avatar_html(m.get("user_name","?"))}<div class="cm-bwrap" style="max-width:90%"><form hx-post="{_u("msg/retry_send",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML" style="display:flex;flex-direction:column;gap:.3rem;width:100%"><textarea name="content" class="cm-input" style="min-height:4rem;overflow-y:auto">{_esc(m.get("content",""))}</textarea><div style="display:flex;gap:.3rem"><button type="submit" class="button" style="font-size:.75rem;margin-top:0">&#x21BA; Retry</button><button type="button" class="btn-icon" hx-get="{_u("msg/cancel_edit",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML">Cancel</button></div></form></div></div>')
+        return HTMLResponse(f"""<div class="cm-msg {role_cls}" id="cm-msg-{mid}" data-msg-id="{mid}">
+                                    {CM._avatar_html(m.get("user_name","?"))}
+                                    <div class="cm-bwrap" style="max-width:90%">
+                                        <form hx-post="{_u("msg/retry_send",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML" style="display:flex;flex-direction:column;gap:.3rem;width:100%">
+                                            <textarea name="content" class="cm-input" style="min-height:4rem;overflow-y:auto">{_esc(m.get("content",""))}</textarea>
+                                            <div style="display:flex;gap:.3rem">
+                                                <button type="submit" class="button" style="font-size:.75rem;margin-top:0">&#x21BA; Retry</button>
+                                                <button type="button" class="btn-icon" hx-get="{_u("msg/cancel_edit",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML">Cancel</button>
+                                              </div>
+                                          </form>
+                                      </div>
+                                  </div>""")
     return HTMLResponse("")
 
 @router.post("/msg/retry_send/{mid}")
 async def msg_retry_send(mid: str, request: Request):
-    form = await request.form(); user = request.state.user; new_content = form.get("content","").strip()
+    form = await request.form()
+    user = request.state.user
+    new_content = form.get("content","").strip()
     for doc in _list_projects(user.username):
         d = _load(doc["id"])
         if not d: continue
@@ -762,7 +847,7 @@ async def msg_retry_send(mid: str, request: Request):
         msgs[idx]["content"] = new_content; msgs[idx]["edited"] = True
         d["conversation"] = msgs[:idx+1]; _save(d); pid = d["id"]
         remaining = "".join(CM.render_message(m, is_me=(m.get("role")=="user"), can_delete=True, can_edit=(m.get("role")=="user")) for m in d["conversation"] if not m.get("deleted"))
-        conn = get_conn(d.get("conn_id","")); model = d.get("model","")
+        conn = AIM.get_conn(d.get("conn_id","")); model = d.get("model","")
         if conn and model: asyncio.create_task(_run_chat_task(pid, user.username, conn, _build_messages(d, new_content), model, d.get("model_ctx",32768)))
         return HTMLResponse(f'<div id="cm-msgs-{pid}" class="cm-msgs" data-pinned="true" hx-swap-oob="outerHTML">{remaining}</div>')
     return HTMLResponse("")
@@ -791,23 +876,6 @@ async def _run_chat_task(pid, username, conn, messages, model, num_ctx, think=Fa
 
 # --- Routes: Knowledge Files ---
 
-@router.post("/files/toggle/{pid}", response_class=HTMLResponse)
-async def files_toggle(pid: str, request: Request):
-    form = await request.form(); path = form.get("path",""); is_dir = form.get("is_dir","false")=="true"
-    doc = _load(pid)
-    if not doc: return HTMLResponse("")
-    files = set(doc.get("selected_files",[]));
-    if is_dir:
-        full = KG_DIR/path
-        children = {str(f.relative_to(KG_DIR)) for f in full.rglob("*") if f.is_file() and not f.name.startswith(".")} if full.is_dir() else set()
-        if children and children.issubset(files): files -= children
-        else: files |= children
-    else:
-        if path in files: files.discard(path)
-        else: files.add(path)
-    doc["selected_files"] = list(files); _save(doc)
-    return HTMLResponse(_kg_html(doc))
-
 @router.post("/kg/upload/{pid}", response_class=HTMLResponse)
 async def kg_upload(pid: str, request: Request, files: list[UploadFile] = File(...)):
     doc = _load(pid)
@@ -819,35 +887,28 @@ async def kg_upload(pid: str, request: Request, files: list[UploadFile] = File(.
         dest.write_bytes(await f.read())
     return HTMLResponse(_kg_html(doc))
 
-# --- Routes: Pipelines ---
-
-def _step_from_form(form, existing_id=None):
-    sep = form.get("output_separator","\n\n---\n\n").replace("\\n","\n")
-    return {"id": existing_id or f"stp_{uuid.uuid4().hex[:8]}",
-            "name": form.get("name","Step").strip(),
-            "type": form.get("type","file_pass"),
-            "conn_id": form.get("conn_id",""),
-            "model": form.get("model","").strip(),
-            "model_ctx": max(512, int(form.get("model_ctx",32768) or 32768)),
-            "chunk_tokens": max(0, int(form.get("chunk_tokens",6000) or 6000)),
-            "input_source": form.get("input_source","").strip("/"),
-            "use_selected": bool(form.get("use_selected")),
-            "system_prompt": form.get("system_prompt","").strip(),
-            "user_template": form.get("user_template","").strip() or "{chunk_content}",
-            "output_separator": sep,
-            "pause_after": bool(form.get("pause_after")),
-            "state": "idle"}
-
 # --- Routes: Settings ---
 
 @router.get("/settings", response_class=HTMLResponse)
 async def settings_page(request: Request):
-    group = _SETTINGS.get_group("defaults"); values = group.load()
-    return HTMLResponse(f'<div style="padding:1.5rem"><h2 style="margin:0 0 1rem;font-size:1rem">Tessa Settings</h2><form hx-post="{_u("settings/save")}" hx-target="#tessa-settings-status" style="display:flex;flex-direction:column;gap:.6rem"><div id="tessa-settings-fields">{group.render(values)}</div><button type="submit" class="button" style="margin-top:.5rem">Save Settings</button><div id="tessa-settings-status" style="font-size:.75rem;min-height:1rem"></div></form></div>')
+    group = _SETTINGS.get_group("defaults")
+    values = group.load()
+    body = f"""<form hx-post="{_u("settings/save")}" hx-target="#tessa-settings-status" style="display:flex;flex-direction:column;gap:.6rem">
+                    <div id="tessa-settings-fields">{group.render(values)}</div>
+                    <button type="submit" class="button" style="margin-top:.5rem">Save Settings</button>
+                    <div id="tessa-settings-status" style="font-size:.75rem;min-height:1rem"></div>
+                </form>"""
+    return HTMLResponse(_SETTINGS.page_shell(body, close_url=_u("settings/close"), target_id="tessa-center", title="Tessa Settings"))
+
+@router.get("/settings/close", response_class=HTMLResponse)
+async def settings_close(request: Request):
+    doc = _load(await ENV["get_state"](request, scope="user", namespace="tessa", key="active_pid"))
+    return HTMLResponse(PE.render_shell(doc) if doc else "")
 
 @router.post("/settings/save", response_class=HTMLResponse)
 async def settings_save(request: Request):
-    form = dict(await request.form()); _SETTINGS.get_group("defaults").save(form)
+    form = dict(await request.form())
+    _SETTINGS.get_group("defaults").save(form)
     return HTMLResponse('<span style="color:#00ffa2">&#x2713; Saved</span>')
 
 # --- CSS ---

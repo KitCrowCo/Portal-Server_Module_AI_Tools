@@ -8,6 +8,8 @@ from typing import Optional
 from datetime import datetime
 from fastapi import APIRouter, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse
+
+##Temp
 from modules.ai_tools.ai_utils import *
 import httpx
 from PIL import Image as PILImage
@@ -21,10 +23,12 @@ PROMPTS_DIR = DATA_DIR / "prompts"
 JOB_RECORDS_DIR = DATA_DIR / "job_records"
 INPAINT_DIR = DATA_DIR / "inpaint_inputs"
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+KG_DIR = Path("./data/ai_tools/_knowledge")
+COMMON_DIR = Path("./data/_common")
 
 _gallery_tool = None
 ENV = {}
-UI = WS = IM = TM = _SETTINGS = None
+UI = WS = IM = TM = AIM = _SETTINGS = None
 _WORKER_TASK = None
 thumb_data_uri = None
 
@@ -36,13 +40,14 @@ def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">",
 def _conn_options(values=None): return [("", "(none)")] + [(c["_id"], f'{c.get("display_name", c["_id"])} [{c.get("connection_type","?")}]') for c in list_conns(get_all=True)]
 
 def init_tool(env: dict, prefix: str):
-    global ENV, UI, WS, IM, TM, _SETTINGS, _P, _gallery_tool, thumb_data_uri
+    global ENV, UI, WS, IM, TM, AIM, _SETTINGS, _P, _gallery_tool, thumb_data_uri
     ENV = env
     _P = prefix.rstrip("/")
     UI = env["templates"].env.globals.get("UI")
     WS = env["ws"]
     for d in (PROMPTS_DIR, JOB_RECORDS_DIR, INPAINT_DIR): d.mkdir(parents=True, exist_ok=True)
     bi = env["tools"]["built_ins"]
+    AIM = ENV["tools"]["ai_manager"]
     _SETTINGS = bi.SettingsPanel("Image", [bi.SettingsGroup("defaults", "Defaults", [
         bi.SettingField("text_encoder_conn_id", "Text Encoder Connection", "select", "", options=_conn_options),
         bi.SettingField("image_gen_conn_id", "Image Generation Connection", "select", "", options=_conn_options),
@@ -130,7 +135,7 @@ def _ensure_worker():
 # Config / paths
 
 def _cfg(): return _SETTINGS.get_group("defaults").load()
-def _conn(key): return get_conn(_cfg().get(key, ""))
+def _conn(key): return AIM.get_conn(_cfg().get(key, ""))
 def _output_dir():
     p = Path(_cfg().get("output_dir") or DATA_DIR / "outputs")
     p.mkdir(parents=True, exist_ok=True)
@@ -664,7 +669,7 @@ def _recent_jobs_html():
 
 async def _right_panel_html():
     conn = _conn("image_gen_conn_id")
-    status = await flux2_system_status(conn) if conn else {}
+    status = await AIM.flux2_system_status(conn) if conn else {}
     loaded = status.get("loaded", False)
     active_loras = status.get("active_loras", [])
     last_error = status.get("last_error", "")
@@ -688,7 +693,7 @@ async def _right_panel_html():
     return (f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
                     <div style="padding:.5rem;border-bottom:var(--border-thick) solid var(--border);flex-shrink:0">
                         <div style="font-size:.7rem; text-transform:uppercase; color:var(--text_muted); margin-bottom:.3rem">Image Node</div>
-                        <div style="font-size:.73rem">{"<span style=color:#00ffa2>&#x25CF; loaded</span>" if loaded else "<span style=color:var(--text_muted)>&#x25CF; not loaded</span>"}</div>
+                        <div style="font-size:.7rem">{"<span style=color:#00ffa2>&#x25CF; loaded</span>" if loaded else "<span style=color:var(--text_muted)>&#x25CF; not loaded</span>"}</div>
                         {lora_html}
                         {err_html}
                         {no_conn_html}

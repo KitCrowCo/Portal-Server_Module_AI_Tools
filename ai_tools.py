@@ -7,7 +7,6 @@ from pathlib import Path
 from datetime import datetime
 from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import HTMLResponse
-from modules.ai_tools.ai_utils import *
 
 MODULE_META = {"label": "AI Tools", "icon": "&#x25B3;", "description": "AI Multi-Tool Dashboard", "persistence": "user"}
 
@@ -22,6 +21,7 @@ ENV = {}
 IM = None
 TM = None
 UI = None
+AIM = None
 Tools:dict = {}
 _sub_css = ""
 
@@ -86,7 +86,7 @@ def _load_submodules():
 # --- init_module ---
 
 def init_module(env: dict):
-    global ENV, IM, TM, UI
+    global ENV, IM, TM, UI, AIM
     ENV.update(env)
     UI = ENV["templates"].env.globals.get("UI")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -94,6 +94,7 @@ def init_module(env: dict):
     _TMPL_DIR.mkdir(parents=True, exist_ok=True)
     IM = ENV["InterfaceManager"](nesting_level=1, db_path="ai_tools/im_registry.db")
     TM = ENV["tools"]["built_ins"].TabManager(namespace="ai_tools", tab_bar_id="ait-tab-bar", content_id="ait-workspace", render_content_fn=_tab_content, intent_prefix="ai_tools", IM=IM, scope="user", empty={"tabs": {"launcher": {"id": "launcher", "path": "launcher", "label": "Launcher", "icon": "", "order": 0}}, "active": "launcher"}, nesting_level=1)
+    AIM = ENV["tools"]["ai_manager"]
     _load_submodules()
     if "refresh_system" in ENV: ENV["refresh_system"]() # This is to reupdate routes
 
@@ -106,8 +107,7 @@ def init_module(env: dict):
             return imr
         return _h
 
-    for intent in ("open", "focus", "close"):
-        IM.scripts[f"ai_tools_{intent}_tab"] = [_wrap(getattr(TM, f"_{intent}"))]
+    for intent in ("open", "focus", "close"): IM.scripts[f"ai_tools_{intent}_tab"] = [_wrap(getattr(TM, f"_{intent}"))]
     print(f"[ai_tools] ready | tools: {list(Tools.keys())}")
 
 # --- Helpers ---
@@ -170,8 +170,8 @@ def _conns_html() -> str:
                                     <button class="btn-icon" style="color:#ff5f5f" hx-delete="{_P}/settings/conn/{c['_id']}" hx-target="#ait-conns" hx-swap="outerHTML" hx-confirm="Delete?">&#x2715;</button>
                                 </div>
                             </div>
-                            <div style="font-size:.68rem;color:var(--text_muted);font-family:var(--font-mono);margin-top:.2rem">{c.get("values",{}).get("host","?")}:{c.get("values",{}).get("port","?")}</div>
-                        </div>""" for c in list_conns(get_all = True)) or '<div style="color:var(--text_muted);font-size:.8rem;padding:1rem 0">No connections. Add one below.</div>'
+                            <div style="font-size:.68rem;color:var(--text_muted);font-family:var(--font-mono);margin-top:.2rem">{c.get("values",{}).get("host","?")}{":" + str(c["values"]["port"]) if c.get("values",{}).get("port") else ""}</div>
+                        </div>""" for c in AIM.list_conns(get_all = True)) or '<div style="color:var(--text_muted);font-size:.8rem;padding:1rem 0">No connections. Add one below.</div>'
     type_opts = "".join(f'<option value="{k}">{v.get("_meta",{}).get("display_name",k)}</option>' for k, v in _tmpls().items())
     return f"""<div id="ait-conns" style="padding:1.5rem; height:100%; overflow:auto; box-sizing:border-box;">
                     <h2 style="margin:0 0 1rem;font-size:1rem">Connections</h2>
@@ -201,7 +201,7 @@ def _conn_form(ctype: str, existing: dict = None, cid: str = None) -> str:
         elif ft == "secret":
             fields += f'<label style="font-size:.75rem;color:var(--text_muted)">{lbl}{hs}<input type="password" name="field_{fn}" value="{cur}" class="module-select" style="font-family:var(--font-mono)"></label>'
         elif ft == "integer":
-            fields += f'<label style="font-size:.75rem;color:var(--text_muted)">{lbl}{hs}<input type="number" name="field_{fn}" value="{cur}" step="1" class="module-select"></label>'
+            fields += f'<label style="font-size:.75rem;color:var(--text_muted)">{lbl}{hs}<input type="number" name="field_{fn}" value="{"" if cur is None else cur}" step="1" class="module-select"></label>'
         else:
             fields += f'<label style="font-size:.75rem;color:var(--text_muted)">{lbl}{hs}<input type="text" name="field_{fn}" value="{cur}" class="module-select" {"required" if fd.get("required") else ""}></label>'
     action = f"{_P}/settings/save_conn/{cid}" if cid else f"{_P}/settings/create_conn"
@@ -264,7 +264,6 @@ async def index(request: Request):
         show_navigation = False
         state = {"tabs": {"_lock": {"id": "_lock", "path": active_tool, "label": active_tool, "order": 0}}, "active": "_lock"}
     else:
-        # Standard behavior: Load from state or default to launcher
         active_tool = _tool_key(state.get("tabs", {}).get(state.get("active"), {}).get("path", "launcher"))
         show_navigation = True
 
@@ -272,7 +271,6 @@ async def index(request: Request):
     grps = ""
     for gk, gi in TOOL_GROUPS.items():
         items = [(tk, tv) for tk, tv in reg.items() if tv["group"] == gk and _is_allowed(request, tk)]
-        #items = [(tk, tv) for tk, tv in reg.items() if tv["group"] == gk]
         if not items: continue
         rows = "".join(f"""<div class="ait-item" hx-post="/im/in" hx-vals='{json.dumps({"type": "ai_tools_open_tab", "path": "settings/connections" if tk == "settings" else tk, "label": tv["label"], "icon": tv["icon"], "id": f"ait-{tk}", "lvl": 1, "branch": "ai_tools"})}' hx-target="body" hx-swap="none" title="{tv["description"]}">{tv["icon"]} {tv["label"]}</div>""" for tk, tv in items)
         grps += f'<details class="ait-grp" open><summary>{gi["icon"]} {gi["label"]}</summary><div class="ait-grp-items">{rows}</div></details>'
@@ -305,12 +303,10 @@ async def conn_status(cid: str):
     if not conn: return HTMLResponse(f'<span id="conn-dot-{cid}" class="conn-dot err">&#x25CF;</span>')
     tmpl = _tmpls().get(conn.get("connection_type", ""), {})
     ep = tmpl.get("endpoints", {}).get("health", {})
-    v = conn.get("values", {})
-    url = f"{'https' if v.get('tls') else 'http'}://{v.get('host','127.0.0.1')}:{v.get('port',11434)}{v.get('base_path','')}{ep.get('path','/')}"
     cls, title = "err", "unreachable"
     try:
         async with httpx.AsyncClient(timeout=3.0) as c:
-            r = await c.request(ep.get("method", "GET"), url)
+            r = await c.request(ep.get("method", "GET"), AIM._base(conn))
             cls, title = ("ok", f"online - HTTP {r.status_code}") if r.status_code == 200 else ("warn", f"HTTP {r.status_code}")
     except Exception as e: title = str(e)[:60]
     return HTMLResponse(f'<span id="conn-dot-{cid}" class="conn-dot {cls}" hx-get="{_P}/conn_status/{cid}" hx-trigger="every 30s" hx-swap="outerHTML" title="{title}">&#x25CF;</span>')
@@ -337,8 +333,12 @@ async def create_conn(request: Request):
         ft = fd.get("type", "string")
         if ft == "boolean": vals[fn] = bool(form.get(f"field_{fn}"))
         elif ft == "integer":
-            try: vals[fn] = int(form.get(f"field_{fn}", fd.get("default", 0)))
-            except: vals[fn] = fd.get("default", 0)
+            raw_val = form.get(f"field_{fn}")
+            if not raw_val:
+                vals[fn] = None
+            else:
+                try: vals[fn] = int(raw_val)
+                except: vals[fn] = fd.get("default", 0)
         else: vals[fn] = form.get(f"field_{fn}", fd.get("default", ""))
     cid = f"{ctype}_{uuid.uuid4().hex[:8]}"
     _save_conn(cid, {"connection_type": ctype, "display_name": form.get("display_name", "").strip() or ctype, "values": vals, "created": datetime.utcnow().isoformat()})
@@ -360,8 +360,12 @@ async def save_conn(cid: str, request: Request):
         ft = fd.get("type", "string")
         if ft == "boolean": c["values"][fn] = bool(form.get(f"field_{fn}"))
         elif ft == "integer":
-            try: c["values"][fn] = int(form.get(f"field_{fn}", c["values"].get(fn, 0)))
-            except: pass
+            raw_val = form.get(f"field_{fn}")
+            if not raw_val:
+                c["values"][fn] = None
+            else:
+                try: c["values"][fn] = int(raw_val)
+                except: pass
         else: c["values"][fn] = form.get(f"field_{fn}", c["values"].get(fn, ""))
     c["modified"] = datetime.utcnow().isoformat()
     _save_conn(cid, c)
@@ -378,12 +382,10 @@ async def test_conn(cid: str):
     if not c: return HTMLResponse('<div style="color:#ff5f5f">Not found.</div>')
     tmpl = _tmpls().get(c.get("connection_type", ""), {})
     ep = tmpl.get("endpoints", {}).get("list_models", tmpl.get("endpoints", {}).get("health", {}))
-    v = c.get("values", {})
-    url = f"{'https' if v.get('tls') else 'http'}://{v.get('host','127.0.0.1')}:{v.get('port',11434)}{v.get('base_path','')}{ep.get('path','/')}"
     sc, msg, models_html = "#ff5f5f", "unreachable", ""
     try:
         async with httpx.AsyncClient(timeout=5.0, trust_env=False) as cl:
-            r = await cl.request(ep.get("method", "GET"), url)
+            r = await cl.request(ep.get("method", "GET"), AIM._base(c))
             print("TESTING2", r)
             if r.status_code == 200:
                 sc, msg = "#00ffa2", f"Connected - HTTP {r.status_code}"
@@ -402,7 +404,7 @@ async def test_conn(cid: str):
         sc, msg = "#ff5f5f", "Connection timed out (Check host/port)"
     except Exception as e:
         sc, msg = "#ff5f5f", f"Error: {str(e)}"
-    return HTMLResponse(f'<div class="glass" style="padding:.8rem;margin-top:.5rem"><div style="font-weight:600;font-size:.8rem;color:{sc}">{msg}</div><div style="font-size:.68rem;color:var(--text_muted);font-family:var(--font-mono);margin-top:.2rem">{url}</div>{models_html}</div>')
+    return HTMLResponse(f'<div class="glass" style="padding:.8rem;margin-top:.5rem"><div style="font-weight:600;font-size:.8rem;color:{sc}">{msg}</div><div style="font-size:.68rem;color:var(--text_muted);font-family:var(--font-mono);margin-top:.2rem">{AIM._base(c)}</div>{models_html}</div>')
 
 @router.get("/settings/policy", response_class=HTMLResponse)
 async def settings_policy(request: Request):
