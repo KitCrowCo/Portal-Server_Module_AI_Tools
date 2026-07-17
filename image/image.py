@@ -28,7 +28,7 @@ COMMON_DIR = Path("./data/_common")
 
 _gallery_tool = None
 ENV = {}
-UI = WS = IM = TM = AIM = _SETTINGS = None
+BI = UI = WS = IM = TM = AIM = _SETTINGS = None
 _WORKER_TASK = None
 thumb_data_uri = None
 
@@ -40,33 +40,33 @@ def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">",
 def _conn_options(values=None): return [("", "(none)")] + [(c["_id"], f'{c.get("display_name", c["_id"])} [{c.get("connection_type","?")}]') for c in list_conns(get_all=True)]
 
 def init_tool(env: dict, prefix: str):
-    global ENV, UI, WS, IM, TM, AIM, _SETTINGS, _P, _gallery_tool, thumb_data_uri
+    global ENV, BI, UI, WS, IM, TM, AIM, _SETTINGS, _P, _gallery_tool, thumb_data_uri
     ENV = env
     _P = prefix.rstrip("/")
     UI = env["templates"].env.globals.get("UI")
     WS = env["ws"]
     for d in (PROMPTS_DIR, JOB_RECORDS_DIR, INPAINT_DIR): d.mkdir(parents=True, exist_ok=True)
-    bi = env["tools"]["built_ins"]
+    BI = env["tools"]["built_ins"]
     AIM = ENV["tools"]["ai_manager"]
-    _SETTINGS = bi.SettingsPanel("Image", [bi.SettingsGroup("defaults", "Defaults", [
-        bi.SettingField("text_encoder_conn_id", "Text Encoder Connection", "select", "", options=_conn_options),
-        bi.SettingField("image_gen_conn_id", "Image Generation Connection", "select", "", options=_conn_options),
-        bi.SettingField("model_name", "Model Filename", "text", "flux-2-klein-9b-Q6_K.gguf", hint="Filename — relative to node's transformer dir"),
-        bi.SettingField("vae_name", "VAE Directory Name", "text", "flux2", hint="Directory name — relative to node's VAE dir"),
-        bi.SettingField("output_dir", "Output Directory (local path)", "text", str(DATA_DIR / "outputs"), hint="Full path on THIS container — for gallery scanning"),
-        bi.SettingField("lora_dir", "LoRA Directory (local path)", "text", str(DATA_DIR / "models/loras"), hint="Full path on THIS container — for dropdown scanning"),
-        bi.SettingField("max_sequence_length", "Max Sequence Length", "number", 1024, hint="Tokens; 512–2048. Longer needs more VRAM on encoder node."),
-        bi.SettingField("vae_tiling", "VAE Tiling", "checkbox", True),
-        bi.SettingField("offload_mode", "Memory Offload Mode", "select", "none", options=[("none", "None (fastest, most VRAM)"), ("vae_cpu", "VAE CPU Offload (~1 GB freed, slower)")]),
+    _SETTINGS = BI.SettingsPanel("Image", [bi.SettingsGroup("defaults", "Defaults", [
+        BI.SettingField("text_encoder_conn_id", "Text Encoder Connection", "select", "", options=_conn_options),
+        BI.SettingField("image_gen_conn_id", "Image Generation Connection", "select", "", options=_conn_options),
+        BI.SettingField("model_name", "Model Filename", "text", "flux-2-klein-9b-Q6_K.gguf", hint="Filename — relative to node's transformer dir"),
+        BI.SettingField("vae_name", "VAE Directory Name", "text", "flux2", hint="Directory name — relative to node's VAE dir"),
+        BI.SettingField("output_dir", "Output Directory (local path)", "text", str(DATA_DIR / "outputs"), hint="Full path on THIS container — for gallery scanning"),
+        BI.SettingField("lora_dir", "LoRA Directory (local path)", "text", str(DATA_DIR / "models/loras"), hint="Full path on THIS container — for dropdown scanning"),
+        BI.SettingField("max_sequence_length", "Max Sequence Length", "number", 1024, hint="Tokens; 512–2048. Longer needs more VRAM on encoder node."),
+        BI.SettingField("vae_tiling", "VAE Tiling", "checkbox", True),
+        BI.SettingField("offload_mode", "Memory Offload Mode", "select", "none", options=[("none", "None (fastest, most VRAM)"), ("vae_cpu", "VAE CPU Offload (~1 GB freed, slower)")]),
     ], json_path=str(DATA_DIR / "settings.json"))])
     IM = env["InterfaceManager"](nesting_level=2, db_path="ai_tools/image_im.db")
-    TM = bi.TabManager(namespace="image", tab_bar_id="img-tab-bar", content_id="img-panel", render_content_fn=_render_panel, intent_prefix="image", IM=IM, scope="user", nesting_level=2, allow_new=False, closable=False,
+    TM = BI.TabManager(namespace="image", tab_bar_id="img-tab-bar", content_id="img-panel", render_content_fn=_render_panel, intent_prefix="image", IM=IM, scope="user", nesting_level=2, allow_new=False, closable=False,
         empty={"tabs": {"generate": {"id":"generate","order":0,"label":"Generate","icon":"&#x25B6;"},
                         "inpaint":  {"id":"inpaint","order":1,"label":"Inpaint","icon":"&#x1F58C;"},
                         "gallery":  {"id":"gallery","order":2,"label":"Gallery","icon":"&#x1F5BC;"},
                         "settings": {"id":"settings","order":3,"label":"Settings","icon":"&#x2699;"}}, "active":"generate"})
-    thumb_data_uri = bi.thumb_data_uri
-    _gallery_tool = bi.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image", nesting_level=2, file_manager=_fm())
+    thumb_data_uri = BI.thumb_data_uri
+    _gallery_tool = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image", nesting_level=2, file_manager=_fm())
     # Tab-switch wrapper: update bottom toolbar on tab focus
     def _wrap_tab_action(base_fn):
         async def _h(req, pay, imr):

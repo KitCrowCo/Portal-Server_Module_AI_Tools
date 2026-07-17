@@ -297,18 +297,19 @@ async def launcher():
 @router.get("/right_panel/{tool_key}", response_class=HTMLResponse)
 async def right_panel_route(tool_key: str): return HTMLResponse(_right_panel(tool_key))
 
-@router.get("/conn_status/{cid}", response_class=HTMLResponse)
+@router.get("/conn_status/{cid}")
 async def conn_status(cid: str):
     conn = _load_conn(cid)
     if not conn: return HTMLResponse(f'<span id="conn-dot-{cid}" class="conn-dot err">&#x25CF;</span>')
     tmpl = _tmpls().get(conn.get("connection_type", ""), {})
     ep = tmpl.get("endpoints", {}).get("health", {})
+    url = f"{AIM._base(conn)}{ep.get('path','/')}"
     cls, title = "err", "unreachable"
     try:
-        async with httpx.AsyncClient(timeout=3.0) as c:
-            r = await c.request(ep.get("method", "GET"), AIM._base(conn))
-            cls, title = ("ok", f"online - HTTP {r.status_code}") if r.status_code == 200 else ("warn", f"HTTP {r.status_code}")
-    except Exception as e: title = str(e)[:60]
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0), follow_redirects=True) as c:
+            r = await c.request(ep.get("method", "GET"), url)
+            cls, title = ("ok", f"online - HTTP {r.status_code}") if r.status_code == 200 else ("warn", f"HTTP {r.status_code} @ {url}")
+    except Exception as e: title = f"{str(e)[:60]} @ {url}"
     return HTMLResponse(f'<span id="conn-dot-{cid}" class="conn-dot {cls}" hx-get="{_P}/conn_status/{cid}" hx-trigger="every 30s" hx-swap="outerHTML" title="{title}">&#x25CF;</span>')
 
 @router.get("/settings/connections/", response_class=HTMLResponse)
@@ -384,7 +385,7 @@ async def test_conn(cid: str):
     ep = tmpl.get("endpoints", {}).get("list_models", tmpl.get("endpoints", {}).get("health", {}))
     sc, msg, models_html = "#ff5f5f", "unreachable", ""
     try:
-        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as cl:
+        async with httpx.AsyncClient(timeout=5.0, trust_env=False, follow_redirects=True) as cl:
             r = await cl.request(ep.get("method", "GET"), AIM._base(c))
             print("TESTING2", r)
             if r.status_code == 200:

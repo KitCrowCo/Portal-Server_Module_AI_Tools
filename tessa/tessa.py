@@ -84,7 +84,7 @@ async def _stream(conn, messages, model, num_ctx, think=False):
     tb = ""
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=3000.0, write=5.0, pool=5.0)) as c:
-            async with c.stream("POST", f"{AIM._base(conn)}/api/chat", json=pl) as resp:
+            async with c.stream("POST", f"{AIM.connections._base(conn)}/api/chat", json=pl) as resp:
                 if resp.status_code != 200: yield "", "", True, f"HTTP {resp.status_code}"; return
                 async for line in resp.aiter_lines():
                     if not line: continue
@@ -147,8 +147,8 @@ def _chunk_text(text, max_tokens):
 # --- Init ---
 
 def get_model_options(values=None):
-    conn = AIM.get_conn((values or {}).get("conn_id",""))
-    return [(m, m) for m in AIM.list_models_sync(conn)] if conn else []
+    conn = AIM.connections.get_conn((values or {}).get("conn_id",""))
+    return [(m, m) for m in AIM.connections.list_models_sync(conn)] if conn else []
 
 def init_tool(env:dict, prefix:str):
     global ENV, UI, WS, IM, CM, BI, PE, _SETTINGS, AIM
@@ -159,7 +159,7 @@ def init_tool(env:dict, prefix:str):
     BI = env["tools"]["built_ins"]
     AIM = ENV["tools"]["ai_manager"]
     _SETTINGS = BI.SettingsPanel("Tessa", [BI.SettingsGroup("defaults", "Defaults", [BI.SettingField("title", "Title", "text", "Tessa"),
-                                                                                     BI.SettingField("conn_id", "Default Connection", "select", options=[("","(none)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in AIM.list_conns()]),
+                                                                                     BI.SettingField("conn_id", "Default Connection", "select", options=[("","(none)")] + [(c["_id"], c.get("display_name",c["_id"])) for c in AIM.connections.list_conns()]),
                                                                                      BI.SettingField("model", "Default Model", "select", options=get_model_options),
                                                                                      BI.SettingField("model_ctx", "Context Tokens", "number", 32768),
                                                                                      BI.SettingField("system_prompt", "Default System Prompt", "textarea", "You are a helpful AI assistant."),
@@ -221,7 +221,7 @@ async def _do_stream(username, payload, pid):
     try:
         doc = _load(pid)
         if not doc or doc.get("username") != username: await _err("Project not found."); return
-        conn = AIM.get_conn(doc.get("conn_id","")); model = doc.get("model","")
+        conn = AIM.connections.get_conn(doc.get("conn_id","")); model = doc.get("model","")
         if not conn: await _err("No connection configured. Set one in the top bar."); return
         if not model: await _err("No model selected. Choose one in the top bar."); return
         num_ctx = doc.get("model_ctx", 32768)
@@ -275,8 +275,8 @@ def _proj_list_html(username, active_id=""):
 
 def _conn_bar_html(doc, conns, models):
     pid = doc["id"]; cid = doc.get("conn_id",""); mdl = doc.get("model",""); ctx = doc.get("model_ctx",32768)
-    c_opts = AIM.conn_opts_html(cid) or '<option value="">No connections</option>'
-    m_opts = "".join(f'<option value="{m}" {"selected" if m==mdl else ""}>{m}</option>' for m in models) or AIM.model_opts_html(cid, mdl)
+    c_opts = AIM.connections.conn_opts_html(cid) or '<option value="">No connections</option>'
+    m_opts = "".join(f'<option value="{m}" {"selected" if m==mdl else ""}>{m}</option>' for m in models) or AIM.connections.model_opts_html(cid, mdl)
     return f"""<div style="display:flex;align-items:center;gap:.4rem;height:100%;padding:0 .5rem;overflow:hidden;">
         <select class="module-select" style="font-size:.72rem;max-width:8rem;flex-shrink:0" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_conn","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-target="#tessa-model-wrap" hx-swap="innerHTML" hx-include="this">{c_opts}</select>
         <div id="tessa-model-wrap" style="flex-shrink:0"><select class="module-select" style="font-size:.72rem;max-width:11rem" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_model","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none">{m_opts}</select></div>
@@ -329,7 +329,7 @@ async def _step_tessa_file_pass(config: dict, ctx) -> dict:
     """Iterates selected/knowledge files, chunks each, runs a chat call per chunk, and appends results directly into the target project's document with a separator
     - persists after every chunk so a stopped job leaves real partial progress, matching prior behavior."""
     pid = config["project_id"]
-    conn = AIM.get_conn(config.get("conn_id",""))
+    conn = AIM.connections.get_conn(config.get("conn_id",""))
     model = config.get("model","")
     if not conn or not model: raise RuntimeError("tessa_file_pass: connection/model not configured")
     num_ctx, chunk_tokens = config.get("model_ctx", 32768), config.get("chunk_tokens", 6000)
@@ -363,7 +363,7 @@ async def _step_tessa_file_pass(config: dict, ctx) -> dict:
 async def _step_tessa_synthesis(config: dict, ctx) -> dict:
     """Chunks the project's CURRENT document content and re-synthesizes chunk by chunk, appending (not replacing) - matches prior accumulate-don't-overwrite behavior."""
     pid = config["project_id"]
-    conn = AIM.get_conn(config.get("conn_id",""))
+    conn = AIM.connections.get_conn(config.get("conn_id",""))
     model = config.get("model","")
     if not conn or not model: raise RuntimeError("tessa_synthesis: connection/model not configured")
     num_ctx, chunk_tokens = config.get("model_ctx", 32768), config.get("chunk_tokens", 6000)
@@ -415,7 +415,7 @@ def _step_config_form_fields(step_type: str, config: dict, pid: str) -> str:
     for field, ftype in schema.items():
         val = config.get(field, "")
         if field == "conn_id":
-            opts = "".join(f'<option value="{c["_id"]}" {"selected" if c["_id"]==val else ""}>{_esc(c.get("display_name",c["_id"]))}</option>' for c in AIM.list_conns(get_all=True))
+            opts = "".join(f'<option value="{c["_id"]}" {"selected" if c["_id"]==val else ""}>{_esc(c.get("display_name",c["_id"]))}</option>' for c in AIM.connections.list_conns(get_all=True))
             out += f"""<label style="font-size:.65rem;color:var(--text_muted)">Connection<select name="cfg_conn_id" class="module-select" style="font-size:.73rem" hx-post="{_u("step_models",pid)}" hx-trigger="change" hx-include="this" hx-target="#step-model-wrap-model" hx-swap="innerHTML"><option value="">(none)</option>{opts}</select></label>"""
         elif field == "model":
             out += f'<div id="step-model-wrap-model"><label style="font-size:.65rem;color:var(--text_muted)">Model<input type="text" name="cfg_model" value="{_esc(str(val))}" class="module-select" style="font-size:.73rem" placeholder="pick a connection above to list models"></label></div>'
@@ -477,13 +477,12 @@ def _parse_node_form(form, step_type: str = "") -> tuple:
 @router.post("/pipeline_node_type_change/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_node_type_change(pid: str, pl_id: str, request: Request):
     form = await request.form()
-    print("******************")
     return HTMLResponse(_step_config_form_fields(form.get("type",""), {}, pid))
 
 @router.post("/step_models/{pid}", response_class=HTMLResponse)
 async def step_models(pid: str, request: Request):
-    form = await request.form(); conn = AIM.get_conn(form.get("cfg_conn_id",""))
-    models = AIM.list_models_sync(conn) if conn else []
+    form = await request.form(); conn = AIM.connections.get_conn(form.get("cfg_conn_id",""))
+    models = AIM.connections.list_models_sync(conn) if conn else []
     opts = "".join(f'<option value="{m}">{m}</option>' for m in models) or '<option value="">No models</option>'
     return HTMLResponse(f'<label style="font-size:.6rem; color:var(--text_muted)">Model<select name="cfg_model" class="module-select" style="font-size:.7rem">{opts}</select></label>')
 
@@ -586,8 +585,9 @@ def _pipeline_card_html(pid: str, pl: dict) -> str:
             <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" hx-get="{_u("pipeline_editor",pid,pl_id)}" hx-target="#tessa-modal" hx-swap="innerHTML">{_esc(pl.get("name",""))}</span>
             <button class="btn-icon" style="color:#ff5f5f;font-size:.7rem" hx-post="{_u("pipeline_delete",pid,pl_id)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" hx-confirm="Delete pipeline?">&#x2715;</button>
         </div>
+        <input type="text" id="tessa-input-{pl_id}" name="input_value" placeholder="Input for this run (fills {{input}} in templates)" class="module-select" style="width:100%;font-size:.7rem;margin:.2rem 0">
         <div id="tessa-status-{pl_id}" data-job="" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">
-            <button class="cm-qbtn" hx-post="{_u("pipeline_run",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x25B6; Run</button>
+            <button class="cm-qbtn" hx-post="{_u("pipeline_run",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML" hx-include="#tessa-input-{pl_id}">&#x25B6; Run</button>
             <span class="tessa-status-label" style="font-size:.6rem;color:var(--text_muted)">idle</span>
         </div>
         {writes_note}
@@ -610,23 +610,27 @@ async def pipeline_delete(pid: str, pl_id: str):
 
 @router.post("/pipeline_run/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_run(pid: str, pl_id: str, request: Request):
-    job_id, err = AIM.engine.submit(request.state.user.username, kind="id", pipeline_id=pl_id, extra_config={"project_id": pid})
+    form = await request.form()
+    job_id, err = AIM.engine.submit(request.state.user.username, kind="id", pipeline_id=pl_id, extra_config={"project_id": pid}, inputs={"input": form.get("input_value","")})
     label = f'<span style="color:#ff5f5f">error: {_esc(err)}</span>' if err else '<span style="color:#00ffa2">running</span>'
     run_btn = f'<button class="cm-qbtn" hx-post="{_u("pipeline_run",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x25B6; Run</button>' if err else ""
     stop_btn = "" if err else f'<button class="cm-qbtn" style="color:#ff4444" hx-post="{_u("pipeline_stop",pid,pl_id,job_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x25FC; Stop</button>'
-    return HTMLResponse(f"""<div id="tessa-status-{pl_id}" data-job="{job_id or ''}" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">{run_btn}{stop_btn}<span class="tessa-status-label" style="font-size:.65rem">{label}</span></div><div class="tessa-status-log" style="font-size:.62rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>""")
+    return HTMLResponse(f"""<div id="tessa-status-{pl_id}" data-job="{job_id or ''}" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">{run_btn}{stop_btn}<span class="tessa-status-label" style="font-size:.65rem">{label}</span></div><div class="tessa-status-log" style="font-size:.62rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>""" + _pipe_status_poll_js(pl_id))
 
 @router.post("/pipeline_stop/{pid}/{pl_id}/{job_id}", response_class=HTMLResponse)
 async def pipeline_stop(pid: str, pl_id: str, job_id: str):
     AIM.engine.stop(job_id)
-    return HTMLResponse(f'<div id="tessa-status-{pl_id}" data-job="{job_id}" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem"><span class="tessa-status-label" style="font-size:.65rem;color:#ffcc00">stopping&#x2026;</span></div><div class="tessa-status-log" style="font-size:.62rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>')
+    return HTMLResponse(f"""<div id="tessa-status-{pl_id}" data-job="{job_id}" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">
+                                <button class="cm-qbtn" hx-post="{_u('pipeline_run', pid, pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x25B6; Run</button>
+                                <span class="tessa-status-label" style="font-size:.65rem;color:var(--text_muted)">stopped</span>
+                            </div>""")
 
 # --- Main View Builder ---
 
 def _project_view(request, doc, models=None):
     username = request.state.user.username
     is_working = doc["id"] in _ACTIVE
-    return (PE.render_shell(doc) + f"""<div id="tessa-conn-bar-content" hx-swap-oob="outerHTML">{_conn_bar_html(doc, AIM.list_conns(), models or [])}</div><div id="tessa-chat-area" hx-swap-oob="outerHTML"><div id="tessa-chat-area" style="height:100%;overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username, is_working=is_working, stop_url=_u("stop",doc["id"]) if is_working else "")}</div></div><div id="tessa-proj-list" hx-swap-oob="innerHTML">{_proj_list_html(username, doc["id"])}</div><div id="tessa-left-bottom" hx-swap-oob="innerHTML">{_left_bottom_html(doc)}</div>""")
+    return (PE.render_shell(doc) + f"""<div id="tessa-conn-bar-content" hx-swap-oob="outerHTML">{_conn_bar_html(doc, AIM.connections.list_conns(), models or [])}</div><div id="tessa-chat-area" hx-swap-oob="outerHTML"><div id="tessa-chat-area" style="height:100%;overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username, is_working=is_working, stop_url=_u("stop",doc["id"]) if is_working else "")}</div></div><div id="tessa-proj-list" hx-swap-oob="innerHTML">{_proj_list_html(username, doc["id"])}</div><div id="tessa-left-bottom" hx-swap-oob="innerHTML">{_left_bottom_html(doc)}</div>""")
 
 # --- Routes: Main ---
 
@@ -643,11 +647,11 @@ async def root(request: Request):
         doc = _load(docs[0]["id"]) if docs else None
     if not doc: doc = _new_project(user); _save(doc)
     await ENV["set_state"](request, doc["id"], scope="user", namespace="tessa", key="active_pid")
-    conn = AIM.get_conn(doc.get("conn_id",""))
-    models = await AIM.list_models_async(conn) if conn else []
+    conn = AIM.connections.get_conn(doc.get("conn_id",""))
+    models = await AIM.connections.list_models_async(conn) if conn else []
     if not doc.get("model") and models: doc["model"] = models[0]; _save(doc)
     chat = f'<div id="tessa-chat-area" style="height:100%; overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username)}</div>'
-    top = f'<div style="position:relative"><div id="tessa-conn-bar-content">{_conn_bar_html(doc, AIM.list_conns(), models)}</div></div>'
+    top = f'<div style="position:relative"><div id="tessa-conn-bar-content">{_conn_bar_html(doc, AIM.connections.list_conns(), models)}</div></div>'
 
     TESSA_SCRIPT = """['step_start','step_done','error'].forEach(k => document.addEventListener('pipeline:'+k, function(e){
                             var row = document.querySelector('tr[data-node="'+e.detail.node+'"]');
@@ -665,14 +669,28 @@ async def root(request: Request):
         "content": f"""<div id="tessa-center">{PE.render_shell(doc)}</div><div id="tessa-modal" onclick="if(event.target===this){{this.style.display='none'; this.innerHTML=''}}"></div>""",
         "extra_css": CSS + CM.CSS + PE.CSS, "extra_script": BI.PORTAL_EDITOR_JS + CM.SCRIPT + TESSA_SCRIPT + BI.PROMPT_BLOCK_JS})
 
+def _pipe_status_poll_js(pl_id: str) -> str:
+    return f"""<script>
+    (function poll(){{
+        fetch('/tool/ai_manager/job_status?job_id='+encodeURIComponent(document.getElementById('tessa-status-{pl_id}').dataset.job))
+            .then(r=>r.json()).then(job=>{{
+                var el = document.getElementById('tessa-status-{pl_id}'); if(!el) return;
+                var label = el.querySelector('.tessa-status-label'); if(label) label.textContent = job.status || 'unknown';
+                var log = el.parentElement.querySelector('.tessa-status-log');
+                if(log && job.log) log.innerHTML = job.log.slice(-8).map(l=>'<div>'+l+'</div>').join('');
+                if(job.status === 'running' || job.status === 'queued') setTimeout(poll, 1200);
+            }}).catch(()=>setTimeout(poll, 2000));
+    }})();
+    </script>"""
+
 @router.post("/new", response_class=HTMLResponse)
 async def new_project(request: Request):
     doc = _new_project(request.state.user)
     _save(doc)
     await ENV["set_state"](request, doc["id"], scope="user", namespace="tessa", key="active_pid")
     models = []
-    conn = AIM.get_conn(doc.get("conn_id",""))
-    if conn: models = await AIM.list_models_async(conn)
+    conn = AIM.connections.get_conn(doc.get("conn_id",""))
+    if conn: models = await AIM.connections.list_models_async(conn)
     return HTMLResponse(_project_view(request, doc, models))
 
 @router.get("/load/{pid}", response_class=HTMLResponse)
@@ -680,8 +698,8 @@ async def load_project(pid: str, request: Request):
     doc = _load(pid)
     if not doc or doc.get("username") != request.state.user.username: return HTMLResponse("Not found", status_code=404)
     await ENV["set_state"](request, pid, scope="user", namespace="tessa", key="active_pid")
-    conn = AIM.get_conn(doc.get("conn_id",""))
-    models = await AIM.list_models_async(conn) if conn else []
+    conn = AIM.connections.get_conn(doc.get("conn_id",""))
+    models = await AIM.connections.list_models_async(conn) if conn else []
     return HTMLResponse(_project_view(request, doc, models))
 
 @router.delete("/project/{pid}", response_class=HTMLResponse)
@@ -705,7 +723,7 @@ async def _h_doc_conn(request, payload, imr):
     pid = payload.get("branch",""); doc = _load(pid)
     if not doc: return imr
     doc["conn_id"] = payload.get("value",""); _save(doc)
-    conn = AIM.get_conn(doc["conn_id"]); models = await AIM.list_models_async(conn) if conn else []
+    conn = AIM.connections.get_conn(doc["conn_id"]); models = await AIM.connections.list_models_async(conn) if conn else []
     cur = doc.get("model",""); opts = "".join(f'<option value="{m}" {"selected" if m==cur else ""}>{m}</option>' for m in models) or '<option value="">No models</option>'
     imr.oob(f"""<select class="module-select" style="font-size:.72rem;max-width:11rem" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_model","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none">{opts}</select>""", "tessa-model-wrap")
     return imr
@@ -847,7 +865,7 @@ async def msg_retry_send(mid: str, request: Request):
         msgs[idx]["content"] = new_content; msgs[idx]["edited"] = True
         d["conversation"] = msgs[:idx+1]; _save(d); pid = d["id"]
         remaining = "".join(CM.render_message(m, is_me=(m.get("role")=="user"), can_delete=True, can_edit=(m.get("role")=="user")) for m in d["conversation"] if not m.get("deleted"))
-        conn = AIM.get_conn(d.get("conn_id","")); model = d.get("model","")
+        conn = AIM.connections.get_conn(d.get("conn_id","")); model = d.get("model","")
         if conn and model: asyncio.create_task(_run_chat_task(pid, user.username, conn, _build_messages(d, new_content), model, d.get("model_ctx",32768)))
         return HTMLResponse(f'<div id="cm-msgs-{pid}" class="cm-msgs" data-pinned="true" hx-swap-oob="outerHTML">{remaining}</div>')
     return HTMLResponse("")
