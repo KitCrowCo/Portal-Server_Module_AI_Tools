@@ -3,7 +3,7 @@
 Kimi - Knowledge Integration Manager Interface. LightRAG ingestion dashboard.
 Sub-module of ai_tools. Mounted at /module/ai_tools/kimi.
 Sources: the shared _knowledge dir (also used by Tessa/Athena pipelines) and the server-wide _common dir.
-All LightRAG protocol logic lives in AIM.lightrag_* - this module is the UI, nothing duplicated here.
+All LightRAG protocol logic lives in AIM.connections.lightrag_* - this module is the UI, nothing duplicated here.
 """
 import json, asyncio
 from datetime import datetime
@@ -66,7 +66,7 @@ async def _kg_state(request, state=None):
         return state
     s = await ENV["get_state"](request, scope="user", namespace="knowledge") or {}
     if not s.get("conn_id"):
-        conns = AIM.list_conns(conn_type="lightrag")
+        conns = AIM.connections.list_conns(conn_type="lightrag")
         s["conn_id"] = conns[0]["_id"] if conns else ""  # auto-default to the only/first connection - no blank placeholder requiring a manual re-select
     s.setdefault("selected_kg", []); s.setdefault("selected_common", [])
     return s
@@ -74,9 +74,9 @@ async def _kg_state(request, state=None):
 # --- Left panel (persistent, not part of tab switching) ---
 
 def _conn_select_html(active_id):
-    conns = AIM.list_conns(conn_type="lightrag")
+    conns = AIM.connections.list_conns(conn_type="lightrag")
     if not conns: return '<div style="font-size:.75rem;color:var(--text_muted)">No LightRAG connections - add one in AI Tools &rarr; Settings &rarr; Connections.</div>'
-    active = AIM.get_conn(active_id, conn_type="lightrag") or conns[0]
+    active = AIM.connections.get_conn(active_id, conn_type="lightrag") or conns[0]
     notes = active.get("values", {}).get("domain_notes", "")
     sel = UI.select("conn_id", [(c["_id"], c.get("display_name", c["_id"])) for c in conns], selected=active["_id"], htmx={"post": _u("conn/select"), "trigger": "change", "target": "#kg-health", "include": "this"})
     notes_html = f'<div style="font-size:.68rem;color:var(--text_muted);margin-top:.2rem">{_esc(notes)}</div>' if notes else ""
@@ -116,7 +116,7 @@ async def _left_panel(request):
 
 async def _panel_query(request):
     s = await _kg_state(request)
-    multi_opts = "".join(f'<label style="display:flex;align-items:center;gap:.3rem;font-size:.76rem"><input type="checkbox" name="conn_ids" value="{c["_id"]}" {"checked" if c["_id"]==s["conn_id"] else ""}> {_esc(c.get("display_name",c["_id"]))}</label>' for c in AIM.list_conns(conn_type="lightrag"))
+    multi_opts = "".join(f'<label style="display:flex;align-items:center;gap:.3rem;font-size:.76rem"><input type="checkbox" name="conn_ids" value="{c["_id"]}" {"checked" if c["_id"]==s["conn_id"] else ""}> {_esc(c.get("display_name",c["_id"]))}</label>' for c in AIM.connections.list_conns(conn_type="lightrag"))
     return f"""<div style="padding:1rem;height:100%;overflow-y:auto;box-sizing:border-box">
                     <form hx-post="{_u('query')}" hx-target="#kg-query-result" style="display:flex;flex-direction:column;gap:.5rem;margin-bottom:.8rem">
                         <div style="display:flex;gap:.4rem">
@@ -144,10 +144,10 @@ async def _panel_paste(request):
 
 async def _panel_docs(request):
     s = await _kg_state(request)
-    conn = AIM.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
     body = '<div style="color:var(--text_muted)">No connection selected.</div>'
     if conn:
-        r = await AIM.lightrag_list_documents(conn)
+        r = await AIM.connections.lightrag_list_documents(conn)
         if "error" in r: body = f'<div style="color:#ff5f5f">{_esc(r["error"])}</div>'
         else:
             rows = r if isinstance(r, list) else (r.get("documents") or r.get("statuses") or [])
@@ -166,9 +166,9 @@ async def _panel_docs(request):
 
 async def _panel_graph(request):
     s = await _kg_state(request)
-    conn = AIM.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
     if not conn: return '<div style="padding:1rem;color:var(--text_muted)">No connection selected.</div>'
-    dot = await AIM.lightrag_graph_dot(conn)
+    dot = await AIM.connections.lightrag_graph_dot(conn)
     if not dot: return '<div style="padding:1rem;color:var(--text_muted)">No graph data available (or this LightRAG version does not expose a listing endpoint at the paths this dashboard tries - check /docs on your instance).</div>'
     return f'<div style="padding:1rem;height:100%;overflow:auto;box-sizing:border-box">{BI.render_graphviz_block(dot, {})}</div>'
 
@@ -207,9 +207,9 @@ async def conn_select(request: Request, conn_id: str = Form("")):
 @router.get("/health", response_class=HTMLResponse)
 async def health(request: Request):
     s = await _kg_state(request)
-    conn = AIM.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
     if not conn: return HTMLResponse('<span style="color:var(--text_muted)">No connection selected.</span>')
-    h = await AIM.lightrag_health(conn)
+    h = await AIM.connections.lightrag_health(conn)
     return HTMLResponse(f'<span style="color:{"#00ffa2" if h.get("ok") else "#ff5f5f"}">{"&#x25CF; online" if h.get("ok") else "&#x25CF; " + _esc(str(h.get("detail","unreachable")))}</span>')
 
 # --- Source selection / ingestion ---
@@ -231,14 +231,14 @@ async def select_file(src: str, request: Request):
 @router.post("/ingest_selected", response_class=HTMLResponse)
 async def ingest_selected(request: Request):
     s = await _kg_state(request)
-    conn = AIM.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
     if not conn: return HTMLResponse('<div style="color:#ff5f5f">No knowledge group selected.</div>')
     preserve = cfg.get_group("general").load().get("preserve_structure", True)
     log = []
     for src, fm in (("kg", FM_KG), ("common", FM_COMMON)):
         for rel in s.get(f"selected_{src}", []):
             try:
-                r = await AIM.lightrag_insert_file(conn, rel if preserve else Path(rel).name, fm.resolve(rel).read_bytes())
+                r = await AIM.connections.lightrag_insert_file(conn, rel if preserve else Path(rel).name, fm.resolve(rel).read_bytes())
                 log.append(f"{rel}: {'ok' if 'error' not in r else r['error'][:80]}")
             except Exception as e: log.append(f"{rel}: error {e}")
     return HTMLResponse("".join(f'<div>{_esc(l)}</div>' for l in log) or '<div style="color:var(--text_muted)">Nothing selected.</div>')
@@ -246,18 +246,18 @@ async def ingest_selected(request: Request):
 @router.post("/insert_text", response_class=HTMLResponse)
 async def insert_text(request: Request, text: str = Form(...), source: str = Form("")):
     s = await _kg_state(request)
-    conn = AIM.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
     if not conn: return HTMLResponse('<div style="color:#ff5f5f">No knowledge group selected.</div>')
-    r = await AIM.lightrag_insert_text(conn, text, source)
+    r = await AIM.connections.lightrag_insert_text(conn, text, source)
     return HTMLResponse(f'<div style="color:{"#ff5f5f" if "error" in r else "var(--accent)"}">{_esc(str(r.get("error") or "Inserted"))}</div>')
 
 # --- Query ---
 
 async def _query_one(conn_id, q, mode, top_k):
-    conn = AIM.get_conn(conn_id, conn_type="lightrag")
+    conn = AIM.connections.get_conn(conn_id, conn_type="lightrag")
     name = conn.get("display_name", conn_id) if conn else conn_id
     if not conn: return name, "connection not found"
-    r = await AIM.lightrag_query_cached(conn, q, mode, top_k=top_k)
+    r = await AIM.connections.lightrag_query_cached(conn, q, mode, top_k=top_k)
     return name, r.get("response") or r.get("error") or json.dumps(r)
 
 @router.post("/query", response_class=HTMLResponse)
@@ -271,8 +271,8 @@ async def query(request: Request, q: str = Form(...), mode: str = Form("hybrid")
 @router.post("/clear_all", response_class=HTMLResponse)
 async def clear_all(request: Request):
     s = await _kg_state(request)
-    conn = AIM.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
-    if conn: await AIM.lightrag_clear_all(conn)
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    if conn: await AIM.connections.lightrag_clear_all(conn)
     return await _panel_docs(request)
 
 # --- Upload ---
@@ -286,13 +286,13 @@ async def upload_modal(src: str, request: Request):
 async def upload(src: str, request: Request, parent: str = Form(""), kind: str = Form("file"), name: str = Form(""), upload: List[UploadFile] = File(default=[]), rel_paths: str = Form("[]")):
     fm = FM_KG if src == "kg" else FM_COMMON
     s = await _kg_state(request)
-    conn = AIM.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
     preserve = cfg.get_group("general").load().get("preserve_structure", True)
 
     async def _auto_ingest(saved_rels):
         if not conn: return
         for rel in saved_rels:
-            try: await AIM.lightrag_insert_file(conn, rel if preserve else Path(rel).name, fm.resolve(rel).read_bytes())
+            try: await AIM.connections.lightrag_insert_file(conn, rel if preserve else Path(rel).name, fm.resolve(rel).read_bytes())
             except Exception: pass
 
     if kind in ("upload", "upload_folder"):
@@ -321,7 +321,7 @@ def _in_window(window: str) -> bool:
 
 async def _run_sync_pass():
     state = _load_sync_state()
-    conns = AIM.list_conns(conn_type="lightrag")
+    conns = AIM.connections.list_conns(conn_type="lightrag")
     if not conns: return
     conn = conns[0]  # scheduled sync targets the default connection - per-connection schedules are future work
     preserve = cfg.get_group("general").load().get("preserve_structure", True)
@@ -333,7 +333,7 @@ async def _run_sync_pass():
             mtime = f.stat().st_mtime
             if state.get(key, 0) >= mtime: continue
             try:
-                await AIM.lightrag_insert_file(conn, rel if preserve else f.name, f.read_bytes())
+                await AIM.connections.lightrag_insert_file(conn, rel if preserve else f.name, f.read_bytes())
                 state[key] = mtime
             except Exception as e: print(f"[kimi] sync failed for {rel}: {e}")
     _save_sync_state(state)

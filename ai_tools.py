@@ -171,7 +171,7 @@ def _conns_html() -> str:
                                 </div>
                             </div>
                             <div style="font-size:.68rem;color:var(--text_muted);font-family:var(--font-mono);margin-top:.2rem">{c.get("values",{}).get("host","?")}{":" + str(c["values"]["port"]) if c.get("values",{}).get("port") else ""}</div>
-                        </div>""" for c in AIM.list_conns(get_all = True)) or '<div style="color:var(--text_muted);font-size:.8rem;padding:1rem 0">No connections. Add one below.</div>'
+                        </div>""" for c in AIM.connections.list_conns(get_all = True)) or '<div style="color:var(--text_muted);font-size:.8rem;padding:1rem 0">No connections. Add one below.</div>'
     type_opts = "".join(f'<option value="{k}">{v.get("_meta",{}).get("display_name",k)}</option>' for k, v in _tmpls().items())
     return f"""<div id="ait-conns" style="padding:1.5rem; height:100%; overflow:auto; box-sizing:border-box;">
                     <h2 style="margin:0 0 1rem;font-size:1rem">Connections</h2>
@@ -303,7 +303,7 @@ async def conn_status(cid: str):
     if not conn: return HTMLResponse(f'<span id="conn-dot-{cid}" class="conn-dot err">&#x25CF;</span>')
     tmpl = _tmpls().get(conn.get("connection_type", ""), {})
     ep = tmpl.get("endpoints", {}).get("health", {})
-    url = f"{AIM._base(conn)}{ep.get('path','/')}"
+    url = f"{AIM.connections._base(conn)}{ep.get('path','/')}"
     cls, title = "err", "unreachable"
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0), follow_redirects=True) as c:
@@ -386,7 +386,7 @@ async def test_conn(cid: str):
     sc, msg, models_html = "#ff5f5f", "unreachable", ""
     try:
         async with httpx.AsyncClient(timeout=5.0, trust_env=False, follow_redirects=True) as cl:
-            r = await cl.request(ep.get("method", "GET"), AIM._base(c))
+            r = await cl.request(ep.get("method", "GET"), AIM.connections._base(c))
             print("TESTING2", r)
             if r.status_code == 200:
                 sc, msg = "#00ffa2", f"Connected - HTTP {r.status_code}"
@@ -405,7 +405,7 @@ async def test_conn(cid: str):
         sc, msg = "#ff5f5f", "Connection timed out (Check host/port)"
     except Exception as e:
         sc, msg = "#ff5f5f", f"Error: {str(e)}"
-    return HTMLResponse(f'<div class="glass" style="padding:.8rem;margin-top:.5rem"><div style="font-weight:600;font-size:.8rem;color:{sc}">{msg}</div><div style="font-size:.68rem;color:var(--text_muted);font-family:var(--font-mono);margin-top:.2rem">{AIM._base(c)}</div>{models_html}</div>')
+    return HTMLResponse(f'<div class="glass" style="padding:.8rem;margin-top:.5rem"><div style="font-weight:600;font-size:.8rem;color:{sc}">{msg}</div><div style="font-size:.68rem;color:var(--text_muted);font-family:var(--font-mono);margin-top:.2rem">{AIM.connections._base(c)}</div>{models_html}</div>')
 
 @router.get("/settings/policy", response_class=HTMLResponse)
 async def settings_policy(request: Request):

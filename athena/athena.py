@@ -14,8 +14,6 @@ from fastapi.responses import HTMLResponse, JSONResponse
 import openpyxl
 import shutil
 
-from modules.ai_tools.ai_utils import (get_conn, list_conns, list_models_sync, list_models_async, _base, tok_estimate, conn_opts_html, model_opts_html, KG_DIR)
-
 # #*************************************************
 # for f in Path("./data/ai_tools/athena/conversations").glob("*.json"):
 #     d = json.loads(f.read_text())
@@ -148,12 +146,12 @@ def _attach_content(conv):
 
 # --- Ollama ---
 
-def get_connection_options(values=None): return [(c["_id"], c.get("display_name", c["_id"])) for c in list_conns()]
+def get_connection_options(values=None): return [(c["_id"], c.get("display_name", c["_id"])) for c in AIM.connections.list_conns()]
 
 def get_model_options(values=None):
     conn_id = (values or {}).get("conn_id") or cfg.get("conn_id","")
-    conn = AIM.get_conn(conn_id) if conn_id else None
-    return [(m, m) for m in AIM.list_models_sync(conn)] if conn else []
+    conn = AIM.connections.get_conn(conn_id) if conn_id else None
+    return [(m, m) for m in AIM.connections.list_models_sync(conn)] if conn else []
 
 async def _stream_ollama(conn, msgs, model, ctx, think=False, images=None):
     if images and msgs: msgs[-1]["images"] = images
@@ -161,7 +159,7 @@ async def _stream_ollama(conn, msgs, model, ctx, think=False, images=None):
     if think: pl["think"] = True
     tb = ""
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=1800.0, write=10.0, pool=30.0)) as c:
-        async with c.stream("POST", f"{_base(conn)}/api/chat", json=pl) as resp:
+        async with c.stream("POST", f"{AIM.connections._base(conn)}/api/chat", json=pl) as resp:
             if resp.status_code == 503: yield "", "", True, "Ollama busy (503)"; return
             if resp.status_code != 200:
                 body = await resp.aread()
@@ -227,7 +225,7 @@ async def _do_stream(username: str, payload: dict, sid: str):
         conv = _load_conv(sid)
         model = conv.get("model") or cfg.get("model","")
         if think: model = conv.get("think_model") or cfg.get("think_model","") or model
-        conn = get_conn(conv.get("conn_id","") or cfg.get("conn_id",""))
+        conn = AIM.connections.get_conn(conv.get("conn_id","") or cfg.get("conn_id",""))
         num_ctx = conv.get("model_ctx", cfg.get("model_ctx",8192))
         if not conn: await _err("No Ollama connection. Add one in AI Tools > Settings."); return
         if not model: await _err("No model configured in Athena Admin."); return
@@ -418,8 +416,6 @@ async def conv_stop(sid:str): _STOP_FLAGS[sid]=True; return HTMLResponse("")
 
 @router.post("/conv/delete/{cid}")
 async def delete_conv(cid: str, request: Request):
-#@router.post("/delete/{cid}")
-#async def delete_conv(cid: str, request: Request):
     user = request.state.user
     conv = _load_conv(cid)
     if conv and conv.get("username") == user.username: _del_conv(cid)

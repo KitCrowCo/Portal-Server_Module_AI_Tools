@@ -8,9 +8,6 @@ from typing import Optional
 from datetime import datetime
 from fastapi import APIRouter, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse
-
-##Temp
-from modules.ai_tools.ai_utils import *
 import httpx
 from PIL import Image as PILImage
 
@@ -37,7 +34,7 @@ def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">",
 
 # --- Init ---
 
-def _conn_options(values=None): return [("", "(none)")] + [(c["_id"], f'{c.get("display_name", c["_id"])} [{c.get("connection_type","?")}]') for c in list_conns(get_all=True)]
+def _conn_options(values=None): return [("", "(none)")] + [(c["_id"], f'{c.get("display_name", c["_id"])} [{c.get("connection_type","?")}]') for c in AIM.connections.list_conns(get_all=True)]
 
 def init_tool(env: dict, prefix: str):
     global ENV, BI, UI, WS, IM, TM, AIM, _SETTINGS, _P, _gallery_tool, thumb_data_uri
@@ -135,7 +132,7 @@ def _ensure_worker():
 # Config / paths
 
 def _cfg(): return _SETTINGS.get_group("defaults").load()
-def _conn(key): return AIM.get_conn(_cfg().get(key, ""))
+def _conn(key): return AIM.connections.get_conn(_cfg().get(key, ""))
 def _output_dir():
     p = Path(_cfg().get("output_dir") or DATA_DIR / "outputs")
     p.mkdir(parents=True, exist_ok=True)
@@ -287,7 +284,7 @@ async def _do_encode(username: str, pid: str):
     conn = _conn("text_encoder_conn_id")
     cfg = _cfg()
     max_len = int(cfg.get("max_sequence_length", 1024))
-    r = await flux2_encode(conn, p["text"], job_id=pid, max_sequence_length=max_len, hard_truncate=True, force_recompute=True)
+    r = await AIM.connections.flux2_encode(conn, p["text"], job_id=pid, max_sequence_length=max_len, hard_truncate=True, force_recompute=True)
     p = _load("prompt", pid)
     if r.get("error"):
         p["status"], p["error"] = "error", r["error"]
@@ -578,7 +575,7 @@ async def _poll_progress(username: str, stop_evt: asyncio.Event):
             if stop_evt.is_set(): break
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as c:
-                    r = await c.get(f"{_base(conn)}/system/progress")
+                    r = await c.get(f"{AIM.connections._base(conn)}/system/progress")
                     if r.status_code != 200: continue
                     prog = r.json()
             except Exception:
@@ -634,9 +631,9 @@ async def _run_job(job):
             payload["num_frames"] = p.get("num_frames", 8)
             payload["frame_strength"] = p.get("frame_strength", 0.35)
             payload["loop"] = True
-            r = await flux2_generate_sequence(conn, payload)
+            r = await AIM.connections.flux2_generate_sequence(conn, payload)
         else:
-            r = await flux2_generate(conn, payload)
+            r = await AIM.connections.flux2_generate(conn, payload)
         if r.get("error"): raise RuntimeError(r["error"])
         result_file = r["file_name"]
         if not (_output_dir() / result_file).exists(): raise RuntimeError(f"Node reported '{result_file}' but file is not in outputs")
@@ -719,12 +716,12 @@ async def system_action(action: str):
     conn = _conn("image_gen_conn_id")
     if conn:
         cfg = _cfg()
-        if action == "load": await flux2_system_load(conn, cfg.get("model_name","flux-2-klein-9b-Q6_K.gguf"), cfg.get("vae_name","flux2"))
-        elif action == "unload": await flux2_system_unload(conn)
-        elif action == "stop": await flux2_system_stop(conn)
+        if action == "load": await AIM.connections.flux2_system_load(conn, cfg.get("model_name","flux-2-klein-9b-Q6_K.gguf"), cfg.get("vae_name","flux2"))
+        elif action == "unload": await AIM.connections.flux2_system_unload(conn)
+        elif action == "stop": await AIM.connections.flux2_system_stop(conn)
         elif action == "clear_error":
             async with httpx.AsyncClient(timeout=httpx.Timeout(connect=3.0, read=5.0, write=3.0, pool=3.0)) as c:
-                try: await c.post(f"{_base(conn)}/system/clear_error")
+                try: await c.post(f"{AIM.connections._base(conn)}/system/clear_error")
                 except Exception: pass
     return HTMLResponse(await _right_panel_html())
 
@@ -823,7 +820,7 @@ async def _render_panel(request, state):
     if active == "gallery": return state, f'<div style="height:100%">{_gallery_tool.render_shell()}</div>'
     if active == "settings": return state, _settings_html()
     conn = _conn("image_gen_conn_id")
-    status = (await flux2_system_status(conn)) if conn else {"_no_conn": True}
+    status = (await AIM.connections.flux2_system_status(conn)) if conn else {"_no_conn": True}
     return state, f'<div id="img-gen-panel" style="height:100%">{_generate_form_html(s["form"], _list("prompt"), s["selected_prompt_id"], status)}</div>'
 
 @router.get("")
