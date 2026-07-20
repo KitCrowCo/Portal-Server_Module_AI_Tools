@@ -45,7 +45,7 @@ def init_tool(env: dict, prefix: str):
     for d in (PROMPTS_DIR, JOB_RECORDS_DIR, INPAINT_DIR): d.mkdir(parents=True, exist_ok=True)
     BI = env["tools"]["built_ins"]
     AIM = ENV["tools"]["ai_manager"]
-    _SETTINGS = BI.SettingsPanel("Image", [bi.SettingsGroup("defaults", "Defaults", [
+    _SETTINGS = BI.SettingsPanel("Image", [BI.SettingsGroup("defaults", "Defaults", [
         BI.SettingField("text_encoder_conn_id", "Text Encoder Connection", "select", "", options=_conn_options),
         BI.SettingField("image_gen_conn_id", "Image Generation Connection", "select", "", options=_conn_options),
         BI.SettingField("model_name", "Model Filename", "text", "flux-2-klein-9b-Q6_K.gguf", hint="Filename — relative to node's transformer dir"),
@@ -306,7 +306,7 @@ async def prompts_delete(pid: str, request: Request):
 # Generate tab
 
 def _lora_row_html(idx, selected_path="", selected_scale=1.0):
-    opts = "".join(f'<option value="{_esc(n)}" {"selected" if n==selected_path else ""}>{_esc(n)}</option>' for n in list_loras(_lora_dir()))
+    opts = "".join(f'<option value="{_esc(n)}" {"selected" if n==selected_path else ""}>{_esc(n)}</option>' for n in AIM.connections.list_loras(_lora_dir()))
     return (f"""<div style="display:flex;gap:.3rem;align-items:center">
                     <select name="lora_{idx}" class="module-select" style="flex:2;font-size:.72rem">
                     <option value="">(none)</option>{opts}</select>
@@ -666,7 +666,7 @@ def _recent_jobs_html():
 
 async def _right_panel_html():
     conn = _conn("image_gen_conn_id")
-    status = await AIM.flux2_system_status(conn) if conn else {}
+    status = await AIM.connections.flux2_system_status(conn) if conn else {}
     loaded = status.get("loaded", False)
     active_loras = status.get("active_loras", [])
     last_error = status.get("last_error", "")
@@ -850,8 +850,8 @@ async def root(request: Request):
             "nesting_level": 2, "shell_id": IM.branch_id,
             "toolbars": {"top": UI.toolbar(side="top", content=tab_bar, size="2.5rem", id="img-top", nesting_level=2, start_open=True, locked=True),
                          "bottom": UI.toolbar(side="bottom", content=f'<div id="img-bottom-content">{bottom_inner}</div>', size="14rem", id="img-bottom", nesting_level=2, start_open=False, resizable=True),
-                         "left": UI.toolbar(side="left", content=left, size="18rem", id="img-left", nesting_level=2, start_open=True, resizable=True),
-                         "right": UI.toolbar(side="right", content=right, size="18rem", id="img-right", nesting_level=2, start_open=True, resizable=True)},
+                         "left": UI.toolbar(side="left", content=left, size="18rem", id="img-left", nesting_level=2, start_open=False, resizable=True),
+                         "right": UI.toolbar(side="right", content=right, size="18rem", id="img-right", nesting_level=2, start_open=False, resizable=True)},
             "content": (f'<div id="img-panel" style="height:100%;overflow:hidden">{panel_html}</div>'), "extra_css": CSS, "extra_script": SCRIPT})
 
 CSS = """

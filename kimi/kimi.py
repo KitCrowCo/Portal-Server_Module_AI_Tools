@@ -11,8 +11,6 @@ from pathlib import Path
 from typing import List
 from fastapi import APIRouter, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse
-# from modules.ai_tools.ai_utils import *
-
 
 TOOL_META = {"label": "Kimi", "group": "knowledge", "icon": "&#x1F4DA;", "description": "Knowledge Integration Manager Interface", "singleton": True}
 
@@ -353,3 +351,12 @@ def right_panel() -> str: return """<div class="ait-rp"><div class="ait-rp-hd">K
 async def sync_now(request: Request):
     asyncio.create_task(_run_sync_pass())
     return HTMLResponse('<span style="color:var(--accent);font-size:.7rem">&#x2713; Sync started (running in background)</span>')
+
+async def _panel_graph(request):
+    s = await _kg_state(request)
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    if not conn: return '<div style="padding:1rem;color:var(--text_muted)">No connection selected.</div>'
+    try: dot = await AIM.connections.lightrag_graph_dot(conn)
+    except Exception as e: return f'<div style="padding:1rem;color:#ff5f5f">Graph fetch failed: {_esc(str(e))}</div>'
+    if not dot: return '<div style="padding:1rem;color:var(--text_muted)">No graph data available.</div>'
+    return f'<div style="padding:1rem;height:100%;overflow:auto;box-sizing:border-box">{BI.render_graphviz_block(dot, {})}</div>'
