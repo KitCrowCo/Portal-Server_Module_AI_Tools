@@ -693,9 +693,6 @@ def _status_block_html(pid: str, pl_id: str, job_id: str, err: str) -> str:
 
 
 def _pipeline_card_html(pid: str, pl: dict) -> str:
-    """Renders one pipeline's card, reconstructed from its last_job_id if one exists - this is
-    what fixes 'nodes never populate until refresh': the table is filled from the job's own
-    saved flow (which IS the progress log) at render time, not waiting on any later JS fetch."""
     pl_id = pl["id"]
     last_job = AIM.engine.load_job(pl.get("last_job_id", "")) if pl.get("last_job_id") else None
     live = bool(last_job and last_job.get("status") in ("running", "queued"))
