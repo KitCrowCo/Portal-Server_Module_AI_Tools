@@ -428,35 +428,38 @@ def _step_config_form_fields(step_type: str, config: dict, pid: str) -> str:
             ta_id = f"cfg-ta-{field}"
             out += f'<label style="font-size:.65rem;color:var(--text_muted)">{field}<textarea id="{ta_id}" name="cfg_{field}" class="module-select" rows="3" style="font-size:.72rem;font-family:var(--font-mono)">{_esc(str(val))}</textarea></label>'
             out += AIM.prompt_block_picker_fragment(ta_id)
+        elif ftype == "pipeline_select":
+            opts = "".join(f'<option value="{p["id"]}" {"selected" if p["id"]==val else ""}>{_esc(p.get("name",p["id"]))} ({_esc(", ".join(p.get("tags",[])))})</option>' for p in AIM.engine.list_pipelines())
+            out += f'<label style="font-size:.6rem;color:var(--text_muted)">{field}<select name="cfg_{field}" class="module-select" style="font-size:.7rem"><option value="">(select)</option>{opts}</select></label>'
         elif ftype == "checkbox": out += f'<label style="display:flex;gap:.3rem;align-items:center;font-size:.7rem"><input type="checkbox" name="cfg_{field}" value="1" {"checked" if val else ""}> {field}</label>'
-        elif ftype == "number": out += f'<label style="font-size:.65rem;color:var(--text_muted)">{field}<input type="number" name="cfg_{field}" value="{_esc(str(val or 0))}" class="module-select" style="font-size:.7rem"></label>'
-        else: out += f'<label style="font-size:.6rem;color:var(--text_muted)">{field}<input type="text" name="cfg_{field}" value="{_esc(str(val))}" class="module-select" style="font-size:.73rem"></label>'
+        elif ftype == "number": out += f'<label style="font-size:.6rem;color:var(--text_muted)">{field}<input type="number" name="cfg_{field}" value="{_esc(str(val or 0))}" class="module-select" style="font-size:.7rem"></label>'
+        else: out += f'<label style="font-size:.6rem; color:var(--text_muted)">{field}<input type="text" name="cfg_{field}" value="{_esc(str(val))}" class="module-select" style="font-size:.73rem"></label>'
     return out
 
 def _node_multiselect(nodes: list, selected: list, exclude_id: str = "") -> str:
-    rows = "".join(f"""<label style="display:flex;align-items:center;gap:.2rem;font-size:.7rem;padding:.1rem 0"><input type="checkbox" name="prev" value="{n["id"]}" {"checked" if n["id"] in selected else ""}> {_esc(n.get("name") or n["id"])} <span style="color:var(--text_muted)">({_esc(n.get("type",""))})</span></label>""" for n in nodes if n["id"] != exclude_id)
-    return rows or '<div style="font-size:.7rem;color:var(--text_muted)">No other nodes yet — this will be a start node.</div>'
+    rows = "".join(f"""<label style="display:flex;align-items:center;gap:.2rem; font-size:.7rem; padding:.1rem 0"><input type="checkbox" name="prev" value="{n["id"]}" {"checked" if n["id"] in selected else ""}> {_esc(n.get("name") or n["id"])} <span style="color:var(--text_muted)">({_esc(n.get("type",""))})</span></label>""" for n in nodes if n["id"] != exclude_id)
+    return rows or '<div style="font-size:.7rem; color:var(--text_muted)">No other nodes yet — this will be a start node.</div>'
 
 def _node_form_html(pid: str, pl: dict, node: dict = None) -> str:
     nodes = pl.get("flow", {}).get("nodes", [])
     nid, is_new = (node or {}).get("id", ""), not (node or {}).get("id")
     ntype, config, prev = (node or {}).get("type", ""), (node or {}).get("config", {}), (node or {}).get("prev", [])
-    cfg_fields = _step_config_form_fields(ntype, config, pid) if ntype else '<div style="color:var(--text_muted);font-size:.72rem">Pick a step type to configure it.</div>'
+    cfg_fields = _step_config_form_fields(ntype, config, pid) if ntype else '<div style="color:var(--text_muted);font-size:.7rem">Pick a step type to configure it.</div>'
     action = _u("pipeline_node_save",pid,pl["id"],nid) if not is_new else _u("pipeline_node_add",pid,pl["id"])
     del_btn = f'<button type="button" class="btn-icon" style="color:#ff5f5f" hx-post="{_u("pipeline_node_delete",pid,pl["id"],nid)}" hx-target="#tessa-node-editor" hx-swap="innerHTML" hx-confirm="Remove node?">Remove</button>' if not is_new else ""
-    return f"""<form hx-post="{action}" hx-target="#tessa-node-editor" hx-swap="innerHTML" style="display:flex;flex-direction:column;gap:.3rem;padding:.3rem">
-                   <span style="font-weight:600;font-size:.8rem;color:var(--accent)">{"New Node" if is_new else "Edit Node"}</span>
+    return f"""<form hx-post="{action}" hx-target="#tessa-node-editor" hx-swap="innerHTML" style="display:flex; flex-direction:column; gap:.2rem; padding:.2rem">
+                   <span style="font-weight:600; font-size:.8rem; color:var(--accent)">{"New Node" if is_new else "Edit Node"}</span>
                    <input type="text" name="name" value="{_esc((node or {}).get('name',''))}" placeholder="Node name" class="module-select" style="font-size:.8rem">
-                   <label style="font-size:.7rem;color:var(--text_muted)">
+                   <label style="font-size:.7rem; color:var(--text_muted)">
                        Step Type
                        <select name="type" class="module-select" style="font-size:.7rem" hx-post="{_u("pipeline_node_type_change",pid,pl["id"])}" hx-trigger="change" hx-include="this" hx-target="#tessa-node-cfg" hx-swap="innerHTML">
                            {_step_type_options(ntype)}
                        </select>
                    </label>
-                   <div id="tessa-node-cfg" style="display:flex;flex-direction:column;gap:.3rem">{cfg_fields}</div>
-                   <label style="font-size:.7rem;color:var(--text_muted)">Runs after</label>
+                   <div id="tessa-node-cfg" style="display:flex;flex-direction:column; gap:.2rem">{cfg_fields}</div>
+                   <label style="font-size:.7rem; color:var(--text_muted)">Runs after</label>
                    {_node_multiselect(nodes, prev, nid)}
-                   <div style="display:flex;gap:.1rem"><button type="submit" class="button" style="flex:1">{"Add Node" if is_new else "Save Node"}</button>{del_btn}</div>
+                   <div style="display:flex; gap:.1rem"><button type="submit" class="button" style="flex:1">{"Add Node" if is_new else "Save Node"}</button>{del_btn}</div>
                </form>"""
 
 def _parse_node_form(form, step_type: str = "") -> tuple:
@@ -542,23 +545,27 @@ async def pipeline_node_delete(pid: str, pl_id: str, nid: str):
 
 def _pipeline_editor_html(pid: str, pl: dict) -> str:
     nodes = pl.get("flow", {}).get("nodes", [])
-    rows = "".join(f"""<div style="display:flex;align-items:center;gap:.3rem;padding:.22rem .4rem;border-bottom:var(--border-thick) solid var(--border);font-size:.73rem">
-        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="after: {', '.join(n.get('prev',[])) or '(start)'}">{_esc(n.get("name") or n["id"])} <span style="color:var(--text_muted)">({_esc(n.get("type",""))})</span></span>
-        <button class="btn-icon" style="font-size:.65rem" hx-get="{_u("pipeline_node_form",pid,pl["id"],n["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">&#x270E;</button>
-    </div>""" for n in nodes) or '<div style="font-size:.72rem;color:var(--text_muted);padding:.4rem">No nodes yet.</div>'
+    rows = "".join(f"""<div style="display:flex; align-items:center; gap:.2rem; padding:.2rem .4rem; border-bottom:var(--border-thick) solid var(--border); font-size:.7rem">
+                           <span style="flex:1; overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="after: {', '.join(n.get('prev',[])) or '(start)'}">
+                               {_esc(n.get("name") or n["id"])} 
+                               <span style="color:var(--text_muted)">({_esc(n.get("type",""))})</span>
+                           </span>
+                           <button class="btn-icon" style="font-size:.6rem" hx-get="{_u("pipeline_node_form",pid,pl["id"],n["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">&#x270E;</button>
+                       </div>""" for n in nodes) or '<div style="font-size:.7rem; color:var(--text_muted); padding:.4rem">No nodes yet.</div>'
     return f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
-        <div style="flex-shrink:0;padding:.4rem .5rem;border-bottom:var(--border-thick) solid var(--border);display:flex;align-items:center;gap:.3rem">
-            <input type="text" value="{_esc(pl.get("name",""))}" class="module-select" style="flex:1;font-size:.78rem" hx-post="{_u("pipeline_rename",pid,pl["id"])}" hx-trigger="change" hx-swap="none" name="name">
-            <span style="font-size:.65rem;color:var(--text_muted)">tags: {", ".join(pl.get("tags",[]))}</span>
-        </div>
-        <div class="tessa-pl-split" style="display:flex;flex:1;min-height:0;overflow:hidden">
-            <div id="tessa-node-editor" style="flex:1;min-width:0;overflow-y:auto;border-right:var(--border-thick) solid var(--border)"><div style="padding:2rem;color:var(--text_muted);font-size:.8rem;text-align:center">Select or add a node.</div></div>
-            <div class="tessa-pl-steps" style="flex:0 0 14rem;display:flex;flex-direction:column;overflow:hidden">
-                <div style="flex:1;overflow-y:auto">{rows}</div>
-                <button class="btn-icon" style="font-size:.75rem;padding:.4rem" hx-get="{_u("pipeline_node_form",pid,pl["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">+ Add Node</button>
-            </div>
-        </div>
-    </div>"""
+                   <div style="flex-shrink:0;padding:.4rem .5rem;border-bottom:var(--border-thick) solid var(--border);display:flex;align-items:center;gap:.3rem">
+                       <input type="text" value="{_esc(pl.get("name",""))}" class="module-select" style="flex:1;font-size:.78rem" hx-post="{_u("pipeline_rename",pid,pl["id"])}" hx-trigger="change" hx-swap="none" name="name">
+                       <span style="font-size:.65rem;color:var(--text_muted)">tags: {", ".join(pl.get("tags",[]))}</span>
+                   </div>
+                   <div class="tessa-pl-split" style="display:flex;flex:1;min-height:0;overflow:hidden">
+                       <div id="tessa-node-editor" style="flex:1;min-width:0;min-height:0;overflow-y:auto;border-right:var(--border-thick) solid var(--border)">
+                           <div style="padding:2rem;color:var(--text_muted);font-size:.8rem;text-align:center">Select or add a node.</div>
+                           <div class="tessa-pl-steps" style="flex:0 0 14rem;min-height:0;display:flex;flex-direction:column;overflow:hidden"></div>
+                           <div style="flex:1;overflow-y:auto">{rows}</div>
+                           <button class="btn-icon" style="font-size:.75rem;padding:.4rem" hx-get="{_u("pipeline_node_form",pid,pl["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">+ Add Node</button>
+                       </div>
+                   </div>
+               </div>"""
 
 @router.post("/pipeline_rename/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_rename(pid: str, pl_id: str, request: Request):
@@ -572,28 +579,30 @@ async def pipeline_editor_route(pid: str, pl_id: str):
     pl = AIM.engine.load_pipeline(pl_id)
     if not pl: return HTMLResponse("")
     return HTMLResponse(f"""<style>
-        @media (max-width: 46rem) {{
-    .tessa-pl-modal {{ width:98vw !important; height:94vh !important; }}
-    .tessa-pl-split {{ flex-direction: column !important; }}
-    .tessa-pl-split #tessa-node-editor {{ flex: 1 1 60% !important; border-right:none !important; }}
-    .tessa-pl-split .tessa-pl-steps {{ flex: 0 0 auto !important; max-height: 8rem !important; border-top: var(--border-thick) solid var(--border) !important; }}
-    .tessa-pl-split select, .tessa-pl-split input {{ font-size: .85rem !important; }}
-}}
-    </style>
-    <div class="glass tessa-pl-modal" style="overflow:hidden;display:flex;flex-direction:column;padding:0">
-        <div style="display:flex;align-items:center;padding:.2rem .2rem;border-bottom:var(--border-thick) solid var(--border);flex-shrink:0">
-            <span style="font-weight:600;color:var(--accent);font-size:.8rem">Pipeline Editor</span>
-            <button onclick="document.getElementById('tessa-modal').style.display='none';document.getElementById('tessa-modal').innerHTML=''" style="margin-left:auto;background:none;border:none;cursor:pointer;font-size:1rem;color:var(--text_muted)">&#x2715;</button>
-        </div>
-        <div style="flex:1;min-height:0;overflow:hidden">{_pipeline_editor_html(pid, pl)}</div>
-    </div><script>document.getElementById("tessa-modal").style.display="flex";</script>""")
+                            @media (max-width: 46rem) {{
+                               .tessa-pl-modal {{ width:98vw !important; height:94vh !important; }}
+                               .tessa-pl-split {{ flex-direction: column !important; }}
+                               .tessa-pl-split #tessa-node-editor {{ flex: 1 1 60% !important; border-right:none !important; }}
+                               .tessa-pl-split .tessa-pl-steps {{ flex: 0 0 auto !important; max-height: 8rem !important; border-top: var(--border-thick) solid var(--border) !important; }}
+                               .tessa-pl-split select, .tessa-pl-split input {{ font-size: .85rem !important; }}
+                            }}
+                            </style>
+                            <div class="glass tessa-pl-modal" style="overflow:hidden;display:flex;flex-direction:column;padding:0">
+                                <div style="display:flex;align-items:center;padding:.2rem .2rem;border-bottom:var(--border-thick) solid var(--border);flex-shrink:0">
+                                    <span style="font-weight:600;color:var(--accent);font-size:.8rem">Pipeline Editor</span>
+                                    <button onclick="document.getElementById('tessa-modal').style.display='none';document.getElementById('tessa-modal').innerHTML=''" style="margin-left:auto;background:none;border:none;cursor:pointer;font-size:1rem;color:var(--text_muted)">&#x2715;</button>
+                                </div>
+                                <div style="flex:1;min-height:0;overflow:hidden">{_pipeline_editor_html(pid, pl)}</div>
+                            </div>
+                            <script>document.getElementById("tessa-modal").style.display="flex";</script>""")
 
 def _pipelines_panel_html(pid: str) -> str:
     pls = _project_pipelines(pid)
-    cards = "".join(_pipeline_card_html(pid, pl) for pl in pls) or '<div style="font-size:.72rem;color:var(--text_muted);padding:.3rem .4rem">No pipelines. Click + to create one.</div>'
+    cards = "".join(_pipeline_card_html(pid, pl) for pl in pls) or '<div style="font-size:.7rem;color:var(--text_muted);padding:.2rem .2rem">No pipelines. Click + to create one.</div>'
     return f"""<div id="tessa-pipelines-section" style="border-top:var(--border-thick) solid var(--border)">
         <details open><summary style="padding:.3rem .45rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.3rem">&#x26A1; Pipelines
         <button class="btn-icon" style="margin-left:auto;font-size:.7rem" hx-get="{_u("pipeline_new_form",pid)}" hx-target="#tessa-pl-new" hx-swap="innerHTML" onclick="event.stopPropagation()">+</button></summary>
+        <label class="btn-icon" style="cursor:pointer;font-size:.7rem" title="Import pipeline JSON">&#x2B06;<input type="file" accept=".json" style="display:none" onchange="tessaImportPipeline(this,'{pid}')"></label>
         <div id="tessa-pl-new"></div><div>{cards}</div></details></div>"""
 
 @router.get("/pipeline_new_form/{pid}", response_class=HTMLResponse)
@@ -638,12 +647,23 @@ async def root(request: Request):
     top = f'<div style="position:relative"><div id="tessa-conn-bar-content">{_conn_bar_html(doc, AIM.connections.list_conns(), models)}</div></div>'
 
     TESSA_SCRIPT = """['step_start','step_done','error'].forEach(k => document.addEventListener('pipeline:'+k, function(e){
-                            var row = document.querySelector('tr[data-node="'+e.detail.node+'"]');
-                            if(!row) return;
-                            var status = row.querySelector('.tsn-status'), preview = row.querySelector('.tsn-preview');
-                            if(status) status.textContent = k === 'step_start' ? 'running' : k;
-                            if(preview){ if(e.detail.message) preview.textContent = e.detail.message; else if(e.detail.preview) preview.textContent = Object.values(e.detail.preview).join(' | '); }
-                        }));"""
+                          var row = document.querySelector('tr[data-node="'+e.detail.node+'"]');
+                          if(!row) return;
+                          var status = row.querySelector('.tsn-status'), preview = row.querySelector('.tsn-preview');
+                          if(status) status.textContent = k === 'step_start' ? 'running' : k;
+                          if(preview){ if(e.detail.message) preview.textContent = e.detail.message; else if(e.detail.preview) preview.textContent = Object.values(e.detail.preview).join(' | '); }}));
+                      function tessaExportPipeline(plId){
+                          fetch('/tool/ai_manager/pipelines/'+plId+'/export').then(r=>r.json()).then(d=>{
+                              var blob = new Blob([JSON.stringify(d, null, 2)], {type:'application/json'});
+                              var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = (d.name||'pipeline')+'.json'; a.click();
+                          });}
+                      async function tessaImportPipeline(input, pid){
+                          var file = input.files[0]; if(!file) return;
+                          var text = await file.text();
+                          await fetch('/tool/ai_manager/pipelines/import', {method:'POST', headers:{'Content-Type':'application/json'}, body:text});
+                          htmx.ajax('GET', '/module/ai_tools/tessa/pipelines_panel/'+pid, {target:'#tessa-pipelines-section', swap:'outerHTML'});
+                      }
+                    """
 
     return ENV["templates"].TemplateResponse(name="base.html", request=request, context={
         "request": request, "user": user, "nesting_level": 2, "shell_id": IM.branch_id, "code_mirror": True,
@@ -654,9 +674,8 @@ async def root(request: Request):
         "extra_css": CSS + CM.CSS + PE.CSS, "extra_script": BI.PORTAL_EDITOR_JS + CM.SCRIPT + TESSA_SCRIPT + BI.PROMPT_BLOCK_JS})
 
 def _pipe_status_poll_js(pl_id: str) -> str:
-    """Polls /tool/ai_manager/job_status for this pipeline's current job and updates the
-    overall label, the recent-log strip, and every per-node table row - all from one fetch,
-    independent of WS. Safe to call even if data-job is empty (it just returns immediately)."""
+    """Polls /tool/ai_manager/job_status for this pipeline's current job and updates the overall label, the recent-log strip, and every per-node table row - all from one fetch, independent of WS.
+    Safe to call even if data-job is empty (it just returns immediately)."""
     base = AIM.job_status_url("")
     return f"""<script>
     (function poll(){{
@@ -721,6 +740,9 @@ def _pipeline_card_html(pid: str, pl: dict) -> str:
         <div style="display:flex;align-items:center;gap:.3rem">
             <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" hx-get="{_u("pipeline_editor",pid,pl_id)}" hx-target="#tessa-modal" hx-swap="innerHTML">{_esc(pl.get("name",""))}</span>
             <button class="btn-icon" style="color:#ff5f5f;font-size:.7rem" hx-post="{_u("pipeline_delete",pid,pl_id)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" hx-confirm="Delete pipeline?">&#x2715;</button>
+            <div style="display:flex;gap:.3rem;margin-top:.2rem">
+                <button type="button" class="cm-qbtn" onclick="tessaExportPipeline('{pl_id}')">&#x2B07; Export</button>
+            </div>
         </div>
         <input type="text" id="tessa-input-{pl_id}" name="input_value" placeholder="Input for this run" class="module-select" style="width:100%;font-size:.7rem;margin:.2rem 0">
         {status_html}
@@ -742,8 +764,7 @@ async def pipeline_run(pid: str, pl_id: str, request: Request):
 @router.post("/pipeline_resume/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_resume(pid: str, pl_id: str):
     pl = AIM.engine.load_pipeline(pl_id)
-    if not pl or not pl.get("last_job_id"):
-        return HTMLResponse(_status_block_html(pid, pl_id, "", "no previous job to resume"))
+    if not pl or not pl.get("last_job_id"): return HTMLResponse(_status_block_html(pid, pl_id, "", "no previous job to resume"))
     job_id, err = AIM.engine.resume(pl["last_job_id"])
     return HTMLResponse(_status_block_html(pid, pl_id, job_id or "", err))
 
@@ -753,7 +774,7 @@ async def pipeline_stop(pid: str, pl_id: str, job_id: str):
     return HTMLResponse(f"""<div id="tessa-status-{pl_id}" data-job="{job_id}" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">
         <span class="tessa-status-label" style="font-size:.65rem;color:#ffcc00">stopping&#x2026;</span>
     </div><div class="tessa-status-log" style="font-size:.62rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>""" + _pipe_status_poll_js(pl_id))
-    
+
 @router.post("/new", response_class=HTMLResponse)
 async def new_project(request: Request):
     doc = _new_project(request.state.user)
@@ -963,6 +984,20 @@ async def _run_chat_task(pid, username, conn, messages, model, num_ctx, think=Fa
         doc["conversation"].append(ai_msg); _save(_compress(doc))
         await WS.send_personal_message(f"""<div id="cm-msgs-{pid}" hx-swap-oob="beforeend">{CM.render_message(ai_msg, is_me=False, can_delete=True, can_edit=False)}</div><div id="cm-stream-{pid}" hx-swap-oob="innerHTML"></div>""" + CM.working_hide_html(pid), username)
 
+@router.post("/pipeline_claim/{pid}/{pl_id}", response_class=HTMLResponse)
+async def pipeline_claim(pid: str, pl_id: str):
+    """One-time fixup for pipelines saved before project_id was tracked - claims an orphaned
+    pipeline for this project so it becomes visible in the sidebar."""
+    pl = AIM.engine.load_pipeline(pl_id)
+    if pl and not pl.get("project_id"): pl["project_id"] = pid; AIM.engine.save_pipeline(pl)
+    return HTMLResponse(_pipelines_panel_html(pid))
+
+def _orphaned_pipelines_html(pid: str) -> str:
+    orphans = [p for p in AIM.engine.list_pipelines() if not p.get("project_id")]
+    if not orphans: return ""
+    rows = "".join(f'<div style="display:flex;align-items:center;gap:.3rem;font-size:.7rem;padding:.15rem .3rem"><span style="flex:1">{_esc(p.get("name",p["id"]))}</span><button class="cm-qbtn" hx-post="{_u("pipeline_claim",pid,p["id"])}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML">Claim for this project</button></div>' for p in orphans)
+    return f'<details style="border-top:var(--border-thick) solid var(--border)"><summary style="font-size:.65rem;color:var(--text_muted);padding:.2rem .4rem;cursor:pointer">Unclaimed pipelines ({len(orphans)})</summary>{rows}</details>'
+
 # --- Routes: Knowledge Files ---
 
 @router.post("/kg/upload/{pid}", response_class=HTMLResponse)
@@ -1000,10 +1035,7 @@ async def settings_save(request: Request):
     _SETTINGS.get_group("defaults").save(form)
     return HTMLResponse('<span style="color:#00ffa2">&#x2713; Saved</span>')
 
-def _folder_picker(root_key: str, field_name: str, selected: str = "") -> str:
-    fm = ENV["tools"]["built_ins"].FileManager(AIM.resolve_root(root_key))
-    html = fm.folder_picker_html(selected)
-    return html.replace('name="parent"', f'name="{field_name}"')
+def _folder_picker(root_key: str, field_name: str, selected: str = "") -> str: return ENV["tools"]["built_ins"].FileManager(AIM.resolve_root(root_key)).folder_picker_html(selected).replace('name="parent"', f'name="{field_name}"')
 
 def _destination_picker_html(field_prefix: str, config: dict, with_filename: bool) -> str:
     roots = AIM.list_roots()
