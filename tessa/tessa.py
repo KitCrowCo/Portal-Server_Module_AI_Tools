@@ -125,7 +125,7 @@ def _files_content(selected):
     for rel in selected:
         p = KG_DIR / rel
         if p.exists() and p.is_file():
-            try: parts.append(f"--- {rel} ---\n{p.read_text(encoding='utf-8',errors='ignore')[:8000]}")
+            try: parts.append(f"--- {rel} ---\n{p.read_text(encoding='utf-8',errors='ignore')}")
             except: pass
     return "\n\n".join(parts)
 
@@ -201,6 +201,7 @@ def init_tool(env:dict, prefix:str):
     IM.scripts.update({"tessa_doc_apply_ai": [_h_doc_apply_ai], "tessa_doc_conn": [_h_doc_conn], "tessa_doc_model": [_h_doc_model], "tessa_doc_ctx": [_h_doc_ctx], "tessa_files_toggle": [_h_files_toggle]})
     AIM.steps.register_step_type("chunked_file_pass", _step_tessa_file_pass, "Chunked File Pass", {"conn_id": "select", "model": "select", "model_ctx": "number", "system_prompt": "textarea", "user_template": "textarea", "chunk_tokens": "number", "use_selected": "checkbox", "input_source": "text", "result_key": "text"})
     AIM.steps.register_step_type("chunked_synthesis", _step_tessa_synthesis, "Chunked Synthesis", {"conn_id": "select", "model": "select", "model_ctx": "number", "system_prompt": "textarea", "user_template": "textarea", "chunk_tokens": "number", "result_key": "text"})
+    AIM.steps.register_step_type("edit_in_place", step_edit_in_place, "Edit In Place (gap-aware)",{"conn_id": "select", "model": "select", "model_ctx": "number", "temperature": "number", "gap_marker": "text", "system_prompt": "textarea", "chunk_tokens": "number", "fm_root": "text", "shadow_dir": "text", "shadow_doc_path": "text", "result_key": "text"})
     print("[tessa] ready")
 
 # --- Chat Stream ---
@@ -271,18 +272,18 @@ def _proj_list_html(username, active_id=""):
     for p in projects:
         pid = p["id"]; title = _esc((p.get("title","") or "Untitled")[:42]); date = (p.get("modified","") or "")[:10]
         act = "background:var(--glass);border-left:.15rem solid var(--accent);" if pid==active_id else ""
-        out += (f"""<div id="tessa-pi-{pid}" style="padding:.38rem .6rem;cursor:pointer;border-bottom:var(--border-thick) solid var(--border);font-size:.78rem;{act}" hx-get="{_u("load",pid)}" hx-target="#tessa-center" hx-swap="innerHTML"><div style="display:flex;align-items:center;gap:.2rem"><span style="flex:1;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{title}</span><button class="cm-qbtn" style="color:#ff5f5f" hx-delete="{_u("project",pid)}" hx-target="#tessa-proj-list" hx-swap="innerHTML" hx-confirm="Delete '{title}'?" onclick="event.stopPropagation()">&#x2715;</button></div><div style="font-size:.6rem;color:var(--text_muted)">{date}</div></div>""")
+        out += (f"""<div id="tessa-pi-{pid}" style="padding:.3rem .3rem;cursor:pointer;border-bottom:var(--border-thick) solid var(--border);font-size:.8rem;{act}" hx-get="{_u("load",pid)}" hx-target="#tessa-center" hx-swap="innerHTML"><div style="display:flex;align-items:center;gap:.2rem"><span style="flex:1;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{title}</span><button class="cm-qbtn" style="color:#ff5f5f" hx-delete="{_u("project",pid)}" hx-target="#tessa-proj-list" hx-swap="innerHTML" hx-confirm="Delete '{title}'?" onclick="event.stopPropagation()">&#x2715;</button></div><div style="font-size:.6rem;color:var(--text_muted)">{date}</div></div>""")
     return out
 
 def _conn_bar_html(doc, conns, models):
     pid = doc["id"]; cid = doc.get("conn_id",""); mdl = doc.get("model",""); ctx = doc.get("model_ctx",32768)
     c_opts = AIM.connections.conn_opts_html(cid) or '<option value="">No connections</option>'
     m_opts = "".join(f'<option value="{m}" {"selected" if m==mdl else ""}>{m}</option>' for m in models) or AIM.connections.model_opts_html(cid, mdl)
-    return f"""<div style="display:flex;align-items:center;gap:.4rem;height:100%;padding:0 .5rem;overflow:hidden;">
-        <select class="module-select" style="font-size:.72rem;max-width:8rem;flex-shrink:0" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_conn","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-target="#tessa-model-wrap" hx-swap="innerHTML" hx-include="this">{c_opts}</select>
-        <div id="tessa-model-wrap" style="flex-shrink:0"><select class="module-select" style="font-size:.72rem;max-width:11rem" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_model","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none">{m_opts}</select></div>
-        <label style="font-size:.63rem;color:var(--text_muted);white-space:nowrap;flex-shrink:0">ctx <input type="number" name="value" value="{ctx}" min="512" max="262144" class="module-select" style="width:4.5rem;font-size:.65rem;padding:.2rem .3rem" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_ctx","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none"></label>
-        <button class="btn-icon" style="font-size:.65rem;flex-shrink:0;margin-left:auto" hx-get="{_u("settings")}" hx-target="#tessa-center" hx-swap="innerHTML" title="Tessa Settings">&#x2699;</button>
+    return f"""<div style="display:flex;align-items:center;gap:.4rem;height:100%;padding:0 .2rem;overflow:hidden;">
+        <select class="module-select" style="font-size:.7rem;max-width:8rem;flex-shrink:0" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_conn","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-target="#tessa-model-wrap" hx-swap="innerHTML" hx-include="this">{c_opts}</select>
+        <div id="tessa-model-wrap" style="flex-shrink:0"><select class="module-select" style="font-size:.7rem;max-width:11rem" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_model","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none">{m_opts}</select></div>
+        <label style="font-size:.6rem;color:var(--text_muted);white-space:nowrap;flex-shrink:0">ctx <input type="number" name="value" value="{ctx}" min="512" max="262144" class="module-select" style="width:5rem;font-size:.6rem;padding:.2rem .2rem" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_ctx","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none"></label>
+        <button class="btn-icon" style="font-size:.6rem;flex-shrink:0;margin-left:auto" hx-get="{_u("settings")}" hx-target="#tessa-center" hx-swap="innerHTML" title="Tessa Settings">&#x2699;</button>
     </div>"""
 
 def _kg_html(doc):
@@ -423,7 +424,7 @@ def _step_config_form_fields(step_type: str, config: dict, pid: str) -> str:
             opts = "".join(f'<option value="{c["_id"]}" {"selected" if c["_id"]==val else ""}>{_esc(c.get("display_name",c["_id"]))}</option>' for c in AIM.connections.list_conns(get_all=True))
             out += f"""<label style="font-size:.6rem;color:var(--text_muted)">Connection<select name="cfg_conn_id" class="module-select" style="font-size:.7rem" hx-post="{_u("step_models",pid)}" hx-trigger="change" hx-include="this" hx-target="#step-model-wrap-model" hx-swap="innerHTML"><option value="">(none)</option>{opts}</select></label>"""
         elif field == "model":
-            out += f'<div id="step-model-wrap-model"><label style="font-size:.65rem;color:var(--text_muted)">Model<input type="text" name="cfg_model" value="{_esc(str(val))}" class="module-select" style="font-size:.7rem" placeholder="pick a connection above to list models"></label></div>'
+            out += f'<div id="step-model-wrap-model"><label style="font-size:.6rem;color:var(--text_muted)">Model<input type="text" name="cfg_model" value="{_esc(str(val))}" class="module-select" style="font-size:.7rem" placeholder="pick a connection above to list models"></label></div>'
         elif ftype == "textarea":
             ta_id = f"cfg-ta-{field}"
             out += f'<label style="font-size:.65rem;color:var(--text_muted)">{field}<textarea id="{ta_id}" name="cfg_{field}" class="module-select" rows="3" style="font-size:.72rem;font-family:var(--font-mono)">{_esc(str(val))}</textarea></label>'
@@ -432,8 +433,8 @@ def _step_config_form_fields(step_type: str, config: dict, pid: str) -> str:
             opts = "".join(f'<option value="{p["id"]}" {"selected" if p["id"]==val else ""}>{_esc(p.get("name",p["id"]))} ({_esc(", ".join(p.get("tags",[])))})</option>' for p in AIM.engine.list_pipelines())
             out += f'<label style="font-size:.6rem;color:var(--text_muted)">{field}<select name="cfg_{field}" class="module-select" style="font-size:.7rem"><option value="">(select)</option>{opts}</select></label>'
         elif ftype == "checkbox": out += f'<label style="display:flex;gap:.3rem;align-items:center;font-size:.7rem"><input type="checkbox" name="cfg_{field}" value="1" {"checked" if val else ""}> {field}</label>'
-        elif ftype == "number": out += f'<label style="font-size:.6rem;color:var(--text_muted)">{field}<input type="number" name="cfg_{field}" value="{_esc(str(val or 0))}" class="module-select" style="font-size:.7rem"></label>'
-        else: out += f'<label style="font-size:.6rem; color:var(--text_muted)">{field}<input type="text" name="cfg_{field}" value="{_esc(str(val))}" class="module-select" style="font-size:.73rem"></label>'
+        elif ftype == "number": out += f'<label style="font-size:.6rem;color:var(--text_muted)">{field}<input type="number" name="cfg_{field}" step="any" value="{_esc(str(val or 0.0))}" class="module-select" style="font-size:.7rem"></label>'
+        else: out += f'<label style="font-size:.6rem; color:var(--text_muted)">{field}<input type="text" name="cfg_{field}" value="{_esc(str(val))}" class="module-select" style="font-size:.7rem"></label>'
     return out
 
 def _node_multiselect(nodes: list, selected: list, exclude_id: str = "") -> str:
@@ -551,18 +552,18 @@ def _pipeline_editor_html(pid: str, pl: dict) -> str:
                                <span style="color:var(--text_muted)">({_esc(n.get("type",""))})</span>
                            </span>
                            <button class="btn-icon" style="font-size:.6rem" hx-get="{_u("pipeline_node_form",pid,pl["id"],n["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">&#x270E;</button>
-                       </div>""" for n in nodes) or '<div style="font-size:.7rem; color:var(--text_muted); padding:.4rem">No nodes yet.</div>'
+                       </div>""" for n in nodes) or '<div style="font-size:.7rem; color:var(--text_muted); padding:.2rem">No nodes yet.</div>'
     return f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
-                   <div style="flex-shrink:0;padding:.4rem .5rem;border-bottom:var(--border-thick) solid var(--border);display:flex;align-items:center;gap:.3rem">
-                       <input type="text" value="{_esc(pl.get("name",""))}" class="module-select" style="flex:1;font-size:.78rem" hx-post="{_u("pipeline_rename",pid,pl["id"])}" hx-trigger="change" hx-swap="none" name="name">
-                       <span style="font-size:.65rem;color:var(--text_muted)">tags: {", ".join(pl.get("tags",[]))}</span>
+                   <div style="flex-shrink:0;padding:.2rem .2rem;border-bottom:var(--border-thick) solid var(--border);display:flex;align-items:center;gap:.2rem">
+                       <input type="text" value="{_esc(pl.get("name",""))}" class="module-select" style="flex:1;font-size:.8rem" hx-post="{_u("pipeline_rename",pid,pl["id"])}" hx-trigger="change" hx-swap="none" name="name">
+                       <span style="font-size:.6rem;color:var(--text_muted)">tags: {", ".join(pl.get("tags",[]))}</span>
                    </div>
                    <div class="tessa-pl-split" style="display:flex;flex:1;min-height:0;overflow:hidden">
                        <div id="tessa-node-editor" style="flex:1;min-width:0;min-height:0;overflow-y:auto;border-right:var(--border-thick) solid var(--border)">
-                           <div style="padding:2rem;color:var(--text_muted);font-size:.8rem;text-align:center">Select or add a node.</div>
-                           <div class="tessa-pl-steps" style="flex:0 0 14rem;min-height:0;display:flex;flex-direction:column;overflow:hidden"></div>
+                           <div style="padding:2rem;color:var(--text_muted); font-size:.8rem;text-align:center">Select or add a node.</div>
+                           <div class="tessa-pl-steps" style="flex:0 0 14rem; min-height:0;display:flex;flex-direction:column;overflow:hidden"></div>
                            <div style="flex:1;overflow-y:auto">{rows}</div>
-                           <button class="btn-icon" style="font-size:.75rem;padding:.4rem" hx-get="{_u("pipeline_node_form",pid,pl["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">+ Add Node</button>
+                           <button class="btn-icon" style="font-size:.7rem;padding:.2rem" hx-get="{_u("pipeline_node_form",pid,pl["id"])}" hx-target="#tessa-node-editor" hx-swap="innerHTML">+ Add Node</button>
                        </div>
                    </div>
                </div>"""
@@ -584,7 +585,7 @@ async def pipeline_editor_route(pid: str, pl_id: str):
                                .tessa-pl-split {{ flex-direction: column !important; }}
                                .tessa-pl-split #tessa-node-editor {{ flex: 1 1 60% !important; border-right:none !important; }}
                                .tessa-pl-split .tessa-pl-steps {{ flex: 0 0 auto !important; max-height: 8rem !important; border-top: var(--border-thick) solid var(--border) !important; }}
-                               .tessa-pl-split select, .tessa-pl-split input {{ font-size: .85rem !important; }}
+                               .tessa-pl-split select, .tessa-pl-split input {{ font-size: .8rem !important; }}
                             }}
                             </style>
                             <div class="glass tessa-pl-modal" style="overflow:hidden;display:flex;flex-direction:column;padding:0">
@@ -600,7 +601,7 @@ def _pipelines_panel_html(pid: str) -> str:
     pls = _project_pipelines(pid)
     cards = "".join(_pipeline_card_html(pid, pl) for pl in pls) or '<div style="font-size:.7rem;color:var(--text_muted);padding:.2rem .2rem">No pipelines. Click + to create one.</div>'
     return f"""<div id="tessa-pipelines-section" style="border-top:var(--border-thick) solid var(--border)">
-        <details open><summary style="padding:.3rem .45rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.3rem">&#x26A1; Pipelines
+        <details open><summary style="paddtessa-pl-ne3rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.2rem">&#x26A1; Pipelines
         <button class="btn-icon" style="margin-left:auto;font-size:.7rem" hx-get="{_u("pipeline_new_form",pid)}" hx-target="#tessa-pl-new" hx-swap="innerHTML" onclick="event.stopPropagation()">+</button></summary>
         <label class="btn-icon" style="cursor:pointer;font-size:.7rem" title="Import pipeline JSON">&#x2B06;<input type="file" accept=".json" style="display:none" onchange="tessaImportPipeline(this,'{pid}')"></label>
         <div id="tessa-pl-new"></div><div>{cards}</div></details></div>"""
@@ -719,24 +720,24 @@ def _pipeline_card_html(pid: str, pl: dict) -> str:
     if live:
         status_html = f"""<div id="tessa-status-{pl_id}" data-job="{pl['last_job_id']}" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">
             <button class="cm-qbtn" style="color:#ff4444" hx-post="{_u("pipeline_stop",pid,pl_id,pl['last_job_id'])}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x25FC; Stop</button>
-            <span class="tessa-status-label" style="font-size:.65rem;color:#00ffa2">{last_job['status']}</span>
-        </div><div class="tessa-status-log" style="font-size:.62rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>""" + _pipe_status_poll_js(pl_id)
+            <span class="tessa-status-label" style="font-size:.6rem;color:#00ffa2">{last_job['status']}</span>
+        </div><div class="tessa-status-log" style="font-size:.6rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>""" + _pipe_status_poll_js(pl_id)
     else:
         state_label = last_job["status"] if last_job else "idle"
         status_html = f"""<div id="tessa-status-{pl_id}" data-job="" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">
             <button class="cm-qbtn" hx-post="{_u("pipeline_run",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML" hx-include="#tessa-input-{pl_id}">&#x25B6; Run</button>
-            <span class="tessa-status-label" style="font-size:.65rem;color:var(--text_muted)">{state_label}</span>
-        </div><div class="tessa-status-log" style="font-size:.62rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>"""
+            <span class="tessa-status-label" style="font-size:.6rem; color:var(--text_muted)">{state_label}</span>
+        </div><div class="tessa-status-log" style="font-size:.6rem; color:var(--text_muted);max-height: 4rem;overflow-y:auto"></div>"""
     resume_row = ""
     if interrupted: resume_row = f'<button class="cm-qbtn" style="width:100%;margin-top:.2rem" hx-post="{_u("pipeline_resume",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x21BB; Resume interrupted run</button>'
     nodes = (last_job["flow"]["nodes"] if last_job else pl.get("flow", {}).get("nodes", []))
     rows = "".join(f"""<tr data-node="{n["id"]}">
                            <td style="font-size:.65rem;padding:.1rem .3rem">{_esc(n.get("name") or n["id"])}</td>
-                           <td style="font-size:.6rem;color:var(--text_muted);padding:.1rem .3rem">{_esc(n.get("type",""))}</td>
+                           <td style="font-size:.6rem;color:var(--text_muted);padding:.1rem .1rem">{_esc(n.get("type",""))}</td>
                            <td class="tsn-status" style="font-size:.62rem;color:var(--text_muted);padding:.1rem .3rem">{_esc(n.get("status","idle"))}{(' ('+n['ts']+')') if n.get('ts') else ''}</td>
                            <td class="tsn-preview" style="font-size:.6rem;color:var(--text_muted);padding:.1rem .3rem;max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{_esc(n.get('message') or ' | '.join((n.get('preview') or {}).values()))}</td>
                        </tr>""" for n in nodes)
-    return f"""<div class="glass" style="padding:.4rem .5rem;margin:.2rem .3rem;font-size:.75rem">
+    return f"""<div class="glass" style="padding=.2rem .5rem;margin:.2rem .2rem; font-size:.7rem">
         <div style="display:flex;align-items:center;gap:.3rem">
             <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" hx-get="{_u("pipeline_editor",pid,pl_id)}" hx-target="#tessa-modal" hx-swap="innerHTML">{_esc(pl.get("name",""))}</span>
             <button class="btn-icon" style="color:#ff5f5f;font-size:.7rem" hx-post="{_u("pipeline_delete",pid,pl_id)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" hx-confirm="Delete pipeline?">&#x2715;</button>
@@ -747,7 +748,7 @@ def _pipeline_card_html(pid: str, pl: dict) -> str:
         <input type="text" id="tessa-input-{pl_id}" name="input_value" placeholder="Input for this run" class="module-select" style="width:100%;font-size:.7rem;margin:.2rem 0">
         {status_html}
         {resume_row}
-        <details style="margin-top:.25rem"><summary style="font-size:.6rem;color:var(--text_muted);cursor:pointer">Node status ({len(nodes)})</summary>
+        <details style="margin-top:.2rem"><summary style="font-size:.6rem;color:var(--text_muted);cursor:pointer">Node status ({len(nodes)})</summary>
         <table style="width:100%;border-collapse:collapse;margin-top:.2rem">{rows}</table></details>
     </div>"""
 
@@ -890,7 +891,7 @@ async def msg_edit_form(mid: str, request: Request):
                                             <form hx-post="{_u("msg/edit_save",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML" style="display:flex;flex-direction:column;gap:.3rem;width:100%">
                                                 <textarea name="content" class="cm-input" style="min-height:4rem;overflow-y:auto">{_esc(m.get("content",""))}</textarea>
                                                 <div style="display:flex;gap:.3rem">
-                                                    <button type="submit" class="button" style="font-size:.75rem;margin-top:0">Save</button>
+                                                    <button type="submit" class="button" style="font-size:.7rem;margin-top:0">Save</button>
                                                     <button type="button" class="btn-icon" hx-get="{_u("msg/cancel_edit",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML">Cancel</button>
                                                 </div>
                                             </form>
@@ -1047,6 +1048,56 @@ def _destination_picker_html(field_prefix: str, config: dict, with_filename: boo
 
 @router.get("/destination_folder", response_class=HTMLResponse)
 async def destination_folder(root: str, field: str): return HTMLResponse(_folder_picker(root, f"cfg_{field}_folder"))
+
+
+async def step_edit_in_place(config: dict, ctx) -> dict:
+    """True in-place chunk editing: locates a chunk by its exact current text (not by position), replaces just that span via the shadow diff/accept flow, and can detect a gap marker to switch from 'edit existing text' mode to 'write new content to fill the gap' mode, then continues editing past the gap once reached.
+    If no marker exists at all, behaves as pure open-ended continuation once the end of existing content is reached - it keeps generating additional chunks until the judge/decision step (chained after this one) reports the goal is met, rather than stopping at end-of-file."""
+    pid = config["project_id"]
+    doc = _load(pid)  # this project accessor is Tessa's own - registered via extra_config same as other tessa_* steps
+    content = doc.get("content", "")
+    marker = config.get("gap_marker", "[[GAP]]")
+    conn = AIM.connections.get_conn(config.get("conn_id", "")); model = config.get("model", "")
+    if not conn or not model: raise RuntimeError("edit_in_place: connection/model required")
+    chunk_tokens = int(config.get("chunk_tokens", 4000))
+    before, _, after = content.partition(marker) if marker in content else (content, "", "")
+    chunks = _chunk_text(before, chunk_tokens) if before else []
+    edited = []
+    for i, chunk in enumerate(chunks):
+        await ctx.progress(f"editing chunk {i+1}/{len(chunks)}")
+        sys_p = ctx.resolve(config.get("system_prompt") or "")
+        msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content": f"Rewrite this passage in place - same length and content, fix grammar/flow/continuity only:\n\n{chunk}"}]
+        full = ""
+        async for piece in AIM.steps._ollama_stream(conn, msgs, model, config.get("model_ctx",8192), config.get("temperature",0.3)):
+            full += piece
+        edited.append(full.strip() or chunk)
+    if marker in content and after.strip():
+        # gap exists with real continuation text after it - generate filler chunks until a decision step (chained next in the pipeline) judges the gap closed. This step produces ONE filler pass per run; loop via branch_on->redo for multiple passes.
+        sys_p = ctx.resolve(config.get("system_prompt") or "")
+        fill_prompt = f"Continue the story to bridge this gap. End of text before the gap:\n\n{edited[-1][-1500:] if edited else before[-1500:]}\n\nText that must follow after your bridge:\n\n{after[:1500]}"
+        msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content":fill_prompt}]
+        full = ""
+        async for piece in AIM.steps._ollama_stream(conn, msgs, model, config.get("model_ctx",8192), config.get("temperature",0.5)):
+            full += piece
+        new_content = "\n\n".join(edited) + "\n\n" + full.strip() + "\n\n" + after
+    elif marker in content:
+        # marker present but nothing after it - open-ended: generate one additional chunk past the existing content. Chain with decision/branch_on to keep generating.
+        sys_p = ctx.resolve(config.get("system_prompt") or "")
+        fill_prompt = f"Continue this story toward its stated goal. Existing text ends:\n\n{(edited[-1] if edited else before)[-1500:]}"
+        msgs = ([{"role":"system","content":sys_p}] if sys_p else []) + [{"role":"user","content":fill_prompt}]
+        full = ""
+        async for piece in AIM.steps._ollama_stream(conn, msgs, model, config.get("model_ctx", 8192), config.get("temperature",0.5)):
+            full += piece
+        new_content = "\n\n".join(edited) + "\n\n" + full.strip()
+    else:
+        new_content = "\n\n".join(edited) or content
+    bi = ENV["tools"]["built_ins"]
+    fm = bi.FileManager(config.get("fm_root") or "./data/_common")
+    shadow = bi.ShadowStore(fm, config.get("shadow_dir") or (Path(config.get("fm_root") or "./data/_common") / "_shadow"))
+    entry = shadow.stage(config.get("shadow_doc_path", f"tessa_edits/{pid}.md"), new_content, author=f"pipeline:{ctx.job_id}")
+    result_key = config.get("result_key", "edit_in_place")
+    ctx.scratch[result_key] = {"status": entry["status"], "gap_remaining": bool(marker in content and not after.strip())}
+    return ctx.scratch[result_key]
 
 # --- CSS ---
 
