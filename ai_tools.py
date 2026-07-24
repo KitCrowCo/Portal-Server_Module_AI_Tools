@@ -14,8 +14,6 @@ router = APIRouter()
 _P = "/module/ai_tools"
 _MODULE_DIR = Path(__file__).parent
 DATA_DIR = Path("./data/ai_tools")
-CONN_DIR = DATA_DIR / "_connections"
-_TMPL_DIR = _MODULE_DIR / "_connections"
 
 ENV = {}
 IM = None
@@ -90,8 +88,6 @@ def init_module(env: dict):
     ENV.update(env)
     UI = ENV["templates"].env.globals.get("UI")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    CONN_DIR.mkdir(parents=True, exist_ok=True)
-    _TMPL_DIR.mkdir(parents=True, exist_ok=True)
     IM = ENV["InterfaceManager"](nesting_level=1, db_path="ai_tools/im_registry.db")
     TM = ENV["tools"]["built_ins"].TabManager(namespace="ai_tools", tab_bar_id="ait-tab-bar", content_id="ait-workspace", render_content_fn=_tab_content, intent_prefix="ai_tools", IM=IM, scope="user", empty={"tabs": {"launcher": {"id": "launcher", "path": "launcher", "label": "Launcher", "icon": "", "order": 0}}, "active": "launcher"}, nesting_level=1)
     AIM = ENV["tools"]["ai_manager"]
@@ -128,16 +124,10 @@ async def _tab_content(request, state):
 
 # --- Connection settings ---
 
-def _tmpls() -> dict: return {f.stem: json.loads(f.read_text()) for f in sorted(_TMPL_DIR.glob("*.json"))}
-def _save_conn(cid: str, data: dict): (CONN_DIR / f"{cid}.json").write_text(json.dumps(data, indent=2))
-
-def _load_conn(cid: str) -> dict | None:
-    p = CONN_DIR / f"{cid}.json"
-    return json.loads(p.read_text()) if p.exists() else None
-
-def _del_conn(cid: str):
-    p = CONN_DIR / f"{cid}.json"
-    if p.exists(): p.unlink()
+def _tmpls() -> dict: return AIM.connections.list_templates()
+def _save_conn(cid, data): AIM.connections.save_conn(cid, data)
+def _load_conn(cid): return AIM.connections.load_conn_raw(cid)
+def _del_conn(cid): AIM.connections.delete_conn(cid)
 
 # --- HTML builders ---
 

@@ -25,7 +25,7 @@ COMMON_DIR = Path("./data/_common")
 
 _gallery_tool = None
 ENV = {}
-BI = UI = WS = IM = TM = AIM = _SETTINGS = None
+BI = UI = WS = IM = TM = AIM = _SETTINGS = _base_picker = _mask_picker = _ref_picker = None
 _WORKER_TASK = None
 thumb_data_uri = None
 
@@ -37,7 +37,7 @@ def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">",
 def _conn_options(values=None): return [("", "(none)")] + [(c["_id"], f'{c.get("display_name", c["_id"])} [{c.get("connection_type","?")}]') for c in AIM.connections.list_conns(get_all=True)]
 
 def init_tool(env: dict, prefix: str):
-    global ENV, BI, UI, WS, IM, TM, AIM, _SETTINGS, _P, _gallery_tool, thumb_data_uri
+    global ENV, BI, UI, WS, IM, TM, AIM, _SETTINGS, _P, _gallery_tool, thumb_data_uri, _base_picker, _mask_picker, _ref_picker
     ENV = env
     _P = prefix.rstrip("/")
     UI = env["templates"].env.globals.get("UI")
@@ -75,7 +75,18 @@ def init_tool(env: dict, prefix: str):
             return imr
         return _h
 
-    for _intent in ("open", "focus", "close"): IM.scripts[f"image_{_intent}_tab"] = [_wrap_tab_action(getattr(TM, f"_{_intent}"))]
+    async def _im_select_mask(request, payload, imr):
+        rel = payload.get("path", "")
+        await _ui_state(request, {"selected_mask": rel})
+        imr.oob(f'<input id="img-mask-path" type="hidden" name="mask_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-mask-path", swap="outerHTML")
+        imr.oob(f'<span id="img-mask-status" style="font-size:.7rem;color:var(--text_muted);flex:1">&#x2713; Using saved mask: {_esc(rel)}</span>', "img-mask-status")
+        return imr
+
+    async def _im_select_reference(request, payload, imr):
+        rel = payload.get("path", "")
+        imr.oob(f'<input id="img-ref-path" type="hidden" name="reference_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-ref-path", swap="outerHTML")
+        imr.oob(f'<span id="img-ref-status" style="font-size:.65rem;color:var(--text_muted)">Reference: {_esc(rel)}</span>', "img-ref-status", swap="outerHTML")
+        return imr
 
     async def _im_save_mask(request, payload, imr):
         print(f"[image_save_mask] called. mask_data length={len(payload.get('mask_data',''))}")
@@ -106,24 +117,35 @@ def init_tool(env: dict, prefix: str):
         imr.oob(f'<input id="img-mask-path" type="hidden" value="{_esc(rel_path)}">', "img-mask-path", swap="outerHTML")
         return imr
 
-    # _im_select_mask — persist selection
-    async def _im_select_mask(request, payload, imr):
-        rel = payload.get("path", "")
-        await _ui_state(request, {"selected_mask": rel})
-        imr.oob(f'<input id="img-mask-path" type="hidden" name="mask_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-mask-path", swap="outerHTML")
-        imr.oob(f'<span id="img-mask-status" style="font-size:.7rem;color:var(--text_muted);flex:1">&#x2713; Using saved mask: {_esc(rel)}</span>', "img-mask-status")
-        return imr
-
-    async def _im_select_reference(request, payload, imr):
-        rel = payload.get("path", "")
-        imr.oob(f'<input id="img-ref-path" type="hidden" name="reference_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-ref-path", swap="outerHTML")
-        imr.oob(f'<span id="img-ref-status" style="font-size:.65rem;color:var(--text_muted)">Reference: {_esc(rel)}</span>', "img-ref-status", swap="outerHTML")
-        return imr
+    for _intent in ("open", "focus", "close"): IM.scripts[f"image_{_intent}_tab"] = [_wrap_tab_action(getattr(TM, f"_{_intent}"))]
     IM.scripts["image_select_reference"] = [_im_select_reference]
     IM.scripts["image_select_mask"] = [_im_select_mask]
     IM.scripts["image_save_mask"] = [_im_save_mask]
     IM.scripts["image_assemble_gif"] = [_im_assemble_gif]
+    _base_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_base", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_base_image)
+    _mask_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_mask", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_mask_image)
+    _ref_picker  = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_ref",  nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_reference_image)
     print("[image] ready")
+
+async def _pick_base_image(request, payload, imr):
+    rel = payload.get("path", "")
+    fm = _fm()
+    imr.oob(f'<input type="hidden" id="img-base-path" value="{_esc(rel)}"><input type="hidden" name="image_path" id="img-base-path-mirror" form="img-inpaint-form" value="{_esc(rel)}">', "img-base-path-mirror", swap="outerHTML")
+    imr.oob(f'<div style="font-size:.7rem;color:var(--accent)">{_esc(rel)}</div>', "img-inpaint-base-hint", swap="outerHTML")
+    imr.raw(f'<script>imgLoadBaseCanvas({json.dumps(_data_uri(rel, fm))})</script>')
+    return imr
+
+async def _pick_mask_image(request, payload, imr):
+    rel = payload.get("path", "")
+    imr.oob(f'<input type="hidden" id="img-mask-path" name="mask_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-mask-path", swap="outerHTML")
+    imr.oob(f'<span style="font-size:.7rem;color:var(--accent)">&#x2713; Using saved mask: {_esc(rel)}</span>', "img-mask-status", swap="outerHTML")
+    return imr
+
+async def _pick_reference_image(request, payload, imr):
+    rel = payload.get("path", "")
+    imr.oob(f'<input type="hidden" id="img-ref-path" name="reference_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-ref-path", swap="outerHTML")
+    imr.oob(f'<span style="font-size:.65rem;color:var(--text_muted)">Reference: {_esc(rel)}</span>', "img-ref-status", swap="outerHTML")
+    return imr
 
 def _ensure_worker():
     global _WORKER_TASK
@@ -424,16 +446,17 @@ async def generate_submit(request: Request):
 def _inpaint_panel_html(prompts, selected_prompt_id):
     """Canvas panel only — controls live in the bottom toolbar."""
     return (f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+
                     <details style="border-bottom:var(--border-thick) solid var(--border); flex-shrink:0">
                         <summary style="cursor:pointer; font-size:.7rem; color:var(--text_muted); list-style:none">Select base image</summary>
-                        <div id="img-inpaint-gallery" hx-get="{_u("inpaint/outputs")}" hx-trigger="load" hx-target="this" hx-swap="innerHTML" style="max-height:20rem; overflow-y:auto; padding:.3rem; display:grid; grid-template-columns:repeat(auto-fill, minmax(10rem, 1fr)); gap:.2rem"></div>
+                        {_base_picker.render_shell(include_css=False)}
                     </details>
                     <div style="flex:1;overflow:auto;padding:.75rem;position:relative;text-align:center">
                         <div id="img-inpaint-canvas-wrap" style="position:relative;display:inline-block;max-width:100%">
                             <canvas id="img-base-canvas" style="display:block;max-width:100%; background:var(--surface)"></canvas>
                             <canvas id="img-mask-canvas" style="position:absolute;top:0;left:0;max-width:100%; opacity:.6; cursor:crosshair"></canvas>
                         </div>
-                        <div id="img-inpaint-base-hint" style="margin-top:.4rem;font-size:.7rem;color:var(--text_muted)">Select an image above</div>
+                        <div id="img-inpaint-base-hint" style="margin-top:.4rem; font-size:.7rem;color:var(--text_muted)">Select an image above</div>
                     </div>
                 </div>""")
 
@@ -469,42 +492,16 @@ def _bottom_toolbar_inpaint_html(prompts, selected_prompt_id, selected_mask=""):
                    <div id="img-mask-debug" style="font-size:.65rem;color:var(--text_muted);font-family:var(--font-mono)">save-mask: idle (never clicked)</div>
                    <details style="border-top:var(--border-thick) solid var(--border);padding-top:.3rem">
                        <summary style="cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none">Or use a previously saved mask</summary>
-                       <div id="img-mask-picker" hx-get="{_u("inpaint/masks")}" hx-trigger="load" hx-target="this" hx-swap="innerHTML" style="max-height:6rem;overflow-y:auto;padding:.3rem;display:grid;grid-template-columns:repeat(auto-fill,minmax(4rem,1fr));gap:.2rem"></div>
+                       {_mask_picker.render_shell(include_css=False)}
                    </details>
                    <details style="border-top:var(--border-thick) solid var(--border);padding-top:.3rem">
                        <summary style="cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none">Reference image (optional)</summary>
                        {mask_status}
-                       <div hx-get="{_u("inpaint/reference_outputs")}" hx-trigger="load" hx-target="this" hx-swap="innerHTML" style="max-height:6rem;overflow-y:auto;padding:.3rem;display:grid;grid-template-columns:repeat(auto-fill,minmax(4rem,1fr));gap:.2rem"></div>
+                       {_ref_picker.render_shell(include_css=False)}
                    </details>
                    <div id="img-inpaint-status" style="font-size:.7rem;color:var(--text_muted);width:100%"></div>
                    <span id="img-mask-status" style="font-size:.7rem;color:var(--text_muted);flex:1">No mask saved yet — draw then Save Mask, or pick a saved one above.</span>
                </div>"""
-
-@router.get("/inpaint/outputs", response_class=HTMLResponse)
-async def inpaint_outputs():
-    root = _output_dir()
-    files = sorted([f.name for f in root.glob("*") if f.suffix.lower() in IMG_EXTS and not f.name.startswith("_")], key=lambda n: (root / n).stat().st_mtime, reverse=True)[:120]
-    if not files: return HTMLResponse('<div style="color:var(--text_muted);font-size:.7rem;padding:.5rem">No outputs yet.</div>')
-    fm = _fm()
-    cards = "".join(f"""<div class="img-inpaint-pick" onclick="imgSelectBase('{_esc(n)}','{_esc(_data_uri(n, fm))}')" style="cursor:pointer;padding:.15rem;border:.1rem solid transparent;border-radius:.2rem">
-                            <img src="{thumb_data_uri(fm, n)}" style="width:100%;height:3.5rem;object-fit:contain;background:var(--bg)">
-                            <div style="font-size:.52rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text_muted)">{_esc(n)}</div>
-                        </div>""" for n in files)
-    return HTMLResponse(f'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(5rem,1fr));gap:.15rem">{cards}</div>')
-
-@router.get("/inpaint/masks", response_class=HTMLResponse)
-async def inpaint_masks():
-    fm = _fm()
-    masks_dir = fm.resolve("_masks")
-    if not masks_dir.exists(): return HTMLResponse('<div style="color:var(--text_muted);font-size:.7rem;padding:.3rem">No saved masks yet.</div>')
-    files = sorted([f.name for f in masks_dir.glob("*.png")], key=lambda n: (masks_dir / n).stat().st_mtime, reverse=True)[:60]
-    if not files: return HTMLResponse('<div style="color:var(--text_muted);font-size:.7rem;padding:.3rem">No saved masks yet.</div>')
-    cards = ""
-    for n in files:
-        rel = f"_masks/{n}"
-        uri = thumb_data_uri(fm, rel)
-        cards += f"""<button type="button" class="img-inpaint-pick" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type": "image_select_mask", "branch": IM.branch_id, "lvl": 2, "path": rel})}' style="cursor:pointer;padding:.15rem;border:.1rem solid transparent;border-radius:.2rem;background:none"><img src="{uri}" style="width:100%;height:3rem;object-fit:contain;background:var(--bg)"></button>"""
-    return HTMLResponse(f"""<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(4rem,1fr));gap:.15rem">{cards}</div>""")
 
 def _data_uri(rel: str, fm) -> str:
     try:
@@ -542,15 +539,6 @@ async def inpaint_submit(request: Request):
     _save("job", job)
     _ensure_worker()
     return HTMLResponse('<span style="color:var(--accent)">&#x2713; Inpaint queued</span>')
-
-@router.get("/inpaint/reference_outputs", response_class=HTMLResponse)
-async def inpaint_reference_outputs():
-    root = _output_dir()
-    files = sorted([f.name for f in root.glob("*") if f.suffix.lower() in IMG_EXTS and not f.name.startswith("_")], key=lambda n: (root / n).stat().st_mtime, reverse=True)[:120]
-    if not files: return HTMLResponse('<div style="color:var(--text_muted);font-size:.7rem;padding:.5rem">No outputs yet.</div>')
-    fm = _fm()
-    cards = "".join(f"""<button type="button" class="img-inpaint-pick" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type": "image_select_reference", "branch": IM.branch_id, "lvl": 2, "path": n})}' style="cursor:pointer;padding:.15rem;border:.1rem solid transparent;border-radius:.2rem;background:none"><img src="{thumb_data_uri(fm, n)}" style="width:100%;height:3.5rem;object-fit:contain;background:var(--bg)"></button>""" for n in files)
-    return HTMLResponse(f'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(5rem,1fr));gap:.15rem">{cards}</div>')
 
 # Queue worker + progress push
 
@@ -862,8 +850,6 @@ CSS = """
 #igal-action-msg{font-size:.7rem;padding:.2rem .4rem}
 """
 
-# JS (minimal — only canvas operations)
-
 SCRIPT = """
 const ImgMask = (() => {
     let canvas, ctx, drawing = false, brush = 40;
@@ -886,29 +872,23 @@ const ImgMask = (() => {
     return {init, setBrush, clear};
 })();
 
-function imgSelectBase(filename, dataUri) {
-    document.getElementById('img-base-path').value = filename;
-    document.getElementById('img-base-path-mirror').value = filename;
-    const hint = document.getElementById('img-inpaint-base-hint');
-    if (hint) hint.textContent = filename;
-    const baseC = document.getElementById('img-base-canvas');
-    const maskC = document.getElementById('img-mask-canvas');
-    if (!baseC) return;
-    const img = new Image();
-    img.onload = () => {
+function imgLoadBaseCanvas(dataUri) {
+    var baseC = document.getElementById('img-base-canvas'), maskC = document.getElementById('img-mask-canvas');
+    if (!baseC || !dataUri) return;
+    var img = new Image();
+    img.onload = function() {
         baseC.width = maskC.width = img.naturalWidth;
         baseC.height = maskC.height = img.naturalHeight;
-        const dispW = Math.min(img.naturalWidth, 680) + 'px';
+        var dispW = Math.min(img.naturalWidth, 680) + 'px';
         baseC.style.width = maskC.style.width = dispW;
         baseC.style.height = maskC.style.height = 'auto';
-        baseC.getContext('2d').drawImage(img,0,0);
-        maskC.getContext('2d').clearRect(0,0,maskC.width,maskC.height);
+        baseC.getContext('2d').drawImage(img, 0, 0);
+        maskC.getContext('2d').clearRect(0, 0, maskC.width, maskC.height);
         ImgMask.init(maskC);
     };
     img.src = dataUri;
-    document.querySelectorAll('.img-inpaint-pick').forEach(e => e.style.outline='none');
-    if (event && event.currentTarget) event.currentTarget.style.outline = 'var(--border-thick) solid var(--accent)';
 }
+
 function imgSaveMask(branchId) {
     const dbg = document.getElementById('img-mask-debug');
     function setDbg(msg, color) { if (dbg) { dbg.textContent = 'save-mask: ' + msg; dbg.style.color = color || 'var(--text_muted)'; } console.log('[imgSaveMask]', msg);}
