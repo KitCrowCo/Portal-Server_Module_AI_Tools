@@ -448,6 +448,12 @@ def _node_form_html(pid: str, pl: dict, node: dict = None) -> str:
     cfg_fields = _step_config_form_fields(ntype, config, pid) if ntype else '<div style="color:var(--text_muted);font-size:.7rem">Pick a step type to configure it.</div>'
     action = _u("pipeline_node_save",pid,pl["id"],nid) if not is_new else _u("pipeline_node_add",pid,pl["id"])
     del_btn = f'<button type="button" class="btn-icon" style="color:#ff5f5f" hx-post="{_u("pipeline_node_delete",pid,pl["id"],nid)}" hx-target="#tessa-node-editor" hx-swap="innerHTML" hx-confirm="Remove node?">Remove</button>' if not is_new else ""
+    join_sel = f"""<label style="font-size:.7rem;color:var(--text_muted)">Join (if multiple 'runs after')
+                        <select name="join" class="module-select" style="font-size:.72rem">
+                            <option value="all" {"selected" if (node or {}).get("join","all")=="all" else ""}>All must complete (default)</option>
+                            <option value="any" {"selected" if (node or {}).get("join","all")=="any" else ""}>Any one is enough</option>
+                       </select>
+                   </label>"""
     return f"""<form hx-post="{action}" hx-target="#tessa-node-editor" hx-swap="innerHTML" style="display:flex; flex-direction:column; gap:.2rem; padding:.2rem">
                    <span style="font-weight:600; font-size:.8rem; color:var(--accent)">{"New Node" if is_new else "Edit Node"}</span>
                    <input type="text" name="name" value="{_esc((node or {}).get('name',''))}" placeholder="Node name" class="module-select" style="font-size:.8rem">
@@ -459,6 +465,7 @@ def _node_form_html(pid: str, pl: dict, node: dict = None) -> str:
                    </label>
                    <div id="tessa-node-cfg" style="display:flex;flex-direction:column; gap:.2rem">{cfg_fields}</div>
                    <label style="font-size:.7rem; color:var(--text_muted)">Runs after</label>
+                   {join_sel}
                    {_node_multiselect(nodes, prev, nid)}
                    <div style="display:flex; gap:.1rem"><button type="submit" class="button" style="flex:1">{"Add Node" if is_new else "Save Node"}</button>{del_btn}</div>
                </form>"""
@@ -486,7 +493,7 @@ def _parse_node_form(form, step_type: str = "") -> tuple:
                 except (ValueError, TypeError): config[field] = 0
         elif ftype == "checkbox": config[field] = raw is not None
         else: config[field] = raw or ""
-    return config, form.getlist("prev")
+    return config, form.getlist("prev"), form.get("join", "all")
 
 @router.post("/pipeline_node_type_change/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_node_type_change(pid: str, pl_id: str, request: Request):
@@ -516,9 +523,9 @@ async def pipeline_node_form_edit(pid: str, pl_id: str, nid: str):
 async def pipeline_node_add(pid: str, pl_id: str, request: Request):
     form = await request.form(); pl = AIM.engine.load_pipeline(pl_id)
     if not pl: return HTMLResponse("")
-    config, prev = _parse_node_form(form, form.get("type", ""))
+    config, prev, join = _parse_node_form(form, form.get("type", ""))
     flow = pl.setdefault("flow", {"nodes": []})
-    flow["nodes"].append({"id": f"n_{uuid.uuid4().hex[:8]}", "name": form.get("name","").strip(), "type": form.get("type",""), "config": config, "prev": prev, "next": []})
+    flow["nodes"].append({"id": f"n_{uuid.uuid4().hex[:8]}", "name": form.get("name","").strip(), "type": form.get("type",""), "config": config, "prev": prev, "join": join, "next": []})
     _recompute_next(flow); AIM.engine.save_pipeline(pl)
     return HTMLResponse(_pipeline_editor_html(pid, pl))
 
@@ -529,8 +536,8 @@ async def pipeline_node_save(pid: str, pl_id: str, nid: str, request: Request):
     flow = pl.setdefault("flow", {"nodes": []})
     node = next((n for n in flow["nodes"] if n["id"] == nid), None)
     if not node: return HTMLResponse("")
-    config, prev = _parse_node_form(form, form.get("type", node["type"]))
-    node["name"], node["type"], node["config"], node["prev"] = form.get("name","").strip(), form.get("type", node["type"]), config, prev
+    config, prev, join = _parse_node_form(form, form.get("type", node["type"]))
+    node["name"], node["type"], node["config"], node["prev"], node["join"] = form.get("name","").strip(), form.get("type", node["type"]), config, prev, join
     _recompute_next(flow); AIM.engine.save_pipeline(pl)
     return HTMLResponse(_pipeline_editor_html(pid, pl))
 
