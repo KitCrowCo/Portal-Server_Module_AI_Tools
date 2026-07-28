@@ -4,7 +4,7 @@ Tessa - AI Document and Pipeline Workspace
 Sub-module of ai_tools. Mounted at /module/ai_tools/tessa.
 Data at data/ai_tools/tessa/. Shared knowledge at data/ai_tools/_knowledge/.
 """
-import asyncio, json, uuid, pathlib
+import asyncio, json, uuid, pathlib, copy
 from datetime import datetime
 from pathlib import Path
 import httpx
@@ -76,35 +76,14 @@ def _compress(doc):
     doc["context_summary"] = (ex + " | " if ex else "") + " | ".join(lines)
     return doc
 
-# --- Connections (shared with ai_tools) ---
-
-# async def _stream(conn, messages, model, num_ctx, think=False):
-#     """Wraps AIM.connections.stream_llm to preserve this module's (text, thinking, done, error) tuple shape for the existing chat-rendering call sites - the actual provider call is fully agnostic underneath."""
-#     try:
-#         async for piece in AIM.connections.stream_llm(conn, messages, model, num_ctx=num_ctx, num_predict=4096):
-#             yield piece, "", False, None
-#         yield "", "", True, None
-#     except asyncio.CancelledError: yield "", "", True, None
-#     except Exception as e: yield "", "", True, str(e)
-
 async def _stream(conn, messages, model, num_ctx, think=False):
-    pl = {"model":model,"messages":messages,"stream":True,"options":{"num_ctx":num_ctx,"num_predict":4096}}
-    if think: pl["think"] = True
-    tb = ""
+    """Wraps AIM.connections.stream_llm, preserving this module's (text, thinking, done, error) tuple shape for existing chat-rendering call sites."""
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5.0, read=3000.0, write=5.0, pool=5.0)) as c:
-            async with c.stream("POST", f"{AIM.connections._base(conn)}/api/chat", json=pl) as resp:
-                if resp.status_code != 200: yield "", "", True, f"HTTP {resp.status_code}"; return
-                async for line in resp.aiter_lines():
-                    if not line: continue
-                    try:
-                        chunk = json.loads(line); msg = chunk.get("message",{})
-                        tb += msg.get("thinking",""); text = msg.get("content",""); done = chunk.get("done",False)
-                        if text or done or tb: yield text, tb, done, None
-                        if done: return
-                    except: continue
-    except asyncio.CancelledError: yield "", tb, True, None
-    except Exception as e: yield "", tb, True, str(e)
+        async for text, thinking in AIM.connections.stream_llm(conn, messages, model, think=think, num_ctx=num_ctx, num_predict=4096):
+            yield text, thinking, False, None
+        yield "", "", True, None
+    except asyncio.CancelledError: yield "", "", True, None
+    except Exception as e: yield "", "", True, str(e)
 
 def _build_messages(doc, user_msg, files_txt=""):
     num_ctx = doc.get("model_ctx", 32768); budget = int(num_ctx * 0.80); used = 0; msgs = []; sys_parts = []
@@ -208,9 +187,6 @@ def init_tool(env:dict, prefix:str):
     PE = _TessaEditor(base_url=_u(), autosave_delay="2000ms", enable_graphviz=True, enable_ai=True, IM=IM, nesting_level=2, intent_prefix="tessa_doc")
     IM.scripts["submit"] = [_handle_submit]
     IM.scripts.update({"tessa_doc_apply_ai": [_h_doc_apply_ai], "tessa_doc_conn": [_h_doc_conn], "tessa_doc_model": [_h_doc_model], "tessa_doc_ctx": [_h_doc_ctx], "tessa_files_toggle": [_h_files_toggle]})
-    AIM.steps.register_step_type("chunked_file_pass", _step_tessa_file_pass, "Chunked File Pass", {"conn_id": "select", "model": "select", "model_ctx": "number", "system_prompt": "textarea", "user_template": "textarea", "chunk_tokens": "number", "use_selected": "checkbox", "input_source": "text", "result_key": "text"})
-    AIM.steps.register_step_type("chunked_synthesis", _step_tessa_synthesis, "Chunked Synthesis", {"conn_id": "select", "model": "select", "model_ctx": "number", "system_prompt": "textarea", "user_template": "textarea", "chunk_tokens": "number", "result_key": "text"})
-    AIM.steps.register_step_type("edit_in_place", step_edit_in_place, "Edit In Place (gap-aware)",{"conn_id": "select", "model": "select", "model_ctx": "number", "temperature": "number", "gap_marker": "text", "system_prompt": "textarea", "chunk_tokens": "number", "fm_root": "text", "shadow_dir": "text", "shadow_doc_path": "text", "result_key": "text"})
     print("[tessa] ready")
 
 # --- Chat Stream ---
@@ -363,9 +339,25 @@ def _recompute_next(flow: dict):
         for p in n.get("prev", []):
             if p in by_id: by_id[p]["next"].append(n["id"])
 
-def _step_type_options(selected="") -> str: return "".join(f'<option value="{t["type"]}" {"selected" if t["type"]==selected else ""}>{_esc(t.get("label",t["type"]))}</option>' for t in AIM.steps.list_step_types())
+def _step_type_options(selected="") -> str:
+    blank = '<option value="" selected disabled>-- select step type --</option>' if not selected else ""
+    return blank + "".join(f'<option value="{t["type"]}" {"selected" if t["type"]==selected else ""}>{_esc(t.get("label",t["type"]))}</option>' for t in AIM.steps.list_step_types())
 
-def _step_config_form_fields(step_type: str, config: dict, pid: str) -> str: return BI.SettingsGroup(name="cfg", label="", fields=AIM.steps.get_step_type(step_type)["config_schema"], json_path="").render(config)
+
+# def _step_config_form_fields(step_type: str, config: dict, pid: str) -> str: return BI.SettingsGroup(name="cfg", label="", fields=AIM.steps.get_step_type(step_type)["config_schema"], json_path="").render(config)
+def _step_config_form_fields(step_type: str, config: dict, pid: str) -> str:
+    schema = list(AIM.steps.get_step_type(step_type)["config_schema"])
+    has_model = any(f.name == "model" for f in schema)
+    if has_model:
+        fields = []
+        for f in schema:
+            if f.name == "conn_id":
+                f = copy.copy(f)
+                f.hx_get, f.hx_target = _u("step_models", pid), "#cfg_model_wrap"
+            fields.append(f)
+        schema = fields
+    return BI.SettingsGroup(name="cfg", label="", fields=schema, json_path="").render(config, name_prefix="cfg_")
+
 
 def _parse_node_form(form, step_type: str = "") -> tuple:
     config = {}
@@ -421,7 +413,7 @@ async def step_models(pid: str, request: Request):
     form = await request.form(); conn = AIM.connections.get_conn(form.get("cfg_conn_id",""))
     models = AIM.connections.list_models_sync(conn) if conn else []
     opts = "".join(f'<option value="{m}">{m}</option>' for m in models) or '<option value="">No models</option>'
-    return HTMLResponse(f'<label style="font-size:.6rem; color:var(--text_muted)">Model<select name="cfg_model" class="module-select" style="font-size:.7rem">{opts}</select></label>')
+    return HTMLResponse(f'<label id="cfg_model_wrap" style="display:block;margin-bottom:1rem">Model<select name="cfg_model" class="module-select" style="width:100%">{opts}</select></label>')
 
 @router.get("/pipeline_node_form/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_node_form_new(pid: str, pl_id: str):
@@ -583,8 +575,8 @@ async def root(request: Request):
                       async function tessaImportPipeline(input, pid){
                           var file = input.files[0]; if(!file) return;
                           var text = await file.text();
-                          await fetch('/tool/ai_manager/pipelines/import', {method:'POST', headers:{'Content-Type':'application/json'}, body:text});
-                          htmx.ajax('GET', '/module/ai_tools/tessa/pipelines_panel/'+pid, {target:'#tessa-pipelines-section', swap:'outerHTML'});
+                          var r = await fetch('/module/ai_tools/tessa/pipeline_import/'+pid, {method:'POST', headers:{'Content-Type':'application/json'}, body:text});
+                          document.getElementById('tessa-pipelines-section').outerHTML = await r.text();
                       }
                     """
 
@@ -964,6 +956,25 @@ def _destination_picker_html(field_prefix: str, config: dict, with_filename: boo
 @router.get("/destination_folder", response_class=HTMLResponse)
 async def destination_folder(root: str, field: str): return HTMLResponse(_folder_picker(root, f"cfg_{field}_folder"))
 
+@router.post("/pipeline_import/{pid}", response_class=HTMLResponse)
+async def pipeline_import(pid: str, request: Request):
+    body = await request.json()
+    body["id"] = f"pl_{uuid.uuid4().hex[:10]}"
+    body["project_id"] = pid
+    body.setdefault("tags", [])
+    if "tessa" not in body["tags"]: body["tags"].append("tessa")
+    AIM.engine.save_pipeline(body)
+    return HTMLResponse(_pipelines_panel_html(pid))
+
+def _pipelines_panel_html(pid: str) -> str:
+    pls = _project_pipelines(pid)
+    cards = "".join(_pipeline_card_html(pid, pl) for pl in pls) or '<div style="font-size:.7rem;color:var(--text_muted);padding:.2rem .2rem">No pipelines. Click + to create one.</div>'
+    return f"""<div id="tessa-pipelines-section" style="border-top:var(--border-thick) solid var(--border)">
+        <details open><summary style="padding:.3rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.2rem">&#x26A1; Pipelines
+        <button class="btn-icon" style="margin-left:auto;font-size:.7rem" hx-get="{_u("pipeline_new_form",pid)}" hx-target="#tessa-pl-new" hx-swap="innerHTML" onclick="event.stopPropagation()">+</button></summary>
+        <label class="btn-icon" style="cursor:pointer;font-size:.7rem" title="Import pipeline JSON">&#x2B06;<input type="file" accept=".json" style="display:none" onchange="tessaImportPipeline(this,'{pid}')"></label>
+        <div id="tessa-pl-new"></div><div>{cards}</div>{_orphaned_pipelines_html(pid)}</details></div>"""
+
 # --- CSS ---
 
 CSS = """
@@ -971,9 +982,9 @@ CSS = """
 #tessa-modal{display:none;position:fixed;inset:0;z-index:2000;align-items:center;justify-content:center;background:rgba(0,0,0,0.65);}
 .editor-shell{display:flex;flex-direction:column;height:100%;width:100%;overflow:hidden;}
 #tessa-center{display:flex;flex-direction:column;height:100%;width:100%;overflow:hidden;}
-#tessa-pipe-bar{height:100%;display:flex;align-items:stretch;}"""
-#@media(max-width: 70rem){.tessa-pl-layout{flex-direction:column!important;} .tessa-pl-steps{flex:0 0 auto!important; max-height:35vh!important;border-right:none!important;border-bottom:var(--border-thick) solid var(--border)!important;}}
-#@media (max-width: 45rem) {.tessa-pl-split { flex-direction: column !important; } .tessa-pl-split #tessa-node-editor { order: 1; flex: 1 1 auto !important; } .tessa-pl-split .tessa-pl-steps { order: 2; flex: 0 0 auto !important; max-height: 10rem !important; border-right: none !important; border-top: var(--border-thick) solid var(--border) !important; } }
+#tessa-pipe-bar{height:100%;display:flex;align-items:stretch;}
+.tessa-pl-modal{width:70rem;max-width:92vw;height:82vh;max-height:82vh;}
+"""
 
 async def _tessa_doc_read(config, ctx):
     doc = _load(config["project_id"])
@@ -982,8 +993,6 @@ async def _tessa_doc_write(config, ctx):
     doc = _load(config["project_id"])
     if doc: doc["content"] = ctx.resolve(f"{{{config.get('from_node','')}.text}}"); _save(doc)
     return {"status": "ok"}
-
-# To Be Removed?
 
 @router.post("/pipeline_claim/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_claim(pid: str, pl_id: str):

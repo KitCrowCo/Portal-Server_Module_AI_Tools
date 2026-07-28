@@ -3,12 +3,12 @@ image.py — Flux2 Klein multi-stage image generation workspace.
 Sub-module of ai_tools. Mounted at /module/ai_tools/image.
 """
 import json, uuid, asyncio, base64, os, re, time, mimetypes, traceback
+import httpx
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
 from fastapi import APIRouter, Request, Form, HTTPException
 from fastapi.responses import HTMLResponse
-import httpx
 from PIL import Image as PILImage
 
 TOOL_META = {"label": "Image", "group": "model_tools", "icon": "&#x1F5BC;", "description": "Flux2 Klein multi-stage image pipeline", "singleton": True}
@@ -63,7 +63,7 @@ def init_tool(env: dict, prefix: str):
                         "gallery":  {"id":"gallery","order":2,"label":"Gallery","icon":"&#x1F5BC;"},
                         "settings": {"id":"settings","order":3,"label":"Settings","icon":"&#x2699;"}}, "active":"generate"})
     thumb_data_uri = BI.thumb_data_uri
-    _gallery_tool = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image", nesting_level=2, file_manager=_fm())
+    _gallery_tool = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_gallery", nesting_level=2, file_manager=_fm())
     # Tab-switch wrapper: update bottom toolbar on tab focus
     def _wrap_tab_action(base_fn):
         async def _h(req, pay, imr):
@@ -85,7 +85,7 @@ def init_tool(env: dict, prefix: str):
     async def _im_select_reference(request, payload, imr):
         rel = payload.get("path", "")
         imr.oob(f'<input id="img-ref-path" type="hidden" name="reference_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-ref-path", swap="outerHTML")
-        imr.oob(f'<span id="img-ref-status" style="font-size:.65rem;color:var(--text_muted)">Reference: {_esc(rel)}</span>', "img-ref-status", swap="outerHTML")
+        imr.oob(f'<span id="img-ref-status" style="font-size:.6rem;color:var(--text_muted)">Reference: {_esc(rel)}</span>', "img-ref-status", swap="outerHTML")
         return imr
 
     async def _im_save_mask(request, payload, imr):
@@ -201,8 +201,7 @@ def _list(kind):
 
 # --- Per-user WIP state ---
 
-def _default_form(): return {"width": 512, "height": 1024, "steps": 4, "cfg": 1.0, "shift": 1.0, "seed": -1, "batch": 1,
-                             "output_prefix": "img", "loras": []}
+def _default_form(): return {"width": 512, "height": 1024, "steps": 4, "cfg": 1.0, "shift": 1.0, "seed": -1, "batch": 1, "output_prefix": "img", "loras": []}
 
 async def _ui_state(request, patch=None):
     if patch is not None:
@@ -831,11 +830,7 @@ async def root(request: Request):
                      <div id="img-prompt-panel" style="border-top:var(--border-thick) solid var(--border); max-height:55%;overflow-y:auto">{_prompt_editor_html(selected)}</div>
                  </div>""")
     right = f'<div id="img-right-panel" style="height:100%">{await _right_panel_html()}</div>'
-
-    return ENV["templates"].TemplateResponse(
-        name="base.html", request=request, context={
-            "request": request, "user": request.state.user,
-            "nesting_level": 2, "shell_id": IM.branch_id,
+    return ENV["templates"].TemplateResponse(name="base.html", request=request, context={"request": request, "user": request.state.user, "nesting_level": 2, "shell_id": IM.branch_id,
             "toolbars": {"top": UI.toolbar(side="top", content=tab_bar, size="2.5rem", id="img-top", nesting_level=2, start_open=True, locked=True),
                          "bottom": UI.toolbar(side="bottom", content=f'<div id="img-bottom-content">{bottom_inner}</div>', size="14rem", id="img-bottom", nesting_level=2, start_open=False, resizable=True),
                          "left": UI.toolbar(side="left", content=left, size="18rem", id="img-left", nesting_level=2, start_open=False, resizable=True),
@@ -843,10 +838,10 @@ async def root(request: Request):
             "content": (f'<div id="img-panel" style="height:100%;overflow:hidden">{panel_html}</div>'), "extra_css": CSS, "extra_script": SCRIPT})
 
 CSS = """
-.img-prompt-item{display:flex;align-items:center;gap:.4rem;padding:.35rem .5rem;cursor:pointer;font-size:.8rem; border-bottom:var(--border-thick) solid var(--border)}
+.img-prompt-item{display:flex;align-items:center;gap:.2rem;padding:.3rem .3rem;cursor:pointer;font-size:.8rem; border-bottom:var(--border-thick) solid var(--border)}
 .img-prompt-item:hover{background:var(--accent_dim)}
-.img-prompt-item.active{background:var(--glass);border-left:.15rem solid var(--accent)}
-.igal-meta-card{padding:.8rem;max-width:22rem;max-height:80vh;overflow-y:auto}
+.img-prompt-item.active{background:var(--glass);border-left:.1rem solid var(--accent)}
+.igal-meta-card{padding:.8rem;max-width:22rem; max-height:80vh; overflow-y:auto}
 #igal-action-msg{font-size:.7rem;padding:.2rem .4rem}
 """
 
