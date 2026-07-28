@@ -4,7 +4,7 @@ Tessa - AI Document and Pipeline Workspace
 Sub-module of ai_tools. Mounted at /module/ai_tools/tessa.
 Data at data/ai_tools/tessa/. Shared knowledge at data/ai_tools/_knowledge/.
 """
-import asyncio, json, uuid, pathlib, copy
+import asyncio, json, uuid, pathlib, copy, re
 from datetime import datetime
 from pathlib import Path
 import httpx
@@ -372,7 +372,15 @@ def _parse_node_form(form, step_type: str = "") -> tuple:
         else: config[field.name] = raw or field.default or ""
     return config, form.getlist("prev"), form.get("join", "all")
 
-def _node_multiselect(nodes: list, selected: list, exclude_id: str = "") -> str: return "".join(f"""<label style="display:flex;align-items:center;gap:.2rem; font-size:.7rem; padding:.1rem 0"><input type="checkbox" name="prev" value="{n["id"]}" {"checked" if n["id"] in selected else ""}> {_esc(n.get("name") or n["id"])} <span style="color:var(--text_muted)">({_esc(n.get("type",""))})</span></label>""" for n in nodes if n["id"] != exclude_id) or '<div style="font-size:.7rem; color:var(--text_muted)">No other nodes yet — this will be a start node.</div>'
+def _node_multiselect(nodes: list, selected: list, exclude_id: str = "") -> str:
+    rows = ""
+    for n in nodes:
+        if n["id"] == exclude_id: continue
+        alias = re.sub(r'\W+', '_', (n.get("name") or "").strip()).strip('_') or n["id"]
+        keys = (AIM.steps.get_step_type(n.get("type","")) or {}).get("output_keys", [])
+        key_hint = " ".join(f'<code style="font-size:.6rem;color:var(--accent)">{{{alias}.{k}}}</code>' for k in keys)
+        rows += f"""<label style="display:flex;align-items:center;gap:.2rem;font-size:.7rem;padding:.1rem 0"><input type="checkbox" name="prev" value="{n["id"]}" {"checked" if n["id"] in selected else ""}> {_esc(n.get("name") or n["id"])} <span style="color:var(--text_muted)">({_esc(n.get("type",""))})</span>{key_hint}</label>"""
+    return rows or '<div style="font-size:.7rem;color:var(--text_muted)">No other nodes yet - this will be a start node.</div>'
 
 def _node_form_html(pid: str, pl: dict, node: dict = None) -> str:
     nodes = pl.get("flow", {}).get("nodes", [])
@@ -533,6 +541,16 @@ async def pipeline_delete(pid: str, pl_id: str):
     AIM.engine.delete_pipeline(pl_id)
     return HTMLResponse(_pipelines_panel_html(pid))
 
+def _bottom_panel_html(doc) -> str:
+    return """<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
+        <div style="display:flex;gap:.3rem;padding:.2rem .4rem;border-bottom:var(--border-thick) solid var(--border);flex-shrink:0">
+            <button class="cm-qbtn" onclick="tessaBottomTab('log')">Job Log</button>
+            <button class="cm-qbtn" onclick="tessaBottomTab('diff')">Shadow Diff</button>
+        </div>
+        <div id="tessa-bottom-log" style="flex:1;overflow-y:auto;padding:.4rem;font-family:var(--font-mono);font-size:.7rem;white-space:pre-wrap"></div>
+        <div id="tessa-bottom-diff" style="flex:1;overflow-y:auto;padding:.4rem;font-family:var(--font-mono);font-size:.72rem;white-space:pre-wrap;display:none"></div>
+    </div>"""
+
 # --- Main View Builder ---
 
 def _project_view(request, doc, models=None):
@@ -578,40 +596,51 @@ async def root(request: Request):
                           var r = await fetch('/module/ai_tools/tessa/pipeline_import/'+pid, {method:'POST', headers:{'Content-Type':'application/json'}, body:text});
                           document.getElementById('tessa-pipelines-section').outerHTML = await r.text();
                       }
+                      function tessaOpenBottom(){ var b=document.getElementById('tessa-bottom'); if(!b.classList.contains('active')) toggleToolbar('tessa-bottom','bottom','16rem','shrink','\u25B2','\u25BC'); }
+                      function tessaBottomTab(which){ document.getElementById('tessa-bottom-log').style.display = which==='log'?'block':'none'; document.getElementById('tessa-bottom-diff').style.display = which==='diff'?'block':'none'; }
+                      function tessaShowJob(jobId){ tessaOpenBottom(); tessaBottomTab('log'); htmx.ajax('GET','/module/ai_tools/tessa/job_detail/'+jobId,{target:'#tessa-bottom-log',swap:'innerHTML'}); }
                     """
 
     return ENV["templates"].TemplateResponse(name="base.html", request=request, context={
         "request": request, "user": user, "nesting_level": 2, "shell_id": IM.branch_id, "code_mirror": True,
         "toolbars": {"top": UI.toolbar(side="top", content=top, size="3rem", overlay=False, start_open=True, locked=True, nesting_level=2),
                      "left":  UI.toolbar(side="left", content=_left_panel(username, doc), size="18rem", overlay=False, start_open=True, resizable=True, nesting_level=2),
-                     "right": UI.toolbar(side="right", content=chat, size="22rem", overlay=False, start_open=True, resizable=True, nesting_level=2, id="tessa-right")},
-        "content": f"""<div id="tessa-center">{PE.render_shell(doc)}</div><div id="tessa-modal" onclick="if(event.target===this){{this.style.display='none'; this.innerHTML=''}}"></div>""",
+                     "right": UI.toolbar(side="right", content=chat, size="22rem", overlay=False, start_open=True, resizable=True, nesting_level=2, id="tessa-right"),
+                     "bottom": UI.toolbar(side="bottom", content=_bottom_panel_html(doc), size="16rem", overlay=False, start_open=False, resizable=True, nesting_level=2, id="tessa-bottom")},
+        "content": f"""<div id="tessa-center">{PE.render_shell(doc)}</div><div id="tessa-modal"></div>""",
         "extra_css": CSS + CM.CSS + PE.CSS, "extra_script": BI.PORTAL_EDITOR_JS + CM.SCRIPT + TESSA_SCRIPT + BI.PROMPT_BLOCK_JS})
 
-def _pipe_status_poll_js(pl_id: str) -> str:
-    """Polls /tool/ai_manager/job_status for this pipeline's current job and updates the overall label, the recent-log strip, and every per-node table row - all from one fetch, independent of WS.
-    Safe to call even if data-job is empty (it just returns immediately)."""
+def _pipe_status_poll_js(pl_id: str, pid: str) -> str:
     base = AIM.job_status_url("")
-    return f"""<script>
-    (function poll(){{
-        var el = document.getElementById('tessa-status-{pl_id}');
-        if(!el || !el.dataset.job) return;
-        fetch('{base}' + encodeURIComponent(el.dataset.job)).then(r=>r.json()).then(job=>{{
-            var label = el.querySelector('.tessa-status-label');
-            if(label) label.textContent = (job.status || 'unknown') + ' @ ' + new Date().toLocaleTimeString();
-            var log = el.parentElement.querySelector('.tessa-status-log');
-            if(log && job.log) log.innerHTML = job.log.slice(-8).map(l=>'<div>'+l+'</div>').join('');
-            (job.flow && job.flow.nodes ? job.flow.nodes : []).forEach(function(n){{
-                var row = document.querySelector('tr[data-node="'+n.id+'"]');
-                if(!row) return;
-                var s = row.querySelector('.tsn-status'), p = row.querySelector('.tsn-preview');
-                if(s) s.textContent = (n.status || 'idle') + (n.ts ? ' (' + n.ts + ')' : '');
-                if(p) p.textContent = n.message || (n.preview ? Object.values(n.preview).join(' | ') : '');
-            }});
-            if(job.status === 'running' || job.status === 'queued') setTimeout(poll, 1200);
-        }}).catch(()=>setTimeout(poll, 2000));
-    }})();
-    </script>"""
+    return f"""<script>(function poll(){{
+                    var el = document.getElementById('tessa-status-{pl_id}');
+                    if(!el || !el.dataset.job) return;
+                    fetch('{base}' + encodeURIComponent(el.dataset.job)).then(r=>r.json()).then(job=>{{
+                        if(job.status === 'running' || job.status === 'queued') {{
+                            var label = el.querySelector('.tessa-status-label'); if(label) label.textContent = job.status;
+                            setTimeout(poll, 1200);
+                        }} else {{
+                            htmx.ajax('GET', '{_u("pipeline_status",pid,pl_id)}', {{target:'#tessa-status-{pl_id}', swap:'outerHTML'}});
+                        }}
+                    }}).catch(()=>setTimeout(poll, 2000));
+                }})();</script>"""
+
+def _pipeline_status_block(pid: str, pl_id: str, last_job: dict) -> str:
+    live = bool(last_job and last_job.get("status") in ("running", "queued"))
+    if live:
+        return f"""<div id="tessa-status-{pl_id}" data-job="{last_job['id']}" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">
+                       <button class="cm-qbtn" style="color:#ff4444" hx-post="{_u("pipeline_stop",pid,pl_id,last_job['id'])}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x25FC; Stop</button>
+                       <span class="tessa-status-label" style="font-size:.6rem;color:#00ffa2">{last_job['status']}</span></div>""" + _pipe_status_poll_js(pl_id, pid)
+    state_label = last_job["status"] if last_job else "idle"
+    return f"""<div id="tessa-status-{pl_id}" data-job="" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">
+                   <button class="cm-qbtn" hx-post="{_u("pipeline_run",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML" hx-include="#tessa-input-{pl_id}">&#x25B6; Run</button>
+                   <span class="tessa-status-label" style="font-size:.6rem;color:var(--text_muted)">{state_label}</span></div>"""
+
+@router.get("/pipeline_status/{pid}/{pl_id}", response_class=HTMLResponse)
+async def pipeline_status_route(pid: str, pl_id: str):
+    pl = AIM.engine.load_pipeline(pl_id)
+    last_job = AIM.engine.load_job(pl.get("last_job_id","")) if pl and pl.get("last_job_id") else None
+    return HTMLResponse(_pipeline_status_block(pid, pl_id, last_job))
 
 def _status_block_html(pid: str, pl_id: str, job_id: str, err: str) -> str:
     """Renders the status row + log strip + poller for a JUST-STARTED job (from pipeline_run or pipeline_resume). This is the html returned directly by those two routes."""
@@ -640,11 +669,11 @@ def _pipeline_card_html(pid: str, pl: dict) -> str:
                           <div class="tessa-status-log" style="font-size:.6rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>""" + _pipe_status_poll_js(pl_id)
     else:
         state_label = last_job["status"] if last_job else "idle"
-        status_html = f"""<div id="tessa-status-{pl_id}" data-job="" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">
-                              <button class="cm-qbtn" hx-post="{_u("pipeline_run",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML" hx-include="#tessa-input-{pl_id}">&#x25B6; Run</button>
-                              <span class="tessa-status-label" style="font-size:.6rem; color:var(--text_muted)">{state_label}</span>
-                          </div>
-                          <div class="tessa-status-log" style="font-size:.6rem; color:var(--text_muted);max-height: 4rem;overflow-y:auto"></div>"""
+        # status_html = f"""<div id="tessa-status-{pl_id}" data-job="" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">
+        #                       <button class="cm-qbtn" hx-post="{_u("pipeline_run",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML" hx-include="#tessa-input-{pl_id}">&#x25B6; Run</button>
+        #                       <span class="tessa-status-label" style="font-size:.6rem; color:var(--text_muted)">{state_label}</span>
+        #                   </div>
+        #                   <div class="tessa-status-log" style="font-size:.6rem; color:var(--text_muted);max-height: 4rem;overflow-y:auto"></div>"""
     resume_row = ""
     if interrupted: resume_row = f'<button class="cm-qbtn" style="width:100%;margin-top:.2rem" hx-post="{_u("pipeline_resume",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x21BB; Resume interrupted run</button>'
     nodes = (last_job["flow"]["nodes"] if last_job else pl.get("flow", {}).get("nodes", []))
@@ -659,16 +688,21 @@ def _pipeline_card_html(pid: str, pl: dict) -> str:
     return f"""<div class="glass" style="padding=.2rem .5rem;margin:.2rem .2rem; font-size:.7rem">
                    <div style="display:flex;align-items:center;gap:.3rem">
                        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" hx-get="{_u("pipeline_editor",pid,pl_id)}" hx-target="#tessa-modal" hx-swap="innerHTML">{_esc(pl.get("name",""))}</span>
-                       <button class="btn-icon" style="color:#ff5f5f;font-size:.7rem" hx-post="{_u("pipeline_delete",pid,pl_id)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" hx-confirm="Delete pipeline?">&#x2715;</button>
+                       <button class="btn-icon" style="color:#ff5f5f;font-size:.7rem" hx-post="{_u("pipeline_delete",pid, pl_id)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" hx-confirm="Delete pipeline?">&#x2715;</button>
                        <div style="display:flex;gap:.3rem;margin-top:.2rem">
                            <button type="button" class="cm-qbtn" onclick="tessaExportPipeline('{pl_id}')">&#x2B07; Export</button>
                        </div>
                    </div>
                    <input type="text" id="tessa-input-{pl_id}" name="input_value" placeholder="Input for this run" class="module-select" style="width:100%;font-size:.7rem;margin:.2rem 0">
-                   {status_html}
+                   {_pipeline_status_block(pid, pl_id, last_job)}
                    {resume_row}
-                   <details style="margin-top:.2rem"><summary style="font-size:.6rem;color:var(--text_muted);cursor:pointer">Node status ({len(nodes)})</summary>
-                   <table style="width:100%;border-collapse:collapse;margin-top:.2rem">{rows}</table></details>
+                   <details style="margin-top:.2rem">
+                       <summary style="font-size:.6rem;color:var(--text_muted);cursor:pointer">Node status ({len(nodes)})</summary>
+                       <table style="width:100%;border-collapse:collapse;margin-top:.2rem">
+                           {rows}
+                       </table>
+                   </details>
+                   <button class="btn-icon" style="color:#ff5f5f;font-size:.7rem" hx-get="{_u("job_detail", pl_id)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML">Job Details</button>
                </div>"""
 
 @router.post("/pipeline_run/{pid}/{pl_id}", response_class=HTMLResponse)
@@ -679,22 +713,19 @@ async def pipeline_run(pid: str, pl_id: str, request: Request):
         pl = AIM.engine.load_pipeline(pl_id)
         pl["last_job_id"] = job_id
         AIM.engine.save_pipeline(pl)
-    return HTMLResponse(_status_block_html(pid, pl_id, job_id or "", err))
+    return HTMLResponse(_pipeline_status_block(pid, pl_id, job_id or ""))
 
 @router.post("/pipeline_resume/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_resume(pid: str, pl_id: str):
     pl = AIM.engine.load_pipeline(pl_id)
-    if not pl or not pl.get("last_job_id"): return HTMLResponse(_status_block_html(pid, pl_id, "", "no previous job to resume"))
+    if not pl or not pl.get("last_job_id"): return HTMLResponse(_pipeline_status_block(pid, pl_id, "", "no previous job to resume"))
     job_id, err = AIM.engine.resume(pl["last_job_id"])
-    return HTMLResponse(_status_block_html(pid, pl_id, job_id or "", err))
+    return HTMLResponse(_pipeline_status_block(pid, pl_id, job_id or ""))
 
 @router.post("/pipeline_stop/{pid}/{pl_id}/{job_id}", response_class=HTMLResponse)
 async def pipeline_stop(pid: str, pl_id: str, job_id: str):
     AIM.engine.stop(job_id)
-    return HTMLResponse(f"""<div id="tessa-status-{pl_id}" data-job="{job_id}" style="display:flex;align-items:center;gap:.4rem;margin-top:.2rem">
-                                <span class="tessa-status-label" style="font-size:.65rem;color:#ffcc00">stopping&#x2026;</span>
-                            </div>
-                            <div class="tessa-status-log" style="font-size:.62rem;color:var(--text_muted);max-height:4rem;overflow-y:auto"></div>""" + _pipe_status_poll_js(pl_id))
+    return HTMLResponse(_pipeline_status_block(pid, pl_id, job_id))
 
 @router.post("/new", response_class=HTMLResponse)
 async def new_project(request: Request):
@@ -970,10 +1001,27 @@ def _pipelines_panel_html(pid: str) -> str:
     pls = _project_pipelines(pid)
     cards = "".join(_pipeline_card_html(pid, pl) for pl in pls) or '<div style="font-size:.7rem;color:var(--text_muted);padding:.2rem .2rem">No pipelines. Click + to create one.</div>'
     return f"""<div id="tessa-pipelines-section" style="border-top:var(--border-thick) solid var(--border)">
-        <details open><summary style="padding:.3rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.2rem">&#x26A1; Pipelines
-        <button class="btn-icon" style="margin-left:auto;font-size:.7rem" hx-get="{_u("pipeline_new_form",pid)}" hx-target="#tessa-pl-new" hx-swap="innerHTML" onclick="event.stopPropagation()">+</button></summary>
-        <label class="btn-icon" style="cursor:pointer;font-size:.7rem" title="Import pipeline JSON">&#x2B06;<input type="file" accept=".json" style="display:none" onchange="tessaImportPipeline(this,'{pid}')"></label>
-        <div id="tessa-pl-new"></div><div>{cards}</div>{_orphaned_pipelines_html(pid)}</details></div>"""
+                   <details open>
+                       <summary style="padding:.3rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.2rem">
+                           &#x26A1; Pipelines
+                           <button class="btn-icon" style="margin-left:auto;font-size:.7rem" hx-get="{_u("pipeline_new_form",pid)}" hx-target="#tessa-pl-new" hx-swap="innerHTML" onclick="event.stopPropagation()">+</button>
+                       </summary>
+                       <label class="btn-icon" style="cursor:pointer;font-size:.7rem" title="Import pipeline JSON">&#x2B06;<input type="file" accept=".json" style="display:none" onchange="tessaImportPipeline(this,'{pid}')"></label>
+                       <div id="tessa-pl-new"></div>
+                       <div>{cards}</div>
+                       {_orphaned_pipelines_html(pid)}
+                   </details>
+               </div>"""
+
+@router.get("/job_detail/{job_id}")
+async def job_detail(job_id: str):
+    job = AIM.engine.load_job(job_id)
+    return HTMLResponse(f'<pre style="white-space:pre-wrap;font-size:.7rem;padding:1rem">{_esc(json.dumps(job.get("scratch",{}), indent=2))}</pre>') if job else HTMLResponse("Not found")
+
+@router.get("/shadow_refresh/{scope}", response_class=HTMLResponse)
+async def shadow_refresh(scope: str):
+    shadow = _shadow_store_for(COMMON_ROOT if scope == "wiki" else KG_DIR)
+    return HTMLResponse(BI.shadow_review_html(shadow, _u(f"shadow/{scope}/accept")+"/{path}", _u(f"shadow/{scope}/reject")+"/{path}", _u(f"shadow/{scope}/diff")+"/{path}", list_id=f"shadow-list-{scope}"))
 
 # --- CSS ---
 

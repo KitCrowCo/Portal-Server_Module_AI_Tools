@@ -143,8 +143,9 @@ async def _pick_mask_image(request, payload, imr):
 
 async def _pick_reference_image(request, payload, imr):
     rel = payload.get("path", "")
+    fm = _fm()
     imr.oob(f'<input type="hidden" id="img-ref-path" name="reference_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-ref-path", swap="outerHTML")
-    imr.oob(f'<span style="font-size:.65rem;color:var(--text_muted)">Reference: {_esc(rel)}</span>', "img-ref-status", swap="outerHTML")
+    imr.oob(f'<div style="display:flex;align-items:center;gap:.3rem;font-size:.6rem;color:var(--text_muted)"><img src="{_u("thumb", rel)}" style="width:2rem;height:2rem;object-fit:cover;border-radius:.2rem"> {_esc(rel)}</div>', "img-ref-status", swap="outerHTML")
     return imr
 
 def _ensure_worker():
@@ -395,12 +396,12 @@ def _generate_form_html(form, prompts, selected_prompt_id, system_status):
                         <select name="offload_mode" class="module-select" style="font-size:.8rem">{offload_opts}</select>
                     </label>
                     <details class="glass" style="padding:.5rem">
-                        <summary style="cursor:pointer;font-size:.74rem;color:var(--text_muted);list-style:none">LoRAs (up to 3)</summary>
+                        <summary style="cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none">LoRAs (up to 3)</summary>
                         <div style="display:flex;flex-direction:column;gap:.3rem;margin-top:.4rem">{lora_rows}</div>
                     </details>
                     <details class="glass" style="padding:.5rem">
-                        <summary style="cursor:pointer;font-size:.74rem;color:var(--text_muted);list-style:none">Sequence / GIF</summary>
-                        <div style="display:flex;gap:.4rem;margin-top:.35rem;align-items:center;flex-wrap:wrap">
+                        <summary style="cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none">Sequence / GIF</summary>
+                        <div style="display:flex;gap:.4rem;margin-top:.3rem;align-items:center;flex-wrap:wrap">
                         <label style="display:flex;align-items:center;gap:.3rem;font-size:.8rem;flex-shrink:0">
                             <input type="checkbox" name="is_sequence" value="1">
                             Enable GIF
@@ -445,10 +446,9 @@ async def generate_submit(request: Request):
 def _inpaint_panel_html(prompts, selected_prompt_id):
     """Canvas panel only — controls live in the bottom toolbar."""
     return (f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
-
                     <details style="border-bottom:var(--border-thick) solid var(--border); flex-shrink:0">
                         <summary style="cursor:pointer; font-size:.7rem; color:var(--text_muted); list-style:none">Select base image</summary>
-                        {_base_picker.render_shell(include_css=False)}
+                        <div style="max-height:20rem;overflow-y:auto">{_base_picker.render_shell(include_css=False)}</div>
                     </details>
                     <div style="flex:1;overflow:auto;padding:.75rem;position:relative;text-align:center">
                         <div id="img-inpaint-canvas-wrap" style="position:relative;display:inline-block;max-width:100%">
@@ -486,17 +486,16 @@ def _bottom_toolbar_inpaint_html(prompts, selected_prompt_id, selected_mask=""):
                            <input type="hidden" name="mask_path" id="img-mask-path" form="img-inpaint-form" value="">
                            <button type="submit" class="button">&#x25B6; Queue Inpaint</button>
                        </form>
-
                    </div>
                    <div id="img-mask-debug" style="font-size:.65rem;color:var(--text_muted);font-family:var(--font-mono)">save-mask: idle (never clicked)</div>
                    <details style="border-top:var(--border-thick) solid var(--border);padding-top:.3rem">
                        <summary style="cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none">Or use a previously saved mask</summary>
-                       {_mask_picker.render_shell(include_css=False)}
+                       <div style="max-height:20rem;overflow-y:auto">{_mask_picker.render_shell(include_css=False)}</div>
                    </details>
                    <details style="border-top:var(--border-thick) solid var(--border);padding-top:.3rem">
                        <summary style="cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none">Reference image (optional)</summary>
                        {mask_status}
-                       {_ref_picker.render_shell(include_css=False)}
+                       <div style="max-height:20rem;overflow-y:auto">{_ref_picker.render_shell(include_css=False)}</div>
                    </details>
                    <div id="img-inpaint-status" style="font-size:.7rem;color:var(--text_muted);width:100%"></div>
                    <span id="img-mask-status" style="font-size:.7rem;color:var(--text_muted);flex:1">No mask saved yet — draw then Save Mask, or pick a saved one above.</span>
@@ -836,6 +835,12 @@ async def root(request: Request):
                          "left": UI.toolbar(side="left", content=left, size="18rem", id="img-left", nesting_level=2, start_open=False, resizable=True),
                          "right": UI.toolbar(side="right", content=right, size="18rem", id="img-right", nesting_level=2, start_open=False, resizable=True)},
             "content": (f'<div id="img-panel" style="height:100%;overflow:hidden">{panel_html}</div>'), "extra_css": CSS, "extra_script": SCRIPT})
+
+@router.get("/thumb/{path:path}")
+async def serve_thumb(path: str):
+    p = BI.ensure_thumb_cached(_fm(), path)
+    if not p: raise HTTPException(404)
+    return FileResponse(p, headers={"Cache-Control": "public, max-age=3600"})
 
 CSS = """
 .img-prompt-item{display:flex;align-items:center;gap:.2rem;padding:.3rem .3rem;cursor:pointer;font-size:.8rem; border-bottom:var(--border-thick) solid var(--border)}
