@@ -122,9 +122,9 @@ def init_tool(env: dict, prefix: str):
     IM.scripts["image_select_mask"] = [_im_select_mask]
     IM.scripts["image_save_mask"] = [_im_save_mask]
     IM.scripts["image_assemble_gif"] = [_im_assemble_gif]
-    _base_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_base", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_base_image)
-    _mask_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_mask", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_mask_image)
-    _ref_picker  = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_ref",  nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_reference_image)
+    _base_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_base", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_base_image, thumb_url_fn=lambda rel: _u("thumb", rel))
+    _mask_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_mask", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_mask_image, thumb_url_fn=lambda rel: _u("thumb", rel))
+    _ref_picker  = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_ref",  nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_reference_image, thumb_url_fn=lambda rel: _u("thumb", rel))
     print("[image] ready")
 
 async def _pick_base_image(request, payload, imr):

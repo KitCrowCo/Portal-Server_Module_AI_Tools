@@ -187,8 +187,16 @@ def init_tool(env:dict, prefix:str):
             return imr.raw(f'<input id="doc-title-{pid}" type="text" value="{_esc(payload.get("value",""))}" name="value" class="doc-title-input">')
     PE = _TessaEditor(base_url=_u(), autosave_delay="2000ms", enable_graphviz=True, enable_ai=True, IM=IM, nesting_level=2, intent_prefix="tessa_doc")
     IM.scripts["submit"] = [_handle_submit]
+    IM.scripts["tessa_step_models"] = [_h_step_models]
+    IM.scripts["tessa_shadow_refresh"] = [_h_shadow_refresh]
     IM.scripts.update({"tessa_doc_apply_ai": [_h_doc_apply_ai], "tessa_doc_conn": [_h_doc_conn], "tessa_doc_model": [_h_doc_model], "tessa_doc_ctx": [_h_doc_ctx], "tessa_files_toggle": [_h_files_toggle]})
     print("[tessa] ready")
+
+async def _h_shadow_refresh(request, payload, imr):
+    scope = payload.get("scope","wiki")
+    shadow = _shadow_store_for(COMMON_ROOT if scope == "wiki" else KG_DIR)
+    imr.oob(BI.shadow_review_html(shadow, ...), f"shadow-list-{scope}", swap="innerHTML")
+    return imr
 
 # --- Chat Stream ---
 
@@ -358,7 +366,7 @@ def _step_config_form_fields(step_type: str, config: dict, pid: str) -> str:
         for f in schema:
             if f.name == "conn_id":
                 f = copy.copy(f)
-                f.hx_get, f.hx_target = _u("step_models", pid), "#cfg_model_wrap"
+                f.hx_intent, f.hx_target = _u("tessa_step_models", pid), "#cfg_model_wrap"
             fields.append(f)
         schema = fields
     return guide_html + BI.SettingsGroup(name="cfg", label="", fields=schema, json_path="").render(config, name_prefix="cfg_")
@@ -422,12 +430,12 @@ async def pipeline_node_type_change(pid: str, pl_id: str, request: Request):
     form = await request.form()
     return HTMLResponse(_step_config_form_fields(form.get("type",""), {}, pid))
 
-@router.post("/step_models/{pid}", response_class=HTMLResponse)
-async def step_models(pid: str, request: Request):
-    form = await request.form(); conn = AIM.connections.get_conn(form.get("cfg_conn_id",""))
+async def _h_step_models(request, payload, imr):
+    conn = AIM.connections.get_conn(payload.get("cfg_conn_id",""))
     models = AIM.connections.list_models_sync(conn) if conn else []
     opts = "".join(f'<option value="{m}">{m}</option>' for m in models) or '<option value="">No models</option>'
-    return HTMLResponse(f'<label id="cfg_model_wrap" style="display:block;margin-bottom:1rem">Model<select name="cfg_model" class="module-select" style="width:100%">{opts}</select></label>')
+    imr.oob(f'<label id="cfg_model_wrap" style="display:block;margin-bottom:1rem">Model<select name="cfg_model" class="module-select" style="width:100%">{opts}</select></label>', "cfg_model_wrap", swap="outerHTML")
+    return imr
 
 @router.get("/pipeline_node_form/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_node_form_new(pid: str, pl_id: str):
