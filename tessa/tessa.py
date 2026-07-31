@@ -188,14 +188,25 @@ def init_tool(env:dict, prefix:str):
     PE = _TessaEditor(base_url=_u(), autosave_delay="2000ms", enable_graphviz=True, enable_ai=True, IM=IM, nesting_level=2, intent_prefix="tessa_doc")
     IM.scripts["submit"] = [_handle_submit]
     IM.scripts["tessa_step_models"] = [_h_step_models]
-    IM.scripts["tessa_shadow_refresh"] = [_h_shadow_refresh]
+    IM.scripts.update({"tessa_shadow_action": [_h_shadow_action], "tessa_bottom_log": [_h_bottom_log], "tessa_bottom_diff": [_h_bottom_diff], "tessa_job_detail": [_h_job_detail]})
     IM.scripts.update({"tessa_doc_apply_ai": [_h_doc_apply_ai], "tessa_doc_conn": [_h_doc_conn], "tessa_doc_model": [_h_doc_model], "tessa_doc_ctx": [_h_doc_ctx], "tessa_files_toggle": [_h_files_toggle]})
+    IM.scripts["tessa_clear_jobs"] = [_h_clear_jobs]
     print("[tessa] ready")
 
-async def _h_shadow_refresh(request, payload, imr):
-    scope = payload.get("scope","wiki")
-    shadow = _shadow_store_for(COMMON_ROOT if scope == "wiki" else KG_DIR)
-    imr.oob(BI.shadow_review_html(shadow, ...), f"shadow-list-{scope}", swap="innerHTML")
+async def _h_bottom_log(request, payload, imr):
+    pid = payload.get("pid","")
+    jobs = sorted([j for j in (AIM.engine.load_job(p["last_job_id"]) for p in _project_pipelines(pid) if p.get("last_job_id")) if j], key=lambda j: j.get("created",""), reverse=True)
+    rows = "".join(f'<div style="border-bottom:var(--border-thick) solid var(--border);padding:.2rem 0;cursor:pointer" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals=\'{json.dumps({"type":"tessa_job_detail","job_id":j["id"]})}\'>{j["id"]} - {j["status"]} - {j.get("created","")[:19]}</div>' for j in jobs[:20])
+    imr.oob(rows or '<span style="color:var(--text_muted)">No jobs run yet for this project.</span>', "tessa-bottom-log")
+    return imr
+
+async def _h_job_detail(request, payload, imr):
+    job = AIM.engine.load_job(payload.get("job_id",""))
+    if not job:
+        imr.oob('<span style="color:var(--text_muted)">Not found</span>', "tessa-bottom-log")
+        return imr
+    note = '<div style="color:var(--text_muted);font-size:.65rem;margin-bottom:.3rem">Raw job scratch data (debug only). To accept/reject a file this run wrote, switch to the Shadow Diff tab above - those entries are tracked per-file, not per-job.</div>'
+    imr.oob(note + f'<pre style="white-space:pre-wrap;font-size:.7rem">{_esc(json.dumps(job.get("scratch",{}), indent=2))}</pre>', "tessa-bottom-log")
     return imr
 
 # --- Chat Stream ---
@@ -209,27 +220,38 @@ async def _handle_submit(request, payload, imr):
     await asyncio.sleep(0.05)
     return imr
 
-async def _do_stream(username, payload, pid):
+async def _do_stream(username, payload, pid, skip_user_append=False):
     content = payload.get("content","").strip(); think = payload.get("think") in ("1","true",True)
     async def _ws(html): await WS.send_personal_message(html, username)
-    async def _err(msg): await _ws(f'<div id="cm-msgs-{pid}" hx-swap-oob="beforeend"><div style="color:#ff5f5f;font-size:.78rem;padding:.3rem .6rem">&#x26A0; {_esc(msg)}</div></div>{CM.working_hide_html(pid)}')
+    async def _err(msg, retry_mid=None):
+        retry_html = f' <button class="cm-qbtn" hx-post="{_u("msg/retry_send",retry_mid)}" hx-target="#cm-msgs-{pid}" hx-swap="outerHTML" hx-vals=\'{{"content":""}}\'>&#x21BA; Retry</button>' if retry_mid else ""
+        await _ws(f'<div id="cm-msgs-{pid}" hx-swap-oob="beforeend"><div style="color:#ff5f5f;font-size:.78rem;padding:.3rem .6rem">&#x26A0; {_esc(msg)}{retry_html}</div></div>{CM.working_hide_html(pid)}')
     full = ""; tb = ""
-    try:
-        doc = _load(pid)
-        if not doc or doc.get("username") != username: await _err("Project not found."); return
-        conn = AIM.connections.get_conn(doc.get("conn_id","")); model = doc.get("model","")
-        if not conn: await _err("No connection configured. Set one in the top bar."); return
-        if not model: await _err("No model selected. Choose one in the top bar."); return
-        num_ctx = doc.get("model_ctx", 32768)
-        if _tok(content) > int(num_ctx * 0.65): await _err(f"Input too long (~{_tok(content)}t, limit ~{int(num_ctx*0.65)}t for {num_ctx} context)"); return
+    doc = _load(pid)
+    if not doc or doc.get("username") != username: await _err("Project not found."); return
+    user_msg = None
+    if not skip_user_append:
         user_msg = {"id":uuid.uuid4().hex[:8],"role":"user","content":content,"user_name":username,"timestamp":datetime.utcnow().isoformat()}
         doc["conversation"].append(user_msg); _save(doc)
         await _ws(f'<div id="cm-msgs-{pid}" hx-swap-oob="beforeend">{CM.render_message(user_msg, is_me=True, can_delete=True, can_edit=True)}</div>')
+    try:
+        conn_id = doc.get("conn_id","")
+        conn = AIM.connections.get_conn(conn_id)
+        if not conn and conn_id:
+            fallback = AIM.connections.get_conn("")
+            if fallback:
+                doc["conn_id"] = fallback["_id"]; _save(doc); conn = fallback
+                await _ws(f'<div id="cm-msgs-{pid}" hx-swap-oob="beforeend"><div style="font-size:.68rem;color:#ffaa44;padding:.15rem .4rem">&#x26A0; Saved connection no longer exists - switched to {_esc(fallback.get("display_name",fallback["_id"]))}. Check the top bar.</div></div>')
+        model = doc.get("model","")
+        if not conn: await _err("No connection available. Add one in AI Tools > Settings.", retry_mid=user_msg["id"] if user_msg else None); return
+        if not model: await _err("No model selected. Choose one in the top bar.", retry_mid=user_msg["id"] if user_msg else None); return
+        num_ctx = doc.get("model_ctx", 32768)
+        if _tok(content) > int(num_ctx * 0.65): await _err(f"Input too long (~{_tok(content)}t, limit ~{int(num_ctx*0.65)}t for {num_ctx} context). Edit the message above and retry.", retry_mid=user_msg["id"] if user_msg else None); return
         files_txt = _files_content(doc.get("selected_files",[])); _ACTIVE.add(pid)
         try:
             async for text, thinking, done, err in _stream(conn, _build_messages(doc, content, files_txt), model, num_ctx, think):
                 if _STOP.pop(pid, False): break
-                if err: await _err(err); return
+                if err: await _err(err, retry_mid=user_msg["id"] if user_msg else None); return
                 if text: full += text
                 if thinking: tb = thinking
                 think_html = f'<details class="cm-think" open><summary>\U0001f9e0 Thinking\u2026</summary><div class="cm-think-body">{_esc(tb[-2000:])}</div></details>' if tb.strip() else ""
@@ -288,35 +310,38 @@ def _kg_html(doc):
 
 def _shadow_store_for(root: Path) -> "BI.ShadowStore": return BI.ShadowStore(BI.FileManager(root), root / "_shadow")
 
+def _shadow_rows_html() -> str:
+    """Shared body: Wiki + Knowledge shadow lists. No collapsible wrapper - callers decide whether/how to collapse."""
+    wiki_rows = BI.shadow_review_html(_shadow_store_for(COMMON_ROOT), "tessa_shadow_action", {"scope": "wiki"}, list_id="shadow-list-wiki")
+    kg_rows = BI.shadow_review_html(_shadow_store_for(KG_DIR), "tessa_shadow_action", {"scope": "kg"}, list_id="shadow-list-kg")
+    return f"""<div style="font-size:.6rem;color:var(--text_muted);text-transform:uppercase;padding:.2rem 0">Wiki</div><div id="shadow-list-wiki">{wiki_rows}</div>
+               <div style="font-size:.6rem;color:var(--text_muted);text-transform:uppercase;padding:.4rem 0 .2rem">Knowledge</div><div id="shadow-list-kg">{kg_rows}</div>"""
+
 def _shadow_panel_html(pid: str) -> str:
-    wiki_rows = BI.shadow_review_html(_shadow_store_for(COMMON_ROOT), _u("shadow/wiki/accept")+"/{path}", _u("shadow/wiki/reject")+"/{path}", _u("shadow/wiki/diff")+"/{path}", list_id="shadow-list-wiki")
-    kg_rows = BI.shadow_review_html(_shadow_store_for(KG_DIR), _u("shadow/kg/accept")+"/{path}", _u("shadow/kg/reject")+"/{path}", _u("shadow/kg/diff")+"/{path}", list_id="shadow-list-kg")
+    """Collapsible version for the LEFT SIDEBAR, sitting alongside Knowledge/Pipelines."""
     return f"""<div id="tessa-shadow-section" style="border-top:var(--border-thick) solid var(--border)">
                    <details>
                        <summary style="padding:.2rem .2rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none">&#x1F441; Pending Reviews</summary>
-                       <div style="max-height:26vh;overflow-y:auto;padding:.2rem .3rem">
-                           <div style="font-size:.6rem;color:var(--text_muted);text-transform:uppercase;padding:.2rem 0">Wiki</div><div id="shadow-list-wiki">{wiki_rows}</div>
-                           <div style="font-size:.6rem;color:var(--text_muted);text-transform:uppercase;padding:.4rem 0 .2rem">Knowledge</div><div id="shadow-list-kg">{kg_rows}</div>
-                       </div>
+                       <div style="max-height:26vh;overflow-y:auto;padding:.2rem .3rem">{_shadow_rows_html()}</div>
                     </details>
                 </div>"""
 
-@router.post("/shadow/{scope}/accept/{rel_path:path}", response_class=HTMLResponse)
-async def shadow_accept(scope: str, rel_path: str):
+async def _h_bottom_diff(request, payload, imr):
+    imr.oob(f'<div style="padding:.2rem .3rem">{_shadow_rows_html()}</div>', "tessa-bottom-diff")
+    return imr
+
+async def _h_shadow_action(request, payload, imr):
+    scope, action, path = payload.get("scope","wiki"), payload.get("action",""), payload.get("path","")
     shadow = _shadow_store_for(COMMON_ROOT if scope == "wiki" else KG_DIR)
-    shadow.accept(rel_path)
-    return HTMLResponse(BI.shadow_review_html(shadow, _u(f"shadow/{scope}/accept")+"/{path}", _u(f"shadow/{scope}/reject")+"/{path}", _u(f"shadow/{scope}/diff")+"/{path}", list_id=f"shadow-list-{scope}"))
+    if action == "diff":
+        imr.oob(f'<pre style="white-space:pre-wrap;margin:0">{_esc(shadow.diff(path))}</pre>', payload.get("diff_target",""))
+        return imr
+    if action == "accept": shadow.accept(path)
+    elif action == "reject": shadow.reject(path)
+    imr.oob(BI.shadow_review_html(shadow, "tessa_shadow_action", {"scope": scope}, list_id=f"shadow-list-{scope}"), f"shadow-list-{scope}", swap="innerHTML")
+    return imr
 
-@router.post("/shadow/{scope}/reject/{rel_path:path}", response_class=HTMLResponse)
-async def shadow_reject(scope: str, rel_path: str):
-    shadow = _shadow_store_for(COMMON_ROOT if scope == "wiki" else KG_DIR)
-    shadow.reject(rel_path)
-    return HTMLResponse(BI.shadow_review_html(shadow, _u(f"shadow/{scope}/accept")+"/{path}", _u(f"shadow/{scope}/reject")+"/{path}", _u(f"shadow/{scope}/diff")+"/{path}", list_id=f"shadow-list-{scope}"))
-
-@router.get("/shadow/{scope}/diff/{rel_path:path}", response_class=HTMLResponse)
-async def shadow_diff_route(scope: str, rel_path: str): return HTMLResponse(f'<pre style="white-space:pre-wrap;margin:0">{_esc(_shadow_store_for(COMMON_ROOT if scope == "wiki" else KG_DIR).diff(rel_path))}</pre>')
-
-def _left_bottom_html(doc): return _kg_html(doc) + _pipelines_panel_html(doc["id"]) + _shadow_panel_html(doc["id"])
+def _left_bottom_html(doc): return _kg_html(doc) + _pipelines_panel_html(doc["id"]) #+ _shadow_panel_html(doc["id"])
 
 def _left_panel(username, doc):
     pid = doc["id"]
@@ -327,7 +352,7 @@ def _left_panel(username, doc):
                         <button class="btn-icon" style="font-size:.7rem" hx-get="{_u("settings")}" hx-target="#tessa-center" hx-swap="innerHTML" title="Settings">&#x2699;</button>
                     </div>
                     <div id="tessa-proj-list" style="flex:1;min-height:0;overflow-y:auto">{_proj_list_html(username, pid)}</div>
-                    <div id="tessa-left-bottom" style="flex-shrink:0;overflow-y:auto;border-top:var(--border-thick) solid var(--border)">{_left_bottom_html(doc)}</div>
+                    <div id="tessa-left-bottom" style="flex:0 1 auto;max-height:55vh;overflow-y:auto;border-top:var(--border-thick) solid var(--border)">{_left_bottom_html(doc)}</div>
                 </div>""")
 
 # -- Pipeline Run --
@@ -357,18 +382,25 @@ def _step_config_form_fields(step_type: str, config: dict, pid: str) -> str:
     schema = list(spec["config_schema"])
     guide = spec.get("guide","")
     guide_html = f"""<details class="glass" style="padding:.4rem .6rem;margin-bottom:.4rem">
+                         <summary style="cursor:pointer;font-size:.7rem;color:var(--accent)">&#x2139; How this node works</summary>
+                         <div style="font-size:.7rem;color:var(--text_muted);margin-top:.3rem;white-space:pre-wrap">{_esc(guide)}</div>
+                     </details>""" if guide else ""
+    schema = [copy.copy(f) if f.name == "conn_id" else f for f in schema]
+    for f in schema:
+        if f.name == "conn_id": f.hx_intent, f.hx_target = "tessa_step_models", "#cfg_model_wrap"
+    return guide_html + BI.SettingsGroup(name="cfg", label="", fields=schema, json_path="").render(config, name_prefix="cfg_")
+
+def _step_config_form_fields(step_type: str, config: dict, pid: str) -> str:
+    spec = AIM.steps.get_step_type(step_type)
+    schema = list(spec["config_schema"])
+    guide = spec.get("guide","")
+    guide_html = f"""<details class="glass" style="padding:.4rem .6rem;margin-bottom:.4rem">
                          <summary style="cursor:pointer;font-size:.68rem;color:var(--accent)">&#x2139; How this node works</summary>
                          <div style="font-size:.7rem;color:var(--text_muted);margin-top:.3rem;white-space:pre-wrap">{_esc(guide)}</div>
                      </details>""" if guide else ""
-    has_model = any(f.name == "model" for f in schema)
-    if has_model:
-        fields = []
-        for f in schema:
-            if f.name == "conn_id":
-                f = copy.copy(f)
-                f.hx_intent, f.hx_target = _u("tessa_step_models", pid), "#cfg_model_wrap"
-            fields.append(f)
-        schema = fields
+    schema = [copy.copy(f) if f.name == "conn_id" else f for f in schema]
+    for f in schema:
+        if f.name == "conn_id": f.hx_intent, f.hx_target = "tessa_step_models", "#cfg_model_wrap"
     return guide_html + BI.SettingsGroup(name="cfg", label="", fields=schema, json_path="").render(config, name_prefix="cfg_")
 
 def _parse_node_form(form, step_type: str = "") -> tuple:
@@ -382,7 +414,7 @@ def _parse_node_form(form, step_type: str = "") -> tuple:
                 except (ValueError, TypeError): config[field.name] = field.default or 0
         elif field.type == "checkbox": config[field.name] = raw is not None
         else: config[field.name] = raw or field.default or ""
-    return config, form.getlist("prev"), form.get("join", "all")
+    return config, form.getlist("prev"), form.get("join", "all"), form.get("slug","").strip()
 
 def _node_multiselect(nodes: list, selected: list, exclude_id: str = "") -> str:
     rows = ""
@@ -409,9 +441,14 @@ def _node_form_html(pid: str, pl: dict, node: dict = None) -> str:
                             <option value="any" {"selected" if (node or {}).get("join","all")=="any" else ""}>Any one is enough</option>
                        </select>
                    </label>"""
+    slug_val = (node or {}).get("slug","") or re.sub(r'\W+', '_', ((node or {}).get('name') or "").strip().lower()).strip('_')
     return f"""<form hx-post="{action}" hx-target="#tessa-node-editor" hx-swap="innerHTML" style="display:flex; flex-direction:column; gap:.2rem; padding:.2rem">
                    <span style="font-weight:600; font-size:.8rem; color:var(--accent)">{"New Node" if is_new else "Edit Node"}</span>
+                   {_scratch_reference_html()}
                    <input type="text" name="name" value="{_esc((node or {}).get('name',''))}" placeholder="Node name" class="module-select" style="font-size:.8rem">
+                   <label style="font-size:.7rem;color:var(--text_muted)">Reference name (used as <code>{{this.field}}</code> elsewhere) - won't change if you rename the node above later
+                       <input type="text" name="slug" value="{_esc(slug_val)}" class="module-select" style="font-size:.75rem;font-family:var(--font-mono)">
+                   </label>
                    <label style="font-size:.7rem; color:var(--text_muted)">
                        Step Type
                        <select name="type" class="module-select" style="font-size:.7rem" hx-post="{_u("pipeline_node_type_change",pid,pl["id"])}" hx-trigger="change" hx-include="this" hx-target="#tessa-node-cfg" hx-swap="innerHTML">
@@ -451,24 +488,27 @@ async def pipeline_node_form_edit(pid: str, pl_id: str, nid: str):
 
 @router.post("/pipeline_node_add/{pid}/{pl_id}", response_class=HTMLResponse)
 async def pipeline_node_add(pid: str, pl_id: str, request: Request):
-    form = await request.form(); pl = AIM.engine.load_pipeline(pl_id)
+    form = await request.form()
+    pl = AIM.engine.load_pipeline(pl_id)
     if not pl: return HTMLResponse("")
-    config, prev, join = _parse_node_form(form, form.get("type", ""))
+    config, prev, join, slug = _parse_node_form(form, form.get("type", ""))
     flow = pl.setdefault("flow", {"nodes": []})
-    flow["nodes"].append({"id": f"n_{uuid.uuid4().hex[:8]}", "name": form.get("name","").strip(), "type": form.get("type",""), "config": config, "prev": prev, "join": join, "next": []})
+    flow["nodes"].append({"id": f"n_{uuid.uuid4().hex[:8]}", "slug": slug, "name": form.get("name","").strip(), "type": form.get("type",""), "config": config, "prev": prev, "join": join, "next": []})
     _recompute_next(flow); AIM.engine.save_pipeline(pl)
     return HTMLResponse(_pipeline_editor_html(pid, pl))
 
 @router.post("/pipeline_node_save/{pid}/{pl_id}/{nid}", response_class=HTMLResponse)
 async def pipeline_node_save(pid: str, pl_id: str, nid: str, request: Request):
-    form = await request.form(); pl = AIM.engine.load_pipeline(pl_id)
+    form = await request.form()
+    pl = AIM.engine.load_pipeline(pl_id)
     if not pl: return HTMLResponse("")
     flow = pl.setdefault("flow", {"nodes": []})
     node = next((n for n in flow["nodes"] if n["id"] == nid), None)
     if not node: return HTMLResponse("")
-    config, prev, join = _parse_node_form(form, form.get("type", node["type"]))
-    node["name"], node["type"], node["config"], node["prev"], node["join"] = form.get("name","").strip(), form.get("type", node["type"]), config, prev, join
-    _recompute_next(flow); AIM.engine.save_pipeline(pl)
+    config, prev, join, slug = _parse_node_form(form, form.get("type", node["type"]))
+    node["slug"], node["name"], node["type"], node["config"], node["prev"], node["join"] = slug, form.get("name","").strip(), form.get("type", node["type"]), config, prev, join
+    _recompute_next(flow)
+    AIM.engine.save_pipeline(pl)
     return HTMLResponse(_pipeline_editor_html(pid, pl))
 
 @router.post("/pipeline_node_delete/{pid}/{pl_id}/{nid}", response_class=HTMLResponse)
@@ -532,16 +572,7 @@ async def pipeline_editor_route(pid: str, pl_id: str):
                                 <div style="flex:1;min-height:0;overflow:hidden">{_pipeline_editor_html(pid, pl)}</div>
                             </div>
                             <script>document.getElementById("tessa-modal").style.display="flex";</script>""")
-
-def _pipelines_panel_html(pid: str) -> str:
-    pls = _project_pipelines(pid)
-    cards = "".join(_pipeline_card_html(pid, pl) for pl in pls) or '<div style="font-size:.7rem;color:var(--text_muted);padding:.2rem .2rem">No pipelines. Click + to create one.</div>'
-    return f"""<div id="tessa-pipelines-section" style="border-top:var(--border-thick) solid var(--border)">
-        <details open><summary style="paddtessa-pl-ne3rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.2rem">&#x26A1; Pipelines
-        <button class="btn-icon" style="margin-left:auto;font-size:.7rem" hx-get="{_u("pipeline_new_form",pid)}" hx-target="#tessa-pl-new" hx-swap="innerHTML" onclick="event.stopPropagation()">+</button></summary>
-        <label class="btn-icon" style="cursor:pointer;font-size:.7rem" title="Import pipeline JSON">&#x2B06;<input type="file" accept=".json" style="display:none" onchange="tessaImportPipeline(this,'{pid}')"></label>
-        <div id="tessa-pl-new"></div><div>{cards}</div></details></div>"""
-
+    
 @router.get("/pipeline_new_form/{pid}", response_class=HTMLResponse)
 async def pipeline_new_form(pid: str): return HTMLResponse(f'<form hx-post="{_u("pipeline_create",pid)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" style="display:flex;gap:.3rem;padding:.3rem"><input type="text" name="name" class="module-select" placeholder="Pipeline name" style="flex:1;font-size:.75rem" required autofocus><button type="submit" class="button" style="margin-top:0;font-size:.72rem">Create</button></form>')
 
@@ -558,8 +589,9 @@ async def pipeline_delete(pid: str, pl_id: str):
 def _bottom_panel_html(pid: str) -> str:
     return f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
                    <div style="display:flex;gap:.3rem;padding:.2rem .4rem;border-bottom:var(--border-thick) solid var(--border);flex-shrink:0">
-                       <button class="cm-qbtn" hx-get="{_u("bottom/log", str(pid))}" hx-target="#tessa-bottom-log" hx-swap="innerHTML" onclick="tessaBottomTab('log')">Job Log</button>
-                       <button class="cm-qbtn" hx-get="{_u("bottom/diff", str(pid))}" hx-target="#tessa-bottom-diff" hx-swap="innerHTML" onclick="tessaBottomTab('diff')">Shadow Diff</button>
+                       <button class="cm-qbtn tessa-bottom-tab-btn active" data-tab="log" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"tessa_bottom_log","pid":pid})}' onclick="tessaBottomTab('log')">Job Log</button>
+                       <button class="cm-qbtn tessa-bottom-tab-btn" data-tab="diff" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"tessa_bottom_diff","pid":pid})}' onclick="tessaBottomTab('diff')">Shadow Diff (Accept/Reject)</button>
+                       <button class="cm-qbtn" style="margin-left:auto;color:var(--text_muted)" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"tessa_clear_jobs","pid":pid})}'>Clear finished</button>
                    </div>
                    <div id="tessa-bottom-log" style="flex:1;overflow-y:auto;padding:.4rem;font-family:var(--font-mono);font-size:.7rem;white-space:pre-wrap">Click Job Log to load recent runs.</div>
                    <div id="tessa-bottom-diff" style="flex:1;overflow-y:auto;padding:.4rem;font-family:var(--font-mono);font-size:.72rem;white-space:pre-wrap;display:none"></div>
@@ -611,7 +643,11 @@ async def root(request: Request):
                           document.getElementById('tessa-pipelines-section').outerHTML = await r.text();
                       }
                       function tessaOpenBottom(){ var b=document.getElementById('tessa-bottom'); if(!b.classList.contains('active')) toggleToolbar('tessa-bottom','bottom','16rem','shrink','\u25B2','\u25BC'); }
-                      function tessaBottomTab(which){ document.getElementById('tessa-bottom-log').style.display = which==='log'?'block':'none'; document.getElementById('tessa-bottom-diff').style.display = which==='diff'?'block':'none'; }
+                      function tessaBottomTab(which){
+                          document.getElementById('tessa-bottom-log').style.display = which==='log'?'block':'none';
+                          document.getElementById('tessa-bottom-diff').style.display = which==='diff'?'block':'none';
+                          document.querySelectorAll('.tessa-bottom-tab-btn').forEach(function(b){b.classList.toggle('active', b.dataset.tab===which);});
+                      }
                       function tessaShowJob(jobId){ tessaOpenBottom(); tessaBottomTab('log'); htmx.ajax('GET','/module/ai_tools/tessa/job_detail/'+jobId,{target:'#tessa-bottom-log',swap:'innerHTML'}); }
                     """
 
@@ -621,7 +657,6 @@ async def root(request: Request):
                      "left":  UI.toolbar(side="left", content=_left_panel(username, doc), size="18rem", overlay=False, start_open=True, resizable=True, nesting_level=2),
                      "right": UI.toolbar(side="right", content=chat, size="22rem", overlay=False, start_open=True, resizable=True, nesting_level=2, id="tessa-right"),
                      "bottom": UI.toolbar(side="bottom", content=_bottom_panel_html(doc["id"]), size="16rem", overlay=False, start_open=False, resizable=True, nesting_level=2, id="tessa-bottom")},
-        # "bottom": UI.toolbar(side="bottom", content=_bottom_panel_html(doc), size="16rem", overlay=False, start_open=False, resizable=True, nesting_level=2, id="tessa-bottom")},
         "content": f"""<div id="tessa-center">{PE.render_shell(doc)}</div><div id="tessa-modal"></div>""",
         "extra_css": CSS + CM.CSS + PE.CSS, "extra_script": BI.PORTAL_EDITOR_JS + CM.SCRIPT + TESSA_SCRIPT + BI.PROMPT_BLOCK_JS})
 
@@ -643,43 +678,41 @@ def _pipe_status_poll_js(pl_id: str, pid: str) -> str:
 def _pipeline_card_html(pid: str, pl: dict) -> str:
     pl_id = pl["id"]
     last_job = AIM.engine.load_job(pl.get("last_job_id", "")) if pl.get("last_job_id") else None
-    live = bool(last_job and last_job.get("status") in ("running", "queued"))
     interrupted = bool(last_job and last_job.get("status") == "interrupted")
     last_job_id = pl.get("last_job_id","")
     details_btn = (f'<button class="btn-icon" style="color:#ff5f5f" hx-get="{_u("job_detail",last_job_id)}" hx-target="#tessa-jobdetail-{pl_id}" hx-swap="innerHTML">Job Details</button>' if last_job_id else '<span style="font-size:.65rem;color:var(--text_muted)">No job run yet</span>')
     resume_row = ""
     if interrupted: resume_row = f'<button class="cm-qbtn" style="width:100%;margin-top:.2rem" hx-post="{_u("pipeline_resume",pid,pl_id)}" hx-target="#tessa-status-{pl_id}" hx-swap="outerHTML">&#x21BB; Resume interrupted run</button>'
     nodes = (last_job["flow"]["nodes"] if last_job else pl.get("flow", {}).get("nodes", []))
-    reg = r'\W+'
-    rows = "".join(f"""<tr data-node="{n["id"]}">
-                           <td style="font-size:.6rem;padding:.1rem .3rem">{_esc(n.get("name") or n["id"])}<br><code style="font-size:.55rem;color:var(--accent)">{re.sub(reg, '_',(n.get("name") or "").strip().lower()).strip('_') or n["id"]}</code></td>
-                           <td style="font-size:.6rem;padding:.1rem .3rem">{_esc(n.get("name") or n["id"])}</td>
-                           <td style="font-size:.6rem;color:var(--text_muted);padding:.1rem .1rem">{_esc(n.get("type",""))}</td>
-                           <td class="tsn-status" style="font-size:.6rem; color:var(--text_muted); padding:.1rem .3rem">{_esc(n.get("status","idle"))}{(' ('+n['ts']+')') if n.get('ts') else ''}</td>
-                           <td class="tsn-preview" style="font-size:.6rem; color:var(--text_muted); padding:.1rem .3rem; max-width:14rem; overflow:hidden; text-overflow:ellipsis;white-space:nowrap">
-                               {_esc(n.get('message') or ' | '.join((n.get('preview') or {}).values()))}
-                           </td>
-                       </tr>""" for n in nodes)
+    rows = "".join(_node_status_row(n) for n in nodes)
     return f"""<div class="glass" style="padding=.2rem .5rem;margin:.2rem .2rem; font-size:.7rem">
                    <div style="display:flex;align-items:center;gap:.3rem">
                        <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" hx-get="{_u("pipeline_editor",pid,pl_id)}" hx-target="#tessa-modal" hx-swap="innerHTML">{_esc(pl.get("name",""))}</span>
                        <button class="btn-icon" style="color:#ff5f5f;font-size:.7rem" hx-post="{_u("pipeline_delete",pid, pl_id)}" hx-target="#tessa-pipelines-section" hx-swap="outerHTML" hx-confirm="Delete pipeline?">&#x2715;</button>
-                       <div style="display:flex;gap:.3rem;margin-top:.2rem">
-                           <button type="button" class="cm-qbtn" onclick="tessaExportPipeline('{pl_id}')">&#x2B07; Export</button>
-                       </div>
+                       <button type="button" class="cm-qbtn" onclick="tessaExportPipeline('{pl_id}')">&#x2B07; Export</button>
                    </div>
                    <input type="text" id="tessa-input-{pl_id}" name="input_value" placeholder="Input for this run" class="module-select" style="width:100%;font-size:.7rem;margin:.2rem 0">
                    {_pipeline_status_block(pid, pl_id, last_job)}
                    {resume_row}
                    <details style="margin-top:.2rem">
                        <summary style="font-size:.6rem;color:var(--text_muted);cursor:pointer">Node status ({len(nodes)})</summary>
-                       <table style="width:100%;border-collapse:collapse;margin-top:.2rem">
-                           {rows}
-                       </table>
+                       <table style="width:100%;border-collapse:collapse;margin-top:.2rem">{rows}</table>
                    </details>
                    {details_btn}
                    <div id="tessa-jobdetail-{pl_id}" style="margin-top:.2rem"></div>
                </div>"""
+
+def _node_status_row(n: dict) -> str:
+    """Extracted so the alias computation (which needs a plain variable, not an inline regex-in-fstring) has somewhere to live cleanly."""
+    slug = _node_slug(n)
+    preview = n.get("message") or " | ".join((n.get("preview") or {}).values())
+    ts_suffix = f" ({n['ts']})" if n.get("ts") else ""
+    return f"""<tr data-node="{n["id"]}">
+                   <td style="font-size:.6rem;padding:.1rem .3rem">{_esc(n.get("name") or n["id"])}<br><code style="font-size:.55rem;color:var(--accent)">{slug}</code></td>
+                   <td style="font-size:.6rem;color:var(--text_muted);padding:.1rem .1rem">{_esc(n.get("type",""))}</td>
+                   <td class="tsn-status" style="font-size:.6rem;color:var(--text_muted);padding:.1rem .3rem">{_esc(n.get("status","idle"))}{ts_suffix}</td>
+                   <td class="tsn-preview" style="font-size:.6rem;color:var(--text_muted);padding:.1rem .3rem;max-width:14rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{_esc(preview)}</td>
+               </tr>"""
 
 def _pipeline_status_block(pid: str, pl_id: str, last_job: dict) -> str:
     live = bool(last_job and last_job.get("status") in ("running", "queued"))
@@ -868,6 +901,24 @@ async def msg_cancel_edit(mid: str, request: Request):
             return HTMLResponse(CM.render_message(m, is_me=is_me, can_delete=True, can_edit=is_me))
     return HTMLResponse("")
 
+@router.post("/msg/retry_send/{mid}")
+async def msg_retry_send(mid: str, request: Request):
+    form = await request.form()
+    user = request.state.user
+    new_content = form.get("content","").strip()
+    for doc in _list_projects(user.username):
+        d = _load(doc["id"])
+        if not d: continue
+        msgs = d.get("conversation",[]); idx = next((i for i,m in enumerate(msgs) if m.get("id")==mid), None)
+        if idx is None: continue
+        if not new_content: new_content = msgs[idx]["content"]  # empty POST body = "resend as-is", the one-click case
+        else: msgs[idx]["content"] = new_content; msgs[idx]["edited"] = True
+        d["conversation"] = msgs[:idx+1]; _save(d); pid = d["id"]
+        remaining = "".join(CM.render_message(m, is_me=(m.get("role")=="user"), can_delete=True, can_edit=(m.get("role")=="user")) for m in d["conversation"] if not m.get("deleted"))
+        asyncio.create_task(_do_stream(user.username, {"content": new_content}, pid, skip_user_append=True))
+        return HTMLResponse(f'<div id="cm-msgs-{pid}" class="cm-msgs" data-pinned="true" hx-swap-oob="outerHTML">{remaining}</div>')
+    return HTMLResponse("")
+
 @router.post("/msg/retry/{mid}")
 async def msg_retry(mid: str, request: Request):
     for doc in _list_projects(request.state.user.username):
@@ -888,24 +939,6 @@ async def msg_retry(mid: str, request: Request):
                                           </form>
                                       </div>
                                   </div>""")
-    return HTMLResponse("")
-
-@router.post("/msg/retry_send/{mid}")
-async def msg_retry_send(mid: str, request: Request):
-    form = await request.form()
-    user = request.state.user
-    new_content = form.get("content","").strip()
-    for doc in _list_projects(user.username):
-        d = _load(doc["id"])
-        if not d: continue
-        msgs = d.get("conversation",[]); idx = next((i for i,m in enumerate(msgs) if m.get("id")==mid), None)
-        if idx is None: continue
-        msgs[idx]["content"] = new_content; msgs[idx]["edited"] = True
-        d["conversation"] = msgs[:idx+1]; _save(d); pid = d["id"]
-        remaining = "".join(CM.render_message(m, is_me=(m.get("role")=="user"), can_delete=True, can_edit=(m.get("role")=="user")) for m in d["conversation"] if not m.get("deleted"))
-        conn = AIM.connections.get_conn(d.get("conn_id","")); model = d.get("model","")
-        if conn and model: asyncio.create_task(_run_chat_task(pid, user.username, conn, _build_messages(d, new_content), model, d.get("model_ctx", 32768)))
-        return HTMLResponse(f'<div id="cm-msgs-{pid}" class="cm-msgs" data-pinned="true" hx-swap-oob="outerHTML">{remaining}</div>')
     return HTMLResponse("")
 
 async def _run_chat_task(pid, username, conn, messages, model, num_ctx, think=False):
@@ -994,38 +1027,70 @@ def _pipelines_panel_html(pid: str) -> str:
     pls = _project_pipelines(pid)
     cards = "".join(_pipeline_card_html(pid, pl) for pl in pls) or '<div style="font-size:.7rem;color:var(--text_muted);padding:.2rem .2rem">No pipelines. Click + to create one.</div>'
     return f"""<div id="tessa-pipelines-section" style="border-top:var(--border-thick) solid var(--border)">
-                   <details open>
-                       <summary style="padding:.3rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.2rem">
-                           &#x26A1; Pipelines
-                           <button class="btn-icon" style="margin-left:auto;font-size:.7rem" hx-get="{_u("pipeline_new_form",pid)}" hx-target="#tessa-pl-new" hx-swap="innerHTML" onclick="event.stopPropagation()">+</button>
-                       </summary>
-                       <label class="btn-icon" style="cursor:pointer;font-size:.7rem" title="Import pipeline JSON">&#x2B06;<input type="file" accept=".json" style="display:none" onchange="tessaImportPipeline(this,'{pid}')"></label>
-                       <div id="tessa-pl-new"></div>
-                       <div>{cards}</div>
-                       {_orphaned_pipelines_html(pid)}
-                   </details>
-               </div>"""
+        <details open>
+            <summary style="padding:.3rem;cursor:pointer;font-size:.7rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);list-style:none;user-select:none;display:flex;align-items:center;gap:.2rem">
+                &#x26A1; Pipelines
+                <button class="btn-icon" style="margin-left:auto;font-size:.7rem" hx-get="{_u("pipeline_new_form",pid)}" hx-target="#tessa-pl-new" hx-swap="innerHTML" onclick="event.stopPropagation()">+</button>
+            </summary>
+            <label class="btn-icon" style="cursor:pointer;font-size:.7rem" title="Import pipeline JSON">&#x2B06;<input type="file" accept=".json" style="display:none" onchange="tessaImportPipeline(this,'{pid}')"></label>
+            <div id="tessa-pl-new"></div>
+            <div style="max-height:32vh;overflow-y:auto">{cards}</div>
+            {_orphaned_pipelines_html(pid)}
+        </details>
+    </div>"""
 
 @router.get("/job_detail/{job_id}")
 async def job_detail(job_id: str):
     job = AIM.engine.load_job(job_id)
     return HTMLResponse(f'<pre style="white-space:pre-wrap;font-size:.7rem;padding:1rem">{_esc(json.dumps(job.get("scratch",{}), indent=2))}</pre>') if job else HTMLResponse("Not found")
 
-@router.get("/shadow_refresh/{scope}", response_class=HTMLResponse)
-async def shadow_refresh(scope: str):
-    shadow = _shadow_store_for(COMMON_ROOT if scope == "wiki" else KG_DIR)
-    return HTMLResponse(BI.shadow_review_html(shadow, _u(f"shadow/{scope}/accept")+"/{path}", _u(f"shadow/{scope}/reject")+"/{path}", _u(f"shadow/{scope}/diff")+"/{path}", list_id=f"shadow-list-{scope}"))
+def _node_slug(n: dict) -> str:
+    """The single source of truth for a node's {reference} name. Pinned at creation, editable, never silently regenerated on rename."""
+    explicit = str(n.get("slug","")).strip().lower()
+    if explicit: return re.sub(r'\W+', '_', explicit).strip('_') or n["id"]
+    return re.sub(r'\W+', '_', (n.get("name") or "").strip().lower()).strip('_') or n["id"]
 
-@router.get("/bottom/log/{pid}", response_class=HTMLResponse)
-async def bottom_log(pid: str):
-    pls = _project_pipelines(pid)
-    jobs = [j for j in (AIM.engine.load_job(p["last_job_id"]) for p in pls if p.get("last_job_id")) if j]
-    jobs.sort(key=lambda j: j.get("created",""), reverse=True)
-    if not jobs: return HTMLResponse('<span style="color:var(--text_muted)">No jobs run yet for this project.</span>')
-    return HTMLResponse("".join(f'<div style="border-bottom:var(--border-thick) solid var(--border);padding:.2rem 0;cursor:pointer" onclick="tessaShowJob(\'{j["id"]}\')">{j["id"]} - {j["status"]} - {j.get("created","")[:19]}</div>' for j in jobs[:20]))
+def _scratch_reference_html() -> str:
+    return f"""<details class="glass" style="padding:.5rem .7rem">
+                   <summary style="cursor:pointer;font-size:.7rem;color:var(--accent)">&#x2139; Scratch value reference - worked example (read this once)</summary>
+                   <div style="font-size:.7rem;color:var(--text_muted);margin-top:.4rem;white-space:pre-wrap">A real 3-node chain, with literal values as they'd actually be typed:
 
-@router.get("/bottom/diff/{pid}", response_class=HTMLResponse)
-async def bottom_diff(pid: str): return HTMLResponse(_shadow_panel_html(pid))
+Node 1 - type: list_files - Reference Name: docs
+  Target Directory: ./data/ai_tools/_knowledge
+  -> produces scratch key  files  =  ["a.txt", "b.txt", "c.txt"]   (a real Python list)
+     also reachable in TEMPLATE fields as {{docs.files}}
+
+Node 2 - type: foreach_call_pipeline - Reference Name: per_doc
+  Items Scratch Key:  files          <- type exactly this. No braces. No quotes. NOT "docs" (docs holds the whole result dict, not the list inside it).
+  Pipeline ID: <a saved sub-pipeline>
+  -> runs the sub-pipeline 3 times, once per string already in that list
+  -> produces scratch key  results  =  [<output for a.txt>, <output for b.txt>, <output for c.txt>]
+     also reachable as {{per_doc.results}}
+
+Node 3 - type: format_each - Reference Name: joined
+  Items Key:  results                <- literal again, not "{{per_doc.results}}"
+  Item Template: {{input}}             <- TEMPLATE field now - inside ONE list item you address its own fields directly ({{input}}, or {{some_field}} if the item is a dict), never {{alias.field}}, since a list item isn't a node
+  -> produces {{joined.text}} = all three outputs concatenated, ready for a file_write node
+
+Direct answers to the specific questions this trips people up on:
+- Is the value a list or a dict? Whatever the upstream node actually produced - check that node's own "produces" line above. You never choose this yourself.
+- Can it be a dict item from a prior node? Yes - if the list contains dicts, format_each's Item Template addresses their keys directly by name.
+- Do I need quotes in Items Scratch Key? No - you're typing a KEY NAME, not a value. No quotes, no braces.
+- Can I type a comma-separated list directly into Items Scratch Key? No - that field can only point at an existing scratch key. To hardcode a fixed list with no real upstream node, use an "expr" node: expr = ["a","b","c"], Result Mapping = {{"value":"manual_list"}}, then Items Scratch Key = manual_list.
+- Can it be escaped? N/A - plain field name, nothing to escape.
+- Do I need to route it back through the input box? No - once it's in a node's output, any downstream node's literal-key field can read it directly; nothing needs to pass back through the chat input.</div>
+               </details>"""
+
+async def _h_clear_jobs(request, payload, imr):
+    pid = payload.get("pid","")
+    for pl in _project_pipelines(pid):
+        jid = pl.get("last_job_id","")
+        job = AIM.engine.load_job(jid) if jid else None
+        if job and job.get("status") in ("done","error","stopped"):
+            AIM.engine.delete_job(jid)
+            pl["last_job_id"] = ""; AIM.engine.save_pipeline(pl)
+    imr.oob(_pipelines_panel_html(pid), "tessa-pipelines-section", swap="outerHTML")
+    return await _h_bottom_log(request, payload, imr)
 
 # --- CSS ---
 
@@ -1036,11 +1101,13 @@ CSS = """
 #tessa-center{display:flex;flex-direction:column;height:100%;width:100%;overflow:hidden;}
 #tessa-pipe-bar{height:100%;display:flex;align-items:stretch;}
 .tessa-pl-modal{width:70rem;max-width:92vw;height:82vh;max-height:82vh;}
+.tessa-bottom-tab-btn.active{color:var(--accent);border-bottom:.15rem solid var(--accent);}
 """
 
 async def _tessa_doc_read(config, ctx):
     doc = _load(config["project_id"])
     return {"text": (doc or {}).get("content", "")}
+
 async def _tessa_doc_write(config, ctx):
     doc = _load(config["project_id"])
     if doc: doc["content"] = ctx.resolve(f"{{{config.get('from_node','')}.text}}"); _save(doc)

@@ -137,6 +137,7 @@ async def _pick_base_image(request, payload, imr):
 
 async def _pick_mask_image(request, payload, imr):
     rel = payload.get("path", "")
+    await _ui_state(request, {"selected_mask": rel})
     imr.oob(f'<input type="hidden" id="img-mask-path" name="mask_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-mask-path", swap="outerHTML")
     imr.oob(f'<span style="font-size:.7rem;color:var(--accent)">&#x2713; Using saved mask: {_esc(rel)}</span>', "img-mask-status", swap="outerHTML")
     return imr
