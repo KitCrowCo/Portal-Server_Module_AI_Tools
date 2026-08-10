@@ -63,7 +63,7 @@ def init_tool(env: dict, prefix: str):
                         "gallery":  {"id":"gallery","order":2,"label":"Gallery","icon":"&#x1F5BC;"},
                         "settings": {"id":"settings","order":3,"label":"Settings","icon":"&#x2699;"}}, "active":"generate"})
     thumb_data_uri = BI.thumb_data_uri
-    
+
     # Tab-switch wrapper: update bottom toolbar on tab focus
     def _wrap_tab_action(base_fn):
         async def _h(req, pay, imr):
@@ -122,7 +122,7 @@ def init_tool(env: dict, prefix: str):
     IM.scripts["image_select_mask"] = [_im_select_mask]
     IM.scripts["image_save_mask"] = [_im_save_mask]
     IM.scripts["image_assemble_gif"] = [_im_assemble_gif]
-    _gallery_tool = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_gallery", nesting_level=2, file_manager=_fm(), full_url_fn=lambda rel: _u("full", rel))
+    _gallery_tool = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_gallery", nesting_level=2, file_manager=_fm(), full_url_fn=lambda rel: _u("full", rel), transfer_targets={"common": "./data/_common"})
     _base_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_base", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_base_image)
     _mask_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_mask", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_mask_image)
     _ref_picker  = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_ref",  nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_reference_image)
@@ -385,7 +385,7 @@ def _generate_form_html(form, prompts, selected_prompt_id, system_status):
                         </label>
                         <label style="font-size:.72rem;color:var(--text_muted);flex:1">
                             Batch
-                            <input type="number" name="batch" value="{form.get("batch", 1)}" min="1" max="20" class="module-select" style="font-size:.8rem">
+                            <input type="number" name="batch" value="{form.get("batch", 1)}" min="1" class="module-select" style="font-size:.8rem">
                         </label>
                     </div>
                     <label style="font-size:.7rem;color:var(--text_muted)">
@@ -429,7 +429,7 @@ async def generate_submit(request: Request):
     if prompt["status"] != "ready": return HTMLResponse('<span style="color:#ff5f5f">Prompt not encoded yet</span>')
     loras = [{"path": f.get(f"lora_{i}", ""), "scale": float(f.get(f"lora_{i}_scale", 1.0) or 1.0)} for i in range(3) if f.get(f"lora_{i}", "")]
     is_sequence = f.get("is_sequence") == "1"
-    base_form = {"width": int(f.get("width", 512)), "height": int(f.get("height", 512)), "steps": int(f.get("steps", 4)), "cfg": float(f.get("cfg", 1.0)), "shift": float(f.get("shift", 1.0)), "seed": int(f.get("seed", -1)), "batch": max(1, min(int(f.get("batch", 1)), 20 if not is_sequence else 1)), "output_prefix": f.get("output_prefix", "img").strip() or "img", "loras": loras, "offload_mode": f.get("offload_mode", "none")}
+    base_form = {"width": int(f.get("width", 512)), "height": int(f.get("height", 512)), "steps": int(f.get("steps", 4)), "cfg": float(f.get("cfg", 1.0)), "shift": float(f.get("shift", 1.0)), "seed": int(f.get("seed", -1)), "batch": (max(1, int(f.get("batch", 1))) if not is_sequence else 1), "output_prefix": f.get("output_prefix", "img").strip() or "img", "loras": loras, "offload_mode": f.get("offload_mode", "none")}
     if is_sequence:
         base_form["num_frames"] = max(2, min(int(f.get("num_frames", 8) or 8), 120))
         base_form["frame_strength"] = float(f.get("frame_strength", 0.35) or 0.35)
