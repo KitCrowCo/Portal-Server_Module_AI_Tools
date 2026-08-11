@@ -50,6 +50,7 @@ def init_tool(env: dict, prefix: str):
                                         "paste":{"id":"paste","order":1,"label":"Paste Text","icon":"&#x1F4DD;"},
                                         "docs":{"id":"docs","order":2,"label":"Documents","icon":"&#x1F4C4;"},
                                         "graph":{"id":"graph","order":3,"label":"Graph","icon":"&#x1F578;"}}, "active":"query"})
+    IM.scripts["kimi_graph_limit"] = [_h_graph_limit]
     print("[kimi] ready")
 
 def _ensure_sync_task():
@@ -166,9 +167,18 @@ async def _panel_graph(request):
     s = await _kg_state(request)
     conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
     if not conn: return '<div style="padding:1rem;color:var(--text_muted)">No connection selected.</div>'
-    dot = await AIM.connections.lightrag_graph_dot(conn)
-    if not dot: return '<div style="padding:1rem;color:var(--text_muted)">No graph data available (or this LightRAG version does not expose a listing endpoint at the paths this dashboard tries - check /docs on your instance).</div>'
-    return f'<div style="padding:1rem;height:100%;overflow:auto;box-sizing:border-box">{BI.render_graphviz_block(dot, {})}</div>'
+    limit = int((await ENV["get_state"](request, scope="user", namespace="knowledge", key="graph_limit")) or 1000)
+    try: dot = await AIM.connections.lightrag_graph_dot(conn, limit=limit)
+    except Exception as e: return f'<div style="padding:1rem;color:#ff5f5f">Graph fetch failed: {_esc(str(e))}</div>'
+    body = dot and BI.render_graphviz_block(dot, {}) or '<div style="padding:1rem;color:var(--text_muted)">No graph data available.</div>'
+    return f"""<div style="padding:.5rem 1rem;display:flex;align-items:center;gap:.4rem;border-bottom:var(--border-thick) solid var(--border)">
+                   <label style="font-size:.75rem;color:var(--text_muted)">Max nodes<input type="number" name="value" value="{limit}" min="1" class="module-select" style="width:6rem" hx-post="/im/in" hx-vals='{{"type":"kimi_graph_limit"}}' hx-trigger="change" hx-include="this" hx-target="#kimi-panel" hx-swap="innerHTML"></label>
+               </div>
+               <div style="padding:1rem;height:calc(100% - 3rem);overflow:auto;box-sizing:border-box">{body}</div>"""
+
+async def _h_graph_limit(request, payload, imr):
+    await ENV["set_state"](request, int(payload.get("value", 1000) or 1000), scope="user", namespace="knowledge", key="graph_limit")
+    return imr.raw(f'<div id="kimi-panel" style="height:100%;overflow:hidden">{await _panel_graph(request)}</div>')
 
 async def _render_panel(request, state):
     active = state.get("active", "query")

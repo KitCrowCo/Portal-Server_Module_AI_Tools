@@ -272,7 +272,7 @@ async def _h_shadow_action(request, payload, imr):
     imr.oob(BI.shadow_review_html(shadow, "tessa_shadow_action", {"scope": scope}, list_id=f"shadow-list-{scope}"), f"shadow-list-{scope}", swap="innerHTML")
     return imr
 
-def _left_bottom_html(doc): return _kg_html(doc) + PB.panel_html(doc["id"], include_modal_slot=False)
+def _left_bottom_html(doc): return _kg_html(doc) #+ PB.panel_html(doc["id"], include_modal_slot=False)
 
 def _left_panel(username, doc):
     pid = doc["id"]
@@ -315,7 +315,7 @@ async def root(request: Request):
                      "right": UI.toolbar(side="right", content=chat, size="22rem", overlay=False, start_open=True, resizable=True, nesting_level=2, id="tessa-right"),
                      "bottom": UI.toolbar(side="bottom", content=_bottom_bar_html(doc), size="16rem", overlay=False, start_open=False, resizable=True, id="tessa-bottom", nesting_level=2)},
         "content": f"""<div id="tessa-center">{PE.render_shell(doc)}</div>{PB.modal_slot_html(doc["id"])}""",
-        "extra_css": CSS + CM.CSS + PE.CSS, "extra_script": BI.PORTAL_EDITOR_JS + CM.SCRIPT + AIM.PipelineBuilderUI.SCRIPT + BI.PROMPT_BLOCK_JS})
+        "extra_css": CSS + CM.CSS + PE.CSS, "extra_script": BI.PORTAL_EDITOR_JS + CM.SCRIPT + BI.PROMPT_BLOCK_JS})
 
 @router.post("/new", response_class=HTMLResponse)
 async def new_project(request: Request):
