@@ -122,7 +122,7 @@ def init_tool(env: dict, prefix: str):
     IM.scripts["image_select_mask"] = [_im_select_mask]
     IM.scripts["image_save_mask"] = [_im_save_mask]
     IM.scripts["image_assemble_gif"] = [_im_assemble_gif]
-    _gallery_tool = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_gallery", nesting_level=2, file_manager=_fm(), full_url_fn=lambda rel: _u("full", rel), transfer_targets={"common": "./data/_common"})
+    _gallery_tool = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_gallery", nesting_level=2, file_manager=_fm(), full_url_fn=lambda rel: _u("full", rel), transfer_targets={"common": "./data/_common", "knowledge": "./data/ai_tools/_knowledge"})
     _base_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_base", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_base_image)
     _mask_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_mask", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_mask_image)
     _ref_picker  = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_ref",  nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_reference_image)

@@ -156,6 +156,7 @@ def init_tool(env: dict, prefix: str):
     IM.scripts.update({"tessa_doc_apply_ai": [_h_doc_apply_ai], "tessa_doc_conn": [_h_doc_conn], "tessa_doc_model": [_h_doc_model], "tessa_doc_ctx": [_h_doc_ctx], "tessa_files_toggle": [_h_files_toggle]})
     IM.scripts["tessa_shadow_action"] = [_h_shadow_action]
     IM.scripts["tessa_git_action"] = [_h_git_action]
+    IM.scripts.update({"tessa_bottom_shadow_wiki":[_h_bottom_shadow_wiki], "tessa_bottom_shadow_kg":[_h_bottom_shadow_kg], "tessa_bottom_git":[_h_bottom_git], "tessa_bottom_git_link":[_h_bottom_git_link], "tessa_bottom_git_create_ws":[_h_bottom_git_create_ws]})
     print("[tessa] ready")
 
 async def _handle_submit(request, payload, imr):
@@ -272,7 +273,7 @@ async def _h_shadow_action(request, payload, imr):
     imr.oob(BI.shadow_review_html(shadow, "tessa_shadow_action", {"scope": scope}, list_id=f"shadow-list-{scope}"), f"shadow-list-{scope}", swap="innerHTML")
     return imr
 
-def _left_bottom_html(doc): return _kg_html(doc) #+ PB.panel_html(doc["id"], include_modal_slot=False)
+def _left_bottom_html(doc): return _kg_html(doc) + PB.panel_html(doc["id"], include_modal_slot=False)
 
 def _left_panel(username, doc):
     pid = doc["id"]
@@ -533,55 +534,53 @@ async def settings_save(request: Request):
 
 def _bottom_bar_html(doc):
     pid = doc["id"]
+    vals = lambda action: json.dumps({"type": f"tessa_bottom_{action}", "lvl": 2, "pid": pid})
     return f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
                    <div style="display:flex;gap:.3rem;padding:.3rem .5rem;border-bottom:var(--border-thick) solid var(--border);flex-shrink:0">
-                       <button class="cm-qbtn" hx-get="{_u('bottom/shadow_wiki')}" hx-target="#tessa-bottom-content" hx-swap="innerHTML">Shadow (Wiki)</button>
-                       <button class="cm-qbtn" hx-get="{_u('bottom/shadow_kg')}" hx-target="#tessa-bottom-content" hx-swap="innerHTML">Shadow (Knowledge)</button>
-                       <button class="cm-qbtn" hx-get="{_u('bottom/git',pid)}" hx-target="#tessa-bottom-content" hx-swap="innerHTML">Git Diff</button>
+                       <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals("shadow_wiki")}'>Shadow (Wiki)</button>
+                       <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals("shadow_kg")}'>Shadow (Knowledge)</button>
+                       <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals("git")}'>Git Diff</button>
                    </div>
                    <div id="tessa-bottom-content" style="flex:1;overflow-y:auto;padding:.4rem">{_shadow_rows_html()}</div>
                </div>"""
 
-@router.get("/bottom/shadow_wiki", response_class=HTMLResponse)
-async def bottom_shadow_wiki(): return HTMLResponse(f'<div style="font-size:.6rem;color:var(--text_muted);text-transform:uppercase;padding:.2rem 0">Wiki</div><div id="shadow-list-wiki">{BI.shadow_review_html(_shadow_store_for(COMMON_ROOT), "tessa_shadow_action", {"scope":"wiki"}, list_id="shadow-list-wiki")}</div>')
+async def _h_bottom_shadow_wiki(request, payload, imr):
+    return imr.oob(f'<div style="font-size:.6rem;color:var(--text_muted);text-transform:uppercase;padding:.2rem 0">Wiki</div><div id="shadow-list-wiki">{BI.shadow_review_html(_shadow_store_for(COMMON_ROOT), "tessa_shadow_action", {"scope":"wiki"}, list_id="shadow-list-wiki")}</div>', "tessa-bottom-content")
 
-@router.get("/bottom/shadow_kg", response_class=HTMLResponse)
-async def bottom_shadow_kg(): return HTMLResponse(f'<div style="font-size:.6rem;color:var(--text_muted);text-transform:uppercase;padding:.2rem 0">Knowledge</div><div id="shadow-list-kg">{BI.shadow_review_html(_shadow_store_for(KG_DIR), "tessa_shadow_action", {"scope":"kg"}, list_id="shadow-list-kg")}</div>')
+async def _h_bottom_shadow_kg(request, payload, imr):
+    return imr.oob(f'<div style="font-size:.6rem;color:var(--text_muted);text-transform:uppercase;padding:.2rem 0">Knowledge</div><div id="shadow-list-kg">{BI.shadow_review_html(_shadow_store_for(KG_DIR), "tessa_shadow_action", {"scope":"kg"}, list_id="shadow-list-kg")}</div>', "tessa-bottom-content")
 
-@router.get("/bottom/git/{pid}", response_class=HTMLResponse)
-async def bottom_git(pid: str, request: Request):
+async def _h_bottom_git(request, payload, imr):
+    pid = payload.get("pid","")
     doc = _load(pid)
-    if not doc: return HTMLResponse("Project not found")
     gm = ENV["tools"]["git_manager"]
+    if not doc: return imr.oob("Project not found", "tessa-bottom-content")
     if not doc.get("git_project_id"):
         opts = "".join(f'<option value="{p["_id"]}">{p["label"]}</option>' for p in gm.list_projects())
-        return HTMLResponse(f"""<div style="font-size:.8rem">
-                                     <div style="margin-bottom:.4rem">Link this project to a Git Manager project to review AI-made code changes here.</div>
-                                     <form hx-post="{_u('bottom/git_link',pid)}" hx-target="#tessa-bottom-content" style="display:flex;gap:.4rem">
-                                         <select name="git_project_id" class="module-select">{opts or '<option value="">No git projects - add one in Git Manager</option>'}</select>
-                                         <button type="submit" class="button">Link</button>
-                                     </form>
-                                 </div>""")
+        return imr.oob(f"""<div style="font-size:.8rem"><div style="margin-bottom:.4rem">Link this project to a Git Manager project to review AI-made code changes here.</div>
+                                <form hx-post="/im/in" hx-target="body" hx-swap="none" style="display:flex;gap:.4rem">
+                                    <input type="hidden" name="type" value="tessa_bottom_git_link"><input type="hidden" name="lvl" value="2"><input type="hidden" name="pid" value="{pid}">
+                                    <select name="git_project_id" class="module-select">{opts or '<option value="">No git projects</option>'}</select>
+                                    <button type="submit" class="button">Link</button>
+                                </form></div>""", "tessa-bottom-content")
     if not doc.get("git_workspace_id"):
-        return HTMLResponse(f"""<div style="font-size:.8rem"><div style="margin-bottom:.4rem">Linked to git project. No AI workspace branch yet.</div>
-                                     <button class="button" hx-post="{_u('bottom/git_create_ws',pid)}" hx-target="#tessa-bottom-content">Create AI Workspace</button></div>""")
+        return imr.oob(f"""<div style="font-size:.8rem"><div style="margin-bottom:.4rem">Linked. No AI workspace branch yet.</div>
+                                <button class="button" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"tessa_bottom_git_create_ws","lvl":2,"pid":pid})}'>Create AI Workspace</button></div>""", "tessa-bottom-content")
     backend = gm.GitWorkspaceDiffBackend(doc["git_workspace_id"])
-    return HTMLResponse(f'<div id="shadow-list-git">{BI.shadow_review_html(backend, "tessa_git_action", {"pid":pid}, list_id="shadow-list-git")}</div>')
+    return imr.oob(f'<div id="shadow-list-git">{BI.shadow_review_html(backend, "tessa_git_action", {"pid":pid}, list_id="shadow-list-git")}</div>', "tessa-bottom-content")
 
-@router.post("/bottom/git_link/{pid}", response_class=HTMLResponse)
-async def bottom_git_link(pid: str, request: Request):
-    f = await request.form(); doc = _load(pid)
-    if doc: doc["git_project_id"] = f.get("git_project_id",""); _save(doc)
-    return await bottom_git(pid, request)
+async def _h_bottom_git_link(request, payload, imr):
+    doc = _load(payload.get("pid",""))
+    if doc: doc["git_project_id"] = payload.get("git_project_id",""); _save(doc)
+    return await _h_bottom_git(request, payload, imr)
 
-@router.post("/bottom/git_create_ws/{pid}", response_class=HTMLResponse)
-async def bottom_git_create_ws(pid: str, request: Request):
-    doc = _load(pid)
-    if not doc or not doc.get("git_project_id"): return HTMLResponse("No git project linked")
+async def _h_bottom_git_create_ws(request, payload, imr):
+    doc = _load(payload.get("pid",""))
+    if not doc or not doc.get("git_project_id"): return imr.oob("No git project linked", "tessa-bottom-content")
     gm = ENV["tools"]["git_manager"]
-    ws, msg = gm.create_workspace(doc["git_project_id"], f"tessa-{pid}")
+    ws, msg = gm.create_workspace(doc["git_project_id"], f"tessa-{doc['id']}")
     if ws: doc["git_workspace_id"] = ws["id"]; _save(doc)
-    return await bottom_git(pid, request)
+    return await _h_bottom_git(request, payload, imr)
 
 async def _h_git_action(request, payload, imr):
     pid, action, path = payload.get("pid",""), payload.get("action",""), payload.get("path","")

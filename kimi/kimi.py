@@ -51,6 +51,10 @@ def init_tool(env: dict, prefix: str):
                                         "docs":{"id":"docs","order":2,"label":"Documents","icon":"&#x1F4C4;"},
                                         "graph":{"id":"graph","order":3,"label":"Graph","icon":"&#x1F578;"}}, "active":"query"})
     IM.scripts["kimi_graph_limit"] = [_h_graph_limit]
+    IM.scripts.update({"kimi_conn_select": [_h_conn_select], "kimi_health": [_h_health], "kimi_select_file": [_h_select_file],
+                    "kimi_ingest_selected": [_h_ingest_selected], "kimi_insert_text": [_h_insert_text], "kimi_query": [_h_query],
+                    "kimi_clear_all": [_h_clear_all], "kimi_doc_delete": [_h_doc_delete], "kimi_upload_modal": [_h_upload_modal],
+                    "kimi_upload_kg": [lambda r,p,i: _h_upload(r,p,i,"kg")], "kimi_upload_common": [lambda r,p,i: _h_upload(r,p,i,"common")]})
     print("[kimi] ready")
 
 def _ensure_sync_task():
@@ -77,20 +81,20 @@ def _conn_select_html(active_id):
     if not conns: return '<div style="font-size:.75rem;color:var(--text_muted)">No LightRAG connections - add one in AI Tools &rarr; Settings &rarr; Connections.</div>'
     active = AIM.connections.get_conn(active_id, conn_type="lightrag") or conns[0]
     notes = active.get("values", {}).get("domain_notes", "")
-    sel = UI.select("conn_id", [(c["_id"], c.get("display_name", c["_id"])) for c in conns], selected=active["_id"], htmx={"post": _u("conn/select"), "trigger": "change", "target": "#kg-health", "include": "this"})
+    sel = UI.select("conn_id", [(c["_id"], c.get("display_name", c["_id"])) for c in conns], selected=active["_id"], htmx={"post":"/im/in","trigger":"change","target":"#kg-health", "vals": json.dumps({"type": "kimi_conn_select", "branch": "kimi", "lvl": 2}), "include":"this"})
     notes_html = f'<div style="font-size:.68rem;color:var(--text_muted);margin-top:.2rem">{_esc(notes)}</div>' if notes else ""
     return sel + notes_html
 
 def _source_tree_html(fm, selected, prefix):
     if not fm.root.exists(): return '<div style="color:var(--text_muted);font-size:.75rem;padding:.3rem">No files yet.</div>'
-    return UI.tree(items=fm.root, mode="file", selectable=True, selected=set(selected), post_url=_u(f"select/{prefix}"), target=f"#kg-tree-{prefix}", swap="outerHTML")
+    return UI.tree(items=fm.root, mode="file", selectable=True, selected=set(selected), post_url="/im/in", target=f"#kg-tree-{prefix}", swap="outerHTML", extra_vals={"type":"kimi_select_file","branch":"kimi","lvl":2,"src":prefix})
 
 async def _left_panel(request):
     s = await _kg_state(request)
     return f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
                     <div style="padding:.5rem;border-bottom:var(--border-thick) solid var(--border)">
                         {UI.field("Knowledge Group", _conn_select_html(s["conn_id"]))}
-                        <div id="kg-health" style="font-size:.7rem;color:var(--text_muted)" hx-get="{_u('health')}" hx-trigger="load" hx-swap="innerHTML">checking...</div>
+                        <div id="kg-health" style="font-size:.7rem;color:var(--text_muted)" hx-post="/im/in" hx-vals='{{"type":"kimi_health","branch":"kimi","lvl":2}}' hx-trigger="load" hx-trigger="load" hx-swap="innerHTML">checking...</div>
                     </div>
                     <div style="flex:1;overflow-y:auto">
                         <details open style="border-bottom:var(--border-thick) solid var(--border)">
@@ -115,15 +119,22 @@ async def _left_panel(request):
 
 async def _panel_query(request):
     s = await _kg_state(request)
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    schema = AIM.connections.lightrag_query_options_schema(conn) if conn else {}
+    opt_fields = "".join(
+        f'<label style="display:flex;align-items:center;gap:.3rem;font-size:.72rem" title="{_esc(spec.get("hint",""))}"><input type="checkbox" name="opt_{k}" value="1"> {_esc(spec.get("label",k))}</label>'
+        if spec.get("type") == "boolean" else
+        f'<label style="font-size:.72rem;color:var(--text_muted)">{_esc(spec.get("label",k))}<input type="number" name="opt_{k}" class="module-select" style="width:5rem"></label>'
+        for k, spec in schema.items())
     multi_opts = "".join(f'<label style="display:flex;align-items:center;gap:.3rem;font-size:.76rem"><input type="checkbox" name="conn_ids" value="{c["_id"]}" {"checked" if c["_id"]==s["conn_id"] else ""}> {_esc(c.get("display_name",c["_id"]))}</label>' for c in AIM.connections.list_conns(conn_type="lightrag"))
     return f"""<div style="padding:1rem;height:100%;overflow-y:auto;box-sizing:border-box">
                     <form hx-post="{_u('query')}" hx-target="#kg-query-result" style="display:flex;flex-direction:column;gap:.5rem;margin-bottom:.8rem">
-                        <div style="display:flex;gap:.4rem">
-                            <input type="text" name="q" placeholder="Ask the knowledge base..." class="module-select" style="flex:1;margin:0">
+                        <div style="display:flex;gap:.4rem;flex-wrap:wrap">
+                            <input type="text" name="q" placeholder="Ask the knowledge base..." class="module-select" style="flex:1;margin:0;min-width:14rem">
                             {UI.select("mode", [(m,m) for m in ("hybrid","local","global","naive","mix")], selected="hybrid", style="width:8rem;margin:0")}
-                            <input type="number" name="top_k" placeholder="top_k" class="module-select" style="width:6rem;margin:0" title="Optional - only some LightRAG versions support this">
                             <button class="ui-btn">Ask</button>
                         </div>
+                        <div style="display:flex;gap:.6rem;flex-wrap:wrap;align-items:center">{opt_fields}</div>
                         <details><summary style="cursor:pointer;font-size:.74rem;color:var(--text_muted);list-style:none">Compare across groups</summary>
                             <div style="display:flex;flex-direction:column;gap:.2rem;margin-top:.4rem">{multi_opts}</div>
                         </details>
@@ -152,16 +163,27 @@ async def _panel_docs(request):
             rows = r if isinstance(r, list) else (r.get("documents") or r.get("statuses") or [])
             if isinstance(rows, dict): rows = [v for vs in rows.values() for v in (vs if isinstance(vs, list) else [vs])]
             if rows and isinstance(rows[0], dict):
+                doc_id_field = next((f for f in ("id","doc_id","document_id") if f in rows[0]), None)
                 headers = list(rows[0].keys())
                 priority = [h for h in headers if any(k in h.lower() for k in ("file","path","name","source"))]
                 headers = priority + [h for h in headers if h not in priority]
-                body = UI.table(headers, [[str(row.get(h,""))[:80] for h in headers] for row in rows])
+                th = "".join(f'<th style="padding:.32rem .6rem;border-bottom:var(--border-thick) solid var(--border);text-align:left;">{_esc(h)}</th>' for h in headers) + ("<th></th>" if doc_id_field else "")
+                table_rows = "".join("<tr>" + "".join(f'<td style="padding:.28rem .6rem;border-bottom:var(--border-thick) solid var(--border);">{_esc(str(row.get(h,""))[:80])}</td>' for h in headers) + (f'<td style="padding:.28rem .6rem;border-bottom:var(--border-thick) solid var(--border)"><button class="cm-qbtn" style="color:#ff5f5f" hx-post="{_u("doc_delete")}" hx-vals=\'{{"doc_id":"{_esc(str(row.get(doc_id_field,"")))}"}}\' hx-target="#kimi-panel" hx-confirm="Delete this document from the knowledge base?">&#x2715;</button></td>' if doc_id_field else "") + "</tr>" for row in rows)
+                body = f'<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.8rem"><thead><tr>{th}</tr></thead><tbody>{table_rows}</tbody></table></div>'
             else:
                 body = f'<pre style="font-size:.72rem;white-space:pre-wrap">{_esc(json.dumps(r, indent=2))}</pre>'
     return f"""<div style="padding:1rem;height:100%;overflow-y:auto;box-sizing:border-box">
                    {body}
                    <button class="ui-btn" style="margin-top:1rem;color:#ff5f5f" hx-post="{_u('clear_all')}" hx-target="#kimi-panel" hx-confirm="Delete the ENTIRE knowledge graph for this group? This cannot be undone.">Clear Entire Knowledge Group</button>
                </div>"""
+
+@router.post("/doc_delete", response_class=HTMLResponse)
+async def doc_delete(request: Request):
+    form = await request.form()
+    s = await _kg_state(request)
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    if conn: await AIM.connections.lightrag_delete_document(conn, form.get("doc_id",""))
+    return await _panel_docs(request)
 
 async def _panel_graph(request):
     s = await _kg_state(request)
@@ -205,42 +227,35 @@ async def root(request: Request):
                      "left": UI.toolbar(side="left", content=left, size="18rem", overlay=False, start_open=True, resizable=True, nesting_level=2)},
         "content": f'<div id="kimi-panel" style="height:100%;overflow:hidden">{panel_html}</div>'})
 
-# --- Connection / health ---
+async def _h_conn_select(request, payload, imr):
+    s = await _kg_state(request); s["conn_id"] = payload.get("conn_id",""); await _kg_state(request, s)
+    return imr.raw(await _health_html(request))
 
-@router.post("/conn/select", response_class=HTMLResponse)
-async def conn_select(request: Request, conn_id: str = Form("")):
-    s = await _kg_state(request); s["conn_id"] = conn_id; await _kg_state(request, s)
-    return await health(request)
-
-@router.get("/health", response_class=HTMLResponse)
-async def health(request: Request):
+async def _health_html(request):
     s = await _kg_state(request)
     conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
-    if not conn: return HTMLResponse('<span style="color:var(--text_muted)">No connection selected.</span>')
+    if not conn: return '<span style="color:var(--text_muted)">No connection selected.</span>'
     h = await AIM.connections.lightrag_health(conn)
-    return HTMLResponse(f'<span style="color:{"#00ffa2" if h.get("ok") else "#ff5f5f"}">{"&#x25CF; online" if h.get("ok") else "&#x25CF; " + _esc(str(h.get("detail","unreachable")))}</span>')
+    return f'<span style="color:{"#00ffa2" if h.get("ok") else "#ff5f5f"}">{"&#x25CF; online" if h.get("ok") else "&#x25CF; " + _esc(str(h.get("detail","unreachable")))}</span>'
 
-# --- Source selection / ingestion ---
+async def _h_health(request, payload, imr): return imr.raw(await _health_html(request))
 
-@router.post("/select/{src}", response_class=HTMLResponse)
-async def select_file(src: str, request: Request):
-    form = await request.form(); path, is_dir = form.get("path",""), form.get("is_dir","false")=="true"
+async def _h_select_file(request, payload, imr):
+    path, is_dir, src = payload.get("path",""), str(payload.get("is_dir","false"))=="true", payload.get("src","kg")
     fm = FM_KG if src == "kg" else FM_COMMON
     s = await _kg_state(request); key = f"selected_{src}"; sel = set(s.get(key, []))
     if is_dir:
         full = fm.resolve(path)
         children = {str(f.relative_to(fm.root)).replace("\\","/") for f in full.rglob("*") if f.is_file()} if full.is_dir() else set()
         sel = sel - children if children and children.issubset(sel) else sel | children
-    else:
-        sel.discard(path) if path in sel else sel.add(path)
+    else: sel.discard(path) if path in sel else sel.add(path)
     s[key] = list(sel); await _kg_state(request, s)
-    return HTMLResponse(_source_tree_html(fm, sel, src))
+    return imr.oob(_source_tree_html(fm, sel, src), f"kg-tree-{src}", swap="outerHTML")
 
-@router.post("/ingest_selected", response_class=HTMLResponse)
-async def ingest_selected(request: Request):
+async def _h_ingest_selected(request, payload, imr):
     s = await _kg_state(request)
     conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
-    if not conn: return HTMLResponse('<div style="color:#ff5f5f">No knowledge group selected.</div>')
+    if not conn: return imr.oob('<div style="color:#ff5f5f">No knowledge group selected.</div>', "kg-ingest-log")
     preserve = cfg.get_group("general").load().get("preserve_structure", True)
     log = []
     for src, fm in (("kg", FM_KG), ("common", FM_COMMON)):
@@ -249,53 +264,64 @@ async def ingest_selected(request: Request):
                 r = await AIM.connections.lightrag_insert_file(conn, rel if preserve else Path(rel).name, fm.resolve(rel).read_bytes())
                 log.append(f"{rel}: {'ok' if 'error' not in r else r['error'][:80]}")
             except Exception as e: log.append(f"{rel}: error {e}")
-    return HTMLResponse("".join(f'<div>{_esc(l)}</div>' for l in log) or '<div style="color:var(--text_muted)">Nothing selected.</div>')
+    return imr.oob("".join(f'<div>{_esc(l)}</div>' for l in log) or '<div style="color:var(--text_muted)">Nothing selected.</div>', "kg-ingest-log")
 
-@router.post("/insert_text", response_class=HTMLResponse)
-async def insert_text(request: Request, text: str = Form(...), source: str = Form("")):
+async def _h_insert_text(request, payload, imr):
     s = await _kg_state(request)
     conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
-    if not conn: return HTMLResponse('<div style="color:#ff5f5f">No knowledge group selected.</div>')
-    r = await AIM.connections.lightrag_insert_text(conn, text, source)
-    return HTMLResponse(f'<div style="color:{"#ff5f5f" if "error" in r else "var(--accent)"}">{_esc(str(r.get("error") or "Inserted"))}</div>')
+    if not conn: return imr.oob('<div style="color:#ff5f5f">No knowledge group selected.</div>', "kg-ingest-log2")
+    r = await AIM.connections.lightrag_insert_text(conn, payload.get("text",""), payload.get("source",""))
+    return imr.oob(f'<div style="color:{"#ff5f5f" if "error" in r else "var(--accent)"}">{_esc(str(r.get("error") or "Inserted"))}</div>', "kg-ingest-log2")
 
-# --- Query ---
-
-async def _query_one(conn_id, q, mode, top_k):
+async def _query_one(conn_id, q, mode, extra):
     conn = AIM.connections.get_conn(conn_id, conn_type="lightrag")
     name = conn.get("display_name", conn_id) if conn else conn_id
     if not conn: return name, "connection not found"
-    r = await AIM.connections.lightrag_query_cached(conn, q, mode, top_k=top_k)
+    r = await AIM.connections.lightrag_query_cached(conn, q, mode, **(extra or {}))
     return name, r.get("response") or r.get("error") or json.dumps(r)
 
-@router.post("/query", response_class=HTMLResponse)
-async def query(request: Request, q: str = Form(...), mode: str = Form("hybrid"), top_k: int = Form(None), conn_ids: List[str] = Form(default=[])):
+async def _h_query(request, payload, imr):
+    q, mode = payload.get("q","").strip(), payload.get("mode","hybrid")
+    if not q: return imr.oob('<div style="color:#ff5f5f">Enter a question.</div>', "kg-query-result")
+    extra = {}
+    for k, v in payload.items():
+        if not k.startswith("opt_"): continue
+        extra[k[4:]] = True if v in ("1","true","on") else (int(v) if str(v).strip().lstrip("-").isdigit() else v)
+    conn_ids = payload.get("conn_ids", [])
+    if isinstance(conn_ids, str): conn_ids = [conn_ids] if conn_ids else []
     targets = [c for c in (conn_ids or [(await _kg_state(request))["conn_id"]]) if c]
-    if not targets: return HTMLResponse('<div style="color:#ff5f5f">No knowledge group selected.</div>')
-    results = await asyncio.gather(*[_query_one(c, q, mode, top_k) for c in targets])
-    if len(results) == 1: return HTMLResponse(_esc(results[0][1]))
-    return HTMLResponse("".join(f'<div class="glass" style="padding:.6rem"><div style="font-weight:600;font-size:.8rem;margin-bottom:.3rem">{_esc(name)}</div>{_esc(text)}</div>' for name, text in results))
+    if not targets: return imr.oob('<div style="color:#ff5f5f">No knowledge group selected.</div>', "kg-query-result")
+    results = await asyncio.gather(*[_query_one(c, q, mode, extra) for c in targets])
+    html = _esc(results[0][1]) if len(results)==1 else "".join(f'<div class="glass" style="padding:.6rem"><div style="font-weight:600;font-size:.8rem;margin-bottom:.3rem">{_esc(name)}</div>{_esc(text)}</div>' for name, text in results)
+    return imr.oob(html, "kg-query-result")
 
-@router.post("/clear_all", response_class=HTMLResponse)
-async def clear_all(request: Request):
+async def _h_clear_all(request, payload, imr):
     s = await _kg_state(request)
     conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
     if conn: await AIM.connections.lightrag_clear_all(conn)
-    return await _panel_docs(request)
+    return imr.raw(f'<div id="kimi-panel" style="height:100%;overflow:hidden">{await _panel_docs(request)}</div>')
 
-# --- Upload ---
+async def _h_doc_delete(request, payload, imr):
+    s = await _kg_state(request)
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    if conn: await AIM.connections.lightrag_delete_document(conn, payload.get("doc_id",""))
+    return imr.raw(f'<div id="kimi-panel" style="height:100%;overflow:hidden">{await _panel_docs(request)}</div>')
 
-@router.get("/upload_modal/{src}", response_class=HTMLResponse)
-async def upload_modal(src: str, request: Request):
+async def _h_upload_modal(request, payload, imr):
+    src = payload.get("src","kg")
     fm = FM_KG if src == "kg" else FM_COMMON
-    return HTMLResponse(fm.new_item_modal_html(f"kg-upload-{src}", _u(f"upload/{src}"), target_id=f"kg-tree-{src}", swap="outerHTML"))
+    return imr.oob(fm.new_item_modal_html(f"kg-upload-{src}", target_id=f"kg-tree-{src}", swap="outerHTML", intent_type=f"kimi_upload_{src}", branch="kimi", lvl=2), "kg-modal")
 
-@router.post("/upload/{src}", response_class=HTMLResponse)
-async def upload(src: str, request: Request, parent: str = Form(""), kind: str = Form("file"), name: str = Form(""), upload: List[UploadFile] = File(default=[]), rel_paths: str = Form("[]")):
+async def _h_upload(request, payload, imr, src):
     fm = FM_KG if src == "kg" else FM_COMMON
     s = await _kg_state(request)
     conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
     preserve = cfg.get_group("general").load().get("preserve_structure", True)
+    parent, kind, name = payload.get("parent",""), payload.get("kind","file"), payload.get("name","")
+    upload_raw = payload.get("upload")
+    files = upload_raw if isinstance(upload_raw, list) else ([upload_raw] if upload_raw else [])
+    try: rel_paths = json.loads(payload.get("rel_paths","[]") or "[]")
+    except Exception: rel_paths = []
 
     async def _auto_ingest(saved_rels):
         if not conn: return
@@ -303,16 +329,15 @@ async def upload(src: str, request: Request, parent: str = Form(""), kind: str =
             try: await AIM.connections.lightrag_insert_file(conn, rel if preserve else Path(rel).name, fm.resolve(rel).read_bytes())
             except Exception: pass
 
-    if kind in ("upload", "upload_folder"):
-        await fm.save_uploads(parent, upload, json.loads(rel_paths or "[]"), on_complete=_auto_ingest)
-    elif kind == "folder":
-        if name.strip(): fm.safe_join(parent, name.strip()).mkdir(parents=True, exist_ok=True)
-    else:
-        if name.strip():
-            p = fm.safe_join(parent, name.strip())
-            p.parent.mkdir(parents=True, exist_ok=True)
-            if not p.exists(): p.write_text("", encoding="utf-8")
-    return HTMLResponse(_source_tree_html(fm, s.get(f"selected_{src}", []), src))
+    if kind in ("upload", "upload_folder") and files:
+        await fm.save_uploads(parent, files, rel_paths, on_complete=_auto_ingest)
+    elif kind == "folder" and name.strip():
+        fm.safe_join(parent, name.strip()).mkdir(parents=True, exist_ok=True)
+    elif kind == "file" and name.strip():
+        p = fm.safe_join(parent, name.strip())
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if not p.exists(): p.write_text("", encoding="utf-8")
+    return imr.oob(_source_tree_html(fm, s.get(f"selected_{src}", []), src), f"kg-tree-{src}", swap="outerHTML")
 
 # --- Scheduled sync ---
 
