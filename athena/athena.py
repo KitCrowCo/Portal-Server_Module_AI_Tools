@@ -1,29 +1,16 @@
+# /modules/ai_tools/athena/athena.py
 """
-Athena - Managed AI chat. One ChatManager per instance. Admin configures model/system prompt, users chat.
-Sub-module of ai_tools. Mounted at /module/ai_tools/athena.
-Conversation storage: JSON files per conversation.
-User organization (folders): JSON metadata per user.
-IM routes submit; HTMX routes conversation navigation and management.
+Athena - Managed AI chat. Thin front end over ai_manager's connections/pipeline layer - not an AI implementation
+of its own. Admin defines "capabilities" (labeled bundles of connection+model+system prompt+optional knowledge
+base+optional pipeline) as individually addable/editable blocks; users only ever pick a capability by its label,
+never a raw model name. Capability resolution happens live at send-time from admin config, not snapshotted into
+the conversation, so an admin fixing a capability's settings takes effect on existing conversations immediately.
 """
 import json, uuid, re, asyncio, base64
 from pathlib import Path
 from datetime import datetime
-import httpx
-from fastapi import APIRouter, Request, UploadFile, File, Form
-from fastapi.responses import HTMLResponse, JSONResponse
-import openpyxl
-import shutil
-
-# #*************************************************
-# for f in Path("./data/ai_tools/athena/conversations").glob("*.json"):
-#     d = json.loads(f.read_text())
-#     changed = False
-#     for m in d.get("messages", []):
-#         if isinstance(m.get("content"), list):
-#             m["content"] = "[corrupted - removed by repair script]"
-#             changed = True
-#     if changed: f.write_text(json.dumps(d, indent=2)); print("repaired", f.name)
-# #*************************************************
+from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import HTMLResponse, Response
 
 TOOL_META = {"label": "Athena", "group": "chat", "icon": "&#x1F989;", "description": "AI chat", "singleton": True}
 
@@ -32,80 +19,123 @@ router = APIRouter(redirect_slashes=False)
 ENV: dict = {}
 _P = "/module/ai_tools/athena"
 DATA_DIR = Path("./data/ai_tools/athena")
-KG_DIR = Path("./data/ai_tools/_knowledge")
-COMMON_DIR = Path("./data/_common")
 
 UI = None
 WS = None
 IM = None
 CM = None
 AIM = None
+BI = None
 cfg = {}
 
-def _u(*p): return "/".join(s.strip("/") for s in [_P,*p] if s)
+DEFAULT_CAP = {"id":"standard", "label":"Standard", "conn_id":"", "model":"", "system_prompt":"You are a helpful, professional assistant.", "think": False, "num_predict": 8192, "model_ctx": 16384, "knowledge_enabled":False, "knowledge_conn_id":"", "flow_pipeline_id":"", "flow_result_key":"text", }
 
-# --- Athena Initialization ---
+def _u(*p): return "/".join(s.strip("/") for s in [_P,*p] if s)
+def _iv(intent_type, **extra): return json.dumps({"type": intent_type, "lvl": 2, **extra})
+
+def get_capability_id_options(values=None):
+    caps = (values or {}).get("capabilities") or []
+    return [(c.get("id",""), c.get("label",c.get("id",""))) for c in caps] or [("standard","Standard")]
+
 def init_tool(env:dict, prefix:str):
-    global ENV, _P, UI, WS, IM, CM, AIM, cfg
+    global ENV, _P, UI, WS, IM, CM, AIM, BI, cfg
     ENV = env
     _P = prefix.rstrip("/")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     (DATA_DIR/"conversations").mkdir(exist_ok=True)
     UI=ENV["templates"].env.globals.get("UI")
     WS=ENV["ws"]
+    BI = ENV["tools"]["built_ins"]
     IM=ENV["InterfaceManager"](nesting_level=2, db_path="ai_tools/athena/im_registry.db")
-    built_ins = ENV["tools"]["built_ins"]
     AIM = ENV["tools"]["ai_manager"]
-    # Configure Athena using the agnostic framework
-    cfg = built_ins.SettingsPanel("Athena Settings", [
-            built_ins.SettingsGroup("general", "General", [
-                built_ins.SettingField("title", "Title", "text", "Athena"),
-                built_ins.SettingField("conn_id", "Connection", "select", options=get_connection_options, hx_get=_u("admin", "fields"), hx_target="#athena-admin-fields"),
-                built_ins.SettingField("model", "Model", "select", options=get_model_options),
-                built_ins.SettingField("think_model", "Think Model", "select", options=get_model_options),
-                built_ins.SettingField("system_prompt", "System Prompt", "textarea", ""),
-                built_ins.SettingField("model_ctx", "Context Tokens", "number", 8192),
-                built_ins.SettingField("user_input_limit", "User Input Limit", "number", 8000),
-                built_ins.SettingField("msg_buffer", "Message Buffer", "number", 500),
-                built_ins.SettingField("temperature", "Temperature", "number", 0.3),
-                built_ins.SettingField("num_predict", "Max Response Tokens (num_predict)", "number", 8192),
-                built_ins.SettingField("allow_files", "Allow Files", "checkbox", True),
-                built_ins.SettingField("user_overrides", "User Overrides", "json", default={}, hint='JSON dict mapping username to custom settings, e.g., {"user1": {"model": "llama3", "system_prompt": "..."}}') # JSON overrides field for the <10 users
-            ], json_path="data/settings/athena.json")
-        ])
-
-    IM.scripts["submit"] = [_handle_submit]
-    CM=ENV["tools"]["built_ins"].ChatManager(namespace="athena", base_url=_u(), view_style="bubble", stream_toggle=True, think_toggle=True, stop_enabled=True, show_export=True, pin_enabled=True, allow_edit=True, allow_delete=True, allow_copy=True, show_info=True, markdown_mode="standard", branch_id=IM.branch_id, nesting_level=2)
+    cfg = BI.SettingsPanel("Athena Settings", [
+            BI.SettingsGroup("general", "General", [
+                BI.SettingField("title", "Title", "text", "Athena"),
+                BI.SettingField("capabilities", "Capabilities (managed below - not edited here)", "json", default=[dict(DEFAULT_CAP)]),
+                BI.SettingField("default_capability_id", "Default Capability for New Conversations", "select", options=get_capability_id_options),
+                BI.SettingField("user_input_limit", "User Input Limit (tokens)", "number", 8000),
+                BI.SettingField("temperature", "Temperature", "number", 0.3),
+                BI.SettingField("num_predict", "Max Response Tokens", "number", 8192),
+                BI.SettingField("allow_files", "Allow File Attachments", "checkbox", True),
+                BI.SettingField("user_overrides", "Per-User Default Capability", "json", default={}, hint='{"username": "capability_id"} - overrides default_capability_id for specific people.')
+            ], json_path="data/settings/athena.json")])
+    CM=ENV["tools"]["built_ins"].ChatManager(namespace="athena", base_url=_u(), view_style="bubble", stream_toggle=True, think_toggle=False, stop_enabled=True, show_export=False, pin_enabled=True, allow_edit=True, allow_delete=True, allow_copy=True, show_info=True, markdown_mode="standard", branch_id=IM.branch_id, nesting_level=2, action_intent_prefix="athena")
+    IM.scripts.update({"submit": [_handle_submit],
+                       "athena_new": [_h_new],
+                       "athena_load": [_h_load],
+                       "athena_conv_delete": [_h_conv_delete],
+                       "athena_conv_rename_form": [_h_conv_rename_form],
+                       "athena_conv_rename": [_h_conv_rename],
+                       "athena_folder_new_form": [_h_folder_new_form],
+                       "athena_folder_cancel": [_h_folder_cancel],
+                       "athena_folder_create": [_h_folder_create],
+                       "athena_folder_delete": [_h_folder_delete],
+                       "athena_folder_rename_form": [_h_folder_rename_form],
+                       "athena_folder_rename": [_h_folder_rename],
+                       "athena_folder_assign": [_h_folder_assign],
+                       "athena_msg_delete": [_h_msg_delete],
+                       "athena_msg_edit_form": [_h_msg_edit_form],
+                       "athena_msg_edit_save": [_h_msg_edit_save],
+                       "athena_msg_cancel_edit": [_h_msg_cancel_edit],
+                       "athena_msg_retry": [_h_msg_retry],
+                       "athena_msg_retry_send": [_h_msg_retry_send],
+                       "athena_upload": [_h_upload],
+                       "athena_delete_file": [_h_delete_file],
+                       "athena_capability_change": [_h_capability_change],
+                       "athena_conv_settings_open": [_h_conv_settings_open],
+                       "athena_conv_settings_save": [_h_conv_settings_save],
+                       "athena_import_form": [_h_import_form],
+                       "athena_import": [_h_import],
+                       "athena_admin_save": [_h_admin_save],
+                       "athena_cap_add": [_h_cap_add],
+                       "athena_cap_delete": [_h_cap_delete],
+                       "athena_cap_save": [_h_cap_save],
+                       "athena_cap_conn_change": [_h_cap_conn_change]})
     print(f"[athena] ready at {_P}")
 
 _STOP_FLAGS:dict = {}
 _ACTIVE_STREAMS:set = set()
-_STREAM_BUFFERS:dict = {}  # sid->{full,thinking,done,error,username} - server-side accumulator
+_STREAM_BUFFERS:dict = {}
 
 def _cp(cid): return DATA_DIR/"conversations"/f"{Path(cid).name}.json"
 def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
 def _tok(t): return max(1,len(str(t))//4)
-def _load_conv(cid): return json.loads(_cp(cid).read_text())
+
+def _load_conv(cid):
+    p = _cp(cid)
+    return json.loads(p.read_text()) if p.exists() else None
+
 def _save_conv(c): c["modified"]=datetime.utcnow().isoformat(); _cp(c["id"]).write_text(json.dumps(c,indent=2))
 def _list_convs(u): return [c for c in (json.loads(p.read_text()) for p in sorted((DATA_DIR/"conversations").glob("*.json"), key=lambda x:x.stat().st_mtime, reverse=True)) if c.get("username") == u]
 def _del_conv(cid): p=_cp(cid); p.unlink() if p.exists() else None
 def _org(u): p=DATA_DIR/f"org_{u}.json"; return json.loads(p.read_text()) if p.exists() else {"folders":{},"conv_folders":{}}
 def _save_org(u,o): (DATA_DIR/f"org_{u}.json").write_text(json.dumps(o, indent=2))
 
-def _new_conv(user):
-    # Extract admin-defined overrides for this specific user - Overrides take priority, fallback to global cfg
-    overrides = cfg.get("user_overrides", {}).get(user.username, {})
-    return {"id": f"ath_{uuid.uuid4().hex[:8]}", "user_id": str(user.id), "username": user.username, "user_display": user.username, "title": "New Chat", "model": overrides.get("model") or cfg.get("model", ""), "system_prompt": overrides.get("system_prompt") or cfg.get("system_prompt", ""), "messages": [], "context_summary": "", "attached_files": [], "created": datetime.utcnow().isoformat(), "modified": datetime.utcnow().isoformat()}
+def _default_capability_id(user):
+    override = cfg.get("user_overrides", {}).get(user.username)
+    if override: return override
+    return cfg.get("default_capability_id") or (cfg.get("capabilities") or [DEFAULT_CAP])[0].get("id","standard")
+
+def _new_conv(user): return {"id": f"ath_{uuid.uuid4().hex[:8]}", "user_id": str(user.id), "username": user.username, "user_display": user.username, "title": "New Chat", "capability_id": _default_capability_id(user), "system_prompt_override": "", "model_ctx_override": None, "messages": [], "context_summary": "", "attached_files": [], "created": datetime.utcnow().isoformat(), "modified": datetime.utcnow().isoformat()}
+
+def _resolve_capability(conv) -> dict:
+    caps = cfg.get("capabilities", []) or [DEFAULT_CAP]
+    return next((c for c in caps if c.get("id") == conv.get("capability_id")), None) or caps[0]
 
 def _conv_ctx_info(conv):
-    """Approximate token usage for sidebar display."""
     if not conv: return ""
-    sys_p=conv.get("system_prompt","") or cfg.get("system_prompt","")
-    total=_tok(sys_p)+sum(_tok(m.get("content","")) for m in conv.get("messages",[]) if not m.get("deleted"))
-    ctx=conv.get("model_ctx",cfg.get("model_ctx", 8192))
-    pct=min(total/max(ctx,1)*100, 100)
-    col="#00ffa2" if pct<60 else "#ffcc00" if pct<80 else "#ff9944" if pct<95 else "#ff5f5f"
-    return (f"""<div style="padding:.3rem .5rem;font-size:.65rem;color:var(--text_muted);border-top:var(--border-thick) solid var(--border);flex-shrink:0;display:flex;justify-content:space-between"><span>~{total:,}t used</span><span style="color:{col}">{pct:.0f}% of {ctx//1000}k ctx</span></div>""")
+    cap = _resolve_capability(conv)
+    sys_p = conv.get("system_prompt_override") or cap.get("system_prompt","")
+    sys_tok = _tok(sys_p)
+    msgs = [m for m in conv.get("messages",[]) if not m.get("deleted")]
+    msg_tok = sum(_tok(m.get("content","")) for m in msgs)
+    total = sys_tok + msg_tok
+    ctx = conv.get("model_ctx_override") or cap.get("model_ctx", 16384)
+    pct = min(total/max(ctx,1)*100, 100)
+    col = "#00ffa2" if pct<60 else "#ffcc00" if pct<80 else "#ff9944" if pct<95 else "#ff5f5f"
+    return (f"""<div style="padding:.3rem .5rem;font-size:.62rem;color:var(--text_muted);border-top:var(--border-thick) solid var(--border);flex-shrink:0">
+                    <div style="display:flex;justify-content:space-between"><span>sys {sys_tok:,}t + msgs {msg_tok:,}t = {total:,}t</span><span style="color:{col}">{pct:.0f}% of {ctx//1000}k ({_esc(cap.get('label',''))})</span></div>
+                </div>""")
 
 def _find_msg(username, mid):
     for c in _list_convs(username):
@@ -115,275 +145,299 @@ def _find_msg(username, mid):
             if m.get("id")==mid: return conv,i,m
     return None, None, None
 
-# --- System Prompts and uploads ---
-
-def _prompts_dir(): d=DATA_DIR/"prompts"; d.mkdir(exist_ok=True); return d
-def _uploads_dir(cid): d=DATA_DIR/"uploads"/cid; d.mkdir(parents=True,exist_ok=True); return d
-def _list_prompts(): return [json.loads(f.read_text()) for f in sorted(_prompts_dir().glob("*.json"), key=lambda x:x.stat().st_mtime, reverse=True)]
-def _load_prompt(pid): return json.loads((_prompts_dir()/f"{pid}.json").read_text())
-def _save_prompt(p): (_prompts_dir()/f"{p['id']}.json").write_text(json.dumps(p,indent=2))
-def _del_prompt(pid): p=_prompts_dir()/f"{pid}.json"; p.unlink() if p.exists() else None
-
 def _attach_content(conv):
-    """Returns (text_parts, image_b64_list) from conv attached_files."""
-    text_parts=[]; images=[]
+    text_parts=[]
+    images=[]
+    if not cfg.get("allow_files", True): return text_parts, images
     for f in conv.get("attached_files",[]):
         p=Path(f["path"])
         if not p.exists(): continue
         ext=f.get("ext","").lower()
-        if ext in (".png",".jpg",".jpeg",".webp",".gif"):
-            images.append(base64.b64encode(p.read_bytes()).decode())
-        elif ext in (".csv",".txt",".md"):
-            text_parts.append(f"[File: {f['name']}]\n{p.read_text(errors='ignore')}")
-        elif ext in (".xlsx",".xls"):
-            try:
-                wb=openpyxl.load_workbook(p,read_only=True, data_only=True)
-                rows=[]
-                for ws in wb.worksheets:
-                    rows.append(f"Sheet: {ws.title}")
-                    for row in ws.iter_rows(values_only=True,max_row=500):
-                        rows.append(",".join(str(c or "") for c in row))
-                text_parts.append(f"[Excel: {f['name']}]\n"+"\n".join(rows))
-            except Exception as e: text_parts.append(f"[Excel: {f['name']} - parse error: {e}]")
+        if ext in (".png",".jpg",".jpeg",".webp",".gif"): images.append(base64.b64encode(p.read_bytes()).decode())
+        else:
+            text = BI.extract_file_text(p)
+            if text: text_parts.append(f"[File: {f['name']}]\n{text}")
     return text_parts,images
 
-# --- Ollama ---
+def _uploads_dir(cid): d=DATA_DIR/"uploads"/cid; d.mkdir(parents=True,exist_ok=True); return d
 
-def get_connection_options(values=None): return [(c["_id"], c.get("display_name", c["_id"])) for c in AIM.connections.list_conns()]
+# --- Ollama streaming ---
 
-def get_model_options(values=None):
-    conn_id = (values or {}).get("conn_id") or cfg.get("conn_id","")
-    conn = AIM.connections.get_conn(conn_id) if conn_id else None
-    return [(m, m) for m in AIM.connections.list_models_sync(conn)] if conn else []
-
-# athena.py — _stream_ollama, accept and use them instead of hardcoded 20/0.5
 async def _stream_ollama(conn, msgs, model, ctx, think=False, images=None, temperature=0.7, num_predict=8192, top_k=40, top_p=0.8):
     if images and msgs: msgs[-1]["images"] = images
-    pl = {"model":model,"messages":msgs,"stream":True,"options":{"num_ctx":ctx,"num_predict":num_predict,"temperature":temperature,"top_k":top_k,"top_p":top_p}}
-    if think: pl["think"] = True
-    tb = ""
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=30.0, read=1800.0, write=10.0, pool=30.0)) as c:
-        async with c.stream("POST", f"{AIM.connections._base(conn)}/api/chat", json=pl) as resp:
-            if resp.status_code == 503: yield "", "", True, "Ollama busy (503)"; return
-            if resp.status_code != 200:
-                body = await resp.aread()
-                yield "", "", True, f"HTTP {resp.status_code}: {body.decode()}"; return
-            async for line in resp.aiter_lines():
-                if not line: continue
-                try:
-                    chunk = json.loads(line)
-                    if chunk.get("error"): yield "", tb, True, chunk["error"]; return
-                    msg = chunk.get("message",{})
-                    tb += msg.get("thinking", "")
-                    text = msg.get("content", "")
-                    done = chunk.get("done",False)
-                    if text or done or tb: yield text, tb, done, None
-                    if done: return
-                except: continue
+    async for text, thinking in AIM.connections.stream_llm(conn, msgs, model, think=think, temperature=temperature, num_ctx=ctx, num_predict=num_predict, top_k=top_k, top_p=top_p):
+        yield text, thinking, False, None
+    yield "", "", True, None
 
-# --- Context ---
-
-def _build_msgs(conv, user_msg):
-    ctx = conv.get("model_ctx", cfg.get("model_ctx", 8192))
+def _build_msgs(conv, user_msg, knowledge_context=""):
+    cap = _resolve_capability(conv)
+    ctx = conv.get("model_ctx_override") or cap.get("model_ctx", 16384)
     budget = int(ctx * 0.82)
-    sys_p = conv.get("system_prompt","") or cfg.get("system_prompt", "")
+    sys_p = conv.get("system_prompt_override") or cap.get("system_prompt", "")
     summary = conv.get("context_summary","").strip()
     out = []
     sys_parts = [sys_p] if sys_p else []
+    if knowledge_context: sys_parts.append(knowledge_context)
     if summary: sys_parts.append(f"[Prior context]\n{summary}")
     if sys_parts: out.append({"role":"system","content":"\n\n---\n\n".join(sys_parts)})
     sys_tok = sum(_tok(m["content"]) for m in out)
     available = budget - sys_tok - _tok(user_msg) - 256
-    if available < 100: raise ValueError(f"System prompt fills context window ({sys_tok}t sys, {_tok(user_msg)}t input, {budget}t budget)")
+    if available < 100: raise ValueError(f"System prompt + knowledge context fills context window ({sys_tok}t sys, {_tok(user_msg)}t input, {budget}t budget)")
     history = [m for m in conv.get("messages",[]) if not m.get("deleted")]
-    recent = []; used = 0; truncated = 0
+    recent = []
+    used = 0
+    truncated = 0
     for m in reversed(history):
         t = _tok(m.get("content",""))
         if used + t > available: truncated += 1; continue
-        recent.insert(0, {"role":m["role"], "content":m["content"]}); used += t
-    out.extend(recent); out.append({"role":"user", "content":user_msg})
+        recent.insert(0, {"role":m["role"], "content":m["content"]})
+        used += t
+    out.extend(recent)
+    out.append({"role":"user", "content":user_msg})
     return out, truncated
 
-# --- IM Submit + Stream ---
+# --- Submit + Stream ---
 
 async def _handle_submit(request, payload:dict, imr):
-    sid=payload.get("cid","").strip(); content=payload.get("content","").strip()
+    sid=payload.get("cid","").strip()
+    content=payload.get("content","").strip()
     if not sid or not content: return imr
+    user = request.state.user
+    conv = _load_conv(sid)
+    if not conv or conv.get("username") != user.username: return imr
+    user_msg = {"id":uuid.uuid4().hex[:8],"role":"user","content":content,"user_name":conv.get("user_display",user.username),"timestamp":datetime.utcnow().isoformat()}
+    conv["messages"].append(user_msg)
+    _save_conv(conv)
+    imr.oob(CM.render_message(user_msg, is_me=True, can_delete=True, can_edit=True), f"cm-msgs-{sid}", swap="beforeend")
+    imr.oob(_left(user.username, sid), "ath-left", swap="innerHTML")
     imr.raw(CM.working_html(sid, _u("stop",sid)))
     imr.raw(f"""<textarea id="cm-in-{sid}" name="content" class="cm-input" placeholder="Type a message\u2026 (Ctrl+Enter)" spellcheck="true" hx-swap-oob="outerHTML"></textarea>""")
-    asyncio.create_task(_do_stream(request.state.user.username, payload, sid))
-    await asyncio.sleep(0.1)
+    cap = _resolve_capability(conv)
+    target = _do_stream_pipeline if cap.get("flow_pipeline_id") else _do_stream
+    asyncio.create_task(target(user.username, payload, sid, skip_user_append=True))
     return imr
 
-async def _do_stream(username: str, payload: dict, sid: str):
-    global _ACTIVE_STREAMS
-    content = payload.get("content","").strip(); think = payload.get("think") in ("1", "true", True)
+async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=False):
+    content = payload.get("content","").strip()
     _STREAM_BUFFERS[sid] = {"full":"", "thinking":"", "done":False, "error":None, "username":username}
     async def _ws(html): await WS.send_personal_message(html, username); await asyncio.sleep(0.01)
     async def _err(msg):
         _STREAM_BUFFERS[sid].update({"error":msg,"done":True})
-        await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="color:#ff5f5f;font-size:.8rem;padding:.2rem .2rem">&#x26A0; {_esc(msg)}</div></div>{CM.working_hide_html(sid)}')
+        await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="color:#ff5f5f; font-size:.8rem; padding:.2rem .2rem">&#x26A0; {_esc(msg)}</div></div>{CM.working_hide_html(sid)}')
     full = ""
     tb = ""
     try:
         conv = _load_conv(sid)
-        model = cfg.get("model","")
-        if think: model = cfg.get("think_model","") or model
-        conn = AIM.connections.get_conn(conv.get("conn_id","") or cfg.get("conn_id",""))
-        num_ctx = conv.get("model_ctx", cfg.get("model_ctx", 8192))
-        if not conn: await _err("No Ollama connection. Add one in AI Tools > Settings."); return
-        if not model: await _err("No model configured in Athena Admin."); return
+        if not conv: await _err("Conversation not found."); return
+        cap = _resolve_capability(conv)
+        conn = AIM.connections.get_conn(cap.get("conn_id",""))
+        num_ctx = conv.get("model_ctx_override") or cap.get("model_ctx", 16384)
+        if not conn: await _err(f"No connection configured for capability '{cap.get('label','')}'. Contact your admin."); return
+        model = cap.get("model","")
+        if not model: await _err(f"No model configured for capability '{cap.get('label','')}'. Contact your admin."); return
         max_input_tok = int(num_ctx * 0.65)
         if _tok(content) > max_input_tok: content = content[:max_input_tok * 4] + f"\n\n[Input was truncated: original length exceeded {max_input_tok} token limit for {num_ctx} context window]"
-        # if _tok(content) > int(num_ctx*0.70): await _err(f"Input too long (~{_tok(content)}t, limit ~{int(num_ctx*0.70)}t)."); return
-
-        try: built_msgs, truncated = _build_msgs(conv, content)
+        knowledge_context = ""
+        if cap.get("knowledge_enabled") and cap.get("knowledge_conn_id"):
+            kg_conn = AIM.connections.get_conn(cap["knowledge_conn_id"], conn_type="lightrag")
+            if kg_conn: knowledge_context = await AIM.connections.lightrag_context_block(kg_conn, content, label="Company Knowledge")
+        try: built_msgs, truncated = _build_msgs(conv, content, knowledge_context)
         except ValueError as e: await _err(f"Context error: {e}"); return
         if truncated: await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="font-size:.7rem;color:#ffcc00;padding:.2rem .4rem;border-left:var(--border-thick) solid #ffcc00">&#x26A0; {truncated} older message{"s" if truncated>1 else ""} shifted out of context window.</div></div>')
-        user_msg = {"id":uuid.uuid4().hex[:8],"role":"user","content":content,"user_name":conv.get("user_display",username),"timestamp":datetime.utcnow().isoformat()}
-        conv["messages"].append(user_msg)
-        _save_conv(conv)
-        await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend">{CM.render_message(user_msg, is_me=True, can_delete=True, can_edit=True)}</div>')
+        user_msg = None
+        if not skip_user_append:
+            user_msg = {"id":uuid.uuid4().hex[:8],"role":"user","content":content,"user_name":conv.get("user_display",username),"timestamp":datetime.utcnow().isoformat()}
+            conv["messages"].append(user_msg)
+            _save_conv(conv)
+            await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend">{CM.render_message(user_msg, is_me=True, can_delete=True, can_edit=True)}</div>')
         _,images = _attach_content(conv)
         _ACTIVE_STREAMS.add(sid)
         try:
-            temp = float(cfg.get("temperature", 0.7)); num_predict = int(cfg.get("num_predict", 8192))
-            top_k = int(cfg.get("top_k", 40)); top_p = float(cfg.get("top_p", 0.8))
-            async for text, thinking, done, err in _stream_ollama(conn, built_msgs, model, num_ctx, think, images=images or None, temperature=temp, num_predict=num_predict, top_k=top_k, top_p=top_p):
+            async for text, thinking, done, err in _stream_ollama(conn, built_msgs, model, num_ctx, cap.get("think", False), images=images or None, temperature=float(cfg.get("temperature", 0.7)), num_predict = int(cap.get("num_predict") or cfg.get("num_predict", 8192))):
                 if _STOP_FLAGS.pop(sid, False): break
-                if err:
-                    _STREAM_BUFFERS[sid]["error"] = err
-                    await _err(f"Ollama: {err}"); return
+                if err: _STREAM_BUFFERS[sid]["error"] = err; await _err(f"Model error: {err}"); return
                 if text: full += text
-                if thinking: tb = thinking
+                if thinking: tb += thinking
                 _STREAM_BUFFERS[sid].update({"full":full,"thinking":tb})
                 think_html = (f'<details class="cm-think" open><summary>&#x1F9E0; Thinking ({len(tb)//4}t)\u2026</summary><div class="cm-think-body">{_esc(tb)}</div></details>') if tb.strip() else ""
                 await _ws(f'<div id="cm-stream-{sid}" hx-swap-oob="innerHTML">{think_html}{"<div class=cm-stream-bubble>"+_esc(full)+"</div>" if full else ""}</div>')
                 if done: break
-        finally:
-            _ACTIVE_STREAMS.discard(sid)
+        except Exception as stream_e:
+            await _err(f"Connection error: {stream_e}"); return
+        finally: _ACTIVE_STREAMS.discard(sid)
         _STREAM_BUFFERS[sid]["done"] = True
-        err_flag = _STREAM_BUFFERS[sid].get("error")
         if not full:
             await _ws(f'<div id="cm-stream-{sid}" hx-swap-oob="innerHTML"></div>{CM.working_hide_html(sid)}')
             if tb.strip():
-                conv = _load_conv(sid)
-                if conv:
+                conv2 = _load_conv(sid)
+                if conv2:
                     ai_msg = {"id":uuid.uuid4().hex[:8],"role":"assistant","content":"*(no visible reply - model used its whole token budget thinking)*","thinking":tb.strip(),"model":model,"timestamp":datetime.utcnow().isoformat(),"partial":True}
-                    conv["messages"].append(ai_msg); _save_conv(conv)
+                    conv2["messages"].append(ai_msg)
+                    _save_conv(conv2)
                     await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend">{CM.render_message(ai_msg, is_me=False, can_delete=True, can_edit=True)}</div>')
-            if err_flag: await _err(f"Ollama error: {err_flag}")
             return
-        conv = _load_conv(sid)
-        if conv:
+        conv2 = _load_conv(sid)
+        if conv2:
             ai_msg = {"id":uuid.uuid4().hex[:8],"role":"assistant","content":full, "thinking":tb.strip() if tb.strip() else "","model":model, "timestamp":datetime.utcnow().isoformat(),"response_tokens":_tok(full)}
-            if err_flag: ai_msg["partial"] = True
-            conv["messages"].append(ai_msg)
-            if len(conv["messages"]) == 2 and conv.get("title","") in ("","New Chat"): conv["title"] = conv["messages"][0].get("content","")[:50]
-            _save_conv(conv)
-            partial_badge = '<span style="font-size:.65rem;color:#ffaa44;margin-left:.3rem">[partial]</span>' if err_flag else ""
-            await _ws(f"""<div id="cm-msgs-{sid}" hx-swap-oob="beforeend">{CM.render_message(ai_msg, is_me=False, can_delete=True, can_edit=True)}{partial_badge}</div>
+            conv2["messages"].append(ai_msg)
+            if len(conv2["messages"]) == 2 and conv2.get("title","") in ("","New Chat"): conv2["title"] = conv2["messages"][0].get("content","")[:50]
+            _save_conv(conv2)
+            await _ws(f"""<div id="cm-msgs-{sid}" hx-swap-oob="beforeend">{CM.render_message(ai_msg, is_me=False, can_delete=True, can_edit=True)}</div>
                           <div id="cm-stream-{sid}" hx-swap-oob="innerHTML"></div>
                           {CM.working_hide_html(sid)}
                           <div id="ath-left" hx-swap-oob="innerHTML">{_left(username,sid)}</div>""")
-            if err_flag: await _err(f"Ollama error (partial response saved): {err_flag}")
     except Exception as e:
         print(f"[athena] stream error {sid}: {e}")
         if full:
             try:
-                conv = _load_conv(sid)
-                if conv:
-                    ai_msg = {"id":uuid.uuid4().hex[:8], "role":"assistant", "content":full, "thinking":tb.strip(), "model":"", "partial":True, "timestamp":datetime.utcnow().isoformat(), "response_tokens":_tok(full)}
-                    conv["messages"].append(ai_msg); _save_conv(conv)
+                conv2 = _load_conv(sid)
+                if conv2:
+                    conv2["messages"].append({"id":uuid.uuid4().hex[:8],"role":"assistant","content":full,"thinking":tb.strip(),"model":"","partial":True,"timestamp":datetime.utcnow().isoformat(),"response_tokens":_tok(full)})
+                    _save_conv(conv2)
             except Exception as save_err: print(f"[athena] partial save failed: {save_err}")
         await _err(f"Server error: {e}")
     finally:
         _STREAM_BUFFERS.pop(sid, None)
 
+async def _do_stream_pipeline(username: str, payload: dict, sid: str, skip_user_append=False):
+    """A capability with flow_pipeline_id set hands the whole turn to an ai_manager pipeline instead of a direct chat call.
+    No live token streaming yet - the working indicator shows until the pipeline job finishes, then the result appears in one piece.
+    Live streaming for this path needs the shared interface_bridge.js pipeline_stream renderer wired up first (tracked separately, not Athena-specific)."""
+    content = payload.get("content","").strip()
+    async def _ws(html): await WS.send_personal_message(html, username); await asyncio.sleep(0.01)
+    async def _err(msg): await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="color:#ff5f5f;font-size:.8rem;padding:.2rem .2rem">&#x26A0; {_esc(msg)}</div></div>{CM.working_hide_html(sid)}')
+    conv = _load_conv(sid)
+    if not conv: await _err("Conversation not found."); return
+    cap = _resolve_capability(conv)
+    if not skip_user_append:
+        user_msg = {"id":uuid.uuid4().hex[:8],"role":"user","content":content,"user_name":conv.get("user_display",username),"timestamp":datetime.utcnow().isoformat()}
+        conv["messages"].append(user_msg); _save_conv(conv)
+        await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend">{CM.render_message(user_msg, is_me=True, can_delete=True, can_edit=True)}</div>')
+    pid = cap.get("flow_pipeline_id","")
+    job_id, err = AIM.engine.submit(username, kind="id", pipeline_id=pid, inputs={"input": content})
+    if err: await _err(f"Pipeline error: {err}"); return
+    job = None
+    while True:
+        await asyncio.sleep(1.0)
+        job = AIM.engine.load_job(job_id)
+        if not job or job["status"] in ("done","error","stopped","interrupted"): break
+    if not job or job["status"] != "done": await _err(f"Pipeline {job['status'] if job else 'lost'} - check AI Manager for node-level detail."); return
+    result_key = cap.get("flow_result_key","text") or "text"
+    full = str(job["data"].get(result_key,""))
+    if not full: await _err(f"Pipeline finished but produced nothing under key '{result_key}' - check the pipeline's config with your admin."); return
+    conv2 = _load_conv(sid)
+    if not conv2: return
+    ai_msg = {"id":uuid.uuid4().hex[:8],"role":"assistant","content":full,"model":f"pipeline:{pid}","timestamp":datetime.utcnow().isoformat()}
+    conv2["messages"].append(ai_msg)
+    if len(conv2["messages"]) == 2 and conv2.get("title","") in ("","New Chat"): conv2["title"] = content[:50]
+    _save_conv(conv2)
+    await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend">{CM.render_message(ai_msg, is_me=False, can_delete=True, can_edit=False)}</div><div id="cm-stream-{sid}" hx-swap-oob="innerHTML"></div>{CM.working_hide_html(sid)}<div id="ath-left" hx-swap-oob="innerHTML">{_left(username,sid)}</div>')
+
+# --- Left panel / conversation list ---
+
 def _conv_item(c, active, org):
     cid = c.get("id","")
     title = _esc((c.get("title","") or "Untitled")[:42])
-    ac = " ath-conv-active" if cid == active else ""
-    #date = (c.get("modified","") or "")[:10]
+    ac = " active" if cid == active else ""
     short_title = (c.get("title","") or "Untitled")[:30]
     partial_badge = '<span style="font-size:.6rem;color:#ffaa44;margin-left:.2rem" title="Last response was partial">&#x25CC;</span>' if any(m.get("partial") for m in c.get("messages",[])) else ""
-    folders = org.get("folders",{}); folder_id = org.get("conv_folders",{}).get(cid,"") or ""
+    folders = org.get("folders",{})
+    folder_id = org.get("conv_folders",{}).get(cid,"") or ""
     folder_sel = ""
     if folders:
         opts = '<option value="">No folder</option>' + "".join(f'<option value="{fid}" {"selected" if fid==folder_id else ""}>{_esc(fd["name"])}</option>' for fid,fd in sorted(folders.items(),key=lambda x:x[1].get("order",0)))
-        folder_sel = f'<select class="ath-folder-sel" name="folder_id" hx-post="{_u("folder","assign",cid)}" hx-trigger="change" hx-target="#ath-left" hx-swap="innerHTML" onclick="event.stopPropagation()">{opts}</select>'
-    return f"""<div class="ath-conv-item{ac}" id="ath-ci-{cid}" hx-get="{_u("load",cid)}" hx-target="#ath-chat-area" hx-swap="innerHTML">
-        <div style="display:flex;align-items:center;gap:.2rem; width:100%">
-            <span class="ath-conv-title" style="flex:1">{title}{partial_badge}</span>
-            <span class="ath-conv-actions" style="display:flex;gap:.1rem;flex-shrink:0">
-                <button class="cm-qbtn" hx-get="{_u("conv","rename_form",cid)}" hx-target="#ath-ci-{cid}" hx-swap="innerHTML" onclick="event.stopPropagation()">&#x270E;</button>
-                <button class="cm-qbtn" hx-post="{_u("conv","delete",cid)}" hx-target="#ath-chat-area" hx-swap="innerHTML" hx-confirm="Delete '{short_title}'?" onclick="event.stopPropagation()">&#x2715;</button>
-            </span>
-        </div>
-        <details style="font-size:.6rem;color:var(--text_muted)" onclick="event.stopPropagation()"><summary style="list-style:none;cursor:pointer;user-select:none">&#x25B8;</summary><div style="display:flex;justify-content:space-between;padding:.1rem 0">{folder_sel}</div></details>
-    </div>"""
+        folder_sel = f"""<select class="side-folder-sel" name="value" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_folder_assign", cid=cid)}' hx-include="this" onclick="event.stopPropagation()">{opts}</select>"""
+    return f"""<div class="side-list-item{ac}" id="ath-ci-{cid}" hx-post="/im/in" hx-target="#ath-chat-area" hx-swap="innerHTML" hx-vals='{_iv("athena_load", cid=cid)}'>
+                   <div style="display:flex;align-items:center;gap:.2rem; width:100%">
+                       <span class="side-list-item-title" style="flex:1">{title}{partial_badge}</span>
+                       <span class="side-list-actions" style="display:flex;gap:.1rem;flex-shrink:0">
+                           <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_conv_rename_form", cid=cid)}' onclick="event.stopPropagation()">&#x270E;</button>
+                           <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_conv_delete", cid=cid)}' hx-confirm="Delete '{short_title}'?" onclick="event.stopPropagation()">&#x2715;</button>
+                       </span>
+                   </div>
+                   <details style="font-size:.6rem;color:var(--text_muted)" onclick="event.stopPropagation()">
+                       <summary style="list-style:none;cursor:pointer;user-select:none">&#x25B8;</summary>
+                       <div style="display:flex;justify-content:space-between;padding:.1rem 0">{folder_sel}</div>
+                   </details>
+               </div>"""
 
 def _left(username, active=""):
-    global cfg
     org = _org(username)
     convs = _list_convs(username)
     folders = org.get("folders", {})
     active_fid = org.get("conv_folders", {}).get(active)
-    grouped = {fid: [] for fid in folders}; ungrouped = []
+    grouped = {fid: [] for fid in folders}
+    ungrouped = []
     for c in convs:
-        cid = c.get("id", "") or c.get("_id", "")
+        cid = c.get("id", "")
         fid = org.get("conv_folders", {}).get(cid)
         (grouped[fid] if fid and fid in grouped else ungrouped).append(c)
-    folder_html = "".join(f"""<details class="ath-folder" {"open" if fid==active_fid else ""}><summary class="ath-folder-sum">&#x1F4C1; <span id="ath-fn-{fid}">{_esc(fd["name"])}</span><button class="cm-qbtn" hx-get="{_u("folder","rename_form",fid)}" hx-target="#ath-fn-{fid}" hx-swap="outerHTML" onclick="event.stopPropagation()">&#x270E;</button><button class="cm-qbtn" hx-post="{_u("folder","delete",fid)}" hx-target="#ath-left" hx-swap="innerHTML" hx-confirm="Delete folder?" style="margin-left:auto;color:#ff5f5f" onclick="event.stopPropagation()">&#x2715;</button></summary>{"".join(_conv_item(c,active,org) for c in grouped.get(fid,[]))}</details>""" for fid, fd in sorted(folders.items(), key=lambda x: x[1].get("order", 0)))
+    folder_html = "".join(f"""<details class="side-folder" {"open" if fid==active_fid else ""}><summary class="side-folder-sum">&#x1F4C1; <span id="ath-fn-{fid}">{_esc(fd["name"])}</span><button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_folder_rename_form", fid=fid)}' onclick="event.stopPropagation()">&#x270E;</button><button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_folder_delete", fid=fid)}' hx-confirm="Delete folder?" style="margin-left:auto;color:#ff5f5f" onclick="event.stopPropagation()">&#x2715;</button></summary>{"".join(_conv_item(c,active,org) for c in grouped.get(fid,[]))}</details>""" for fid, fd in sorted(folders.items(), key=lambda x: x[1].get("order", 0)))
     ug_html = "".join(_conv_item(c, active, org) for c in ungrouped)
-    ug_hdr = '<div class="ath-ungrouped-hdr">Other</div>' if folder_html and ungrouped else ""
+    ug_hdr = '<div class="side-ungrouped-hdr">Other</div>' if folder_html and ungrouped else ""
     active_conv = _load_conv(active) if active else None
     ctx_footer = _conv_ctx_info(active_conv)
-    app_title = cfg.get("title", "Athena") 
-    return (f"""<div class="ath-sb-hdr">
-                    <button class="btn-icon" hx-post="{_u("new")}" hx-target="#ath-chat-area" hx-swap="innerHTML" title="New chat" style="font-size:1rem">+</button>
+    app_title = cfg.get("title", "Athena")
+    return (f"""<div class="side-list-hdr">
+                    <button class="btn-icon" hx-post="/im/in" hx-target="#ath-chat-area" hx-swap="innerHTML" hx-vals='{_iv("athena_new")}' title="New chat" style="font-size:1rem">+</button>
                     <span style="font-size:.7rem; text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);flex:1;padding:0 .3rem">{_esc(app_title)}</span>
-                    <button class="btn-icon" hx-get="{_u("folder","new_form")}" hx-target="#ath-folder-new" hx-swap="innerHTML" style="font-size:.75rem">&#x1F4C1;+</button>
+                    <button class="btn-icon" hx-post="/im/in" hx-target="#ath-chat-area" hx-swap="innerHTML" hx-vals='{_iv("athena_import_form")}' style="font-size:.8rem" title="Import">&#x1F4E5;</button>
+                    <button class="btn-icon" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_folder_new_form")}' style="font-size:.75rem" title="New folder">&#x1F4C1;+</button>
                 </div>
                 <div id="ath-folder-new"></div>
-                <div class="ath-conv-list">
+                <div class="side-list">
                     {folder_html}
                     {ug_hdr}
                     {ug_html}
                 </div>
-                <button class="ait-rp-btn" hx-get="{_u("admin")}" hx-target="#ait-workspace" hx-swap="innerHTML">&#x2699; Admin Settings</button>
-    {ctx_footer}""")
+                <button class="ait-rp-btn" hx-get="{_u("admin")}" hx-target="#ait-workspace" hx-swap="innerHTML">&#x2699; Admin Settings</button>{ctx_footer}""")
+
+# --- Chat area ---
+
+def _capability_bar_html(conv):
+    caps = cfg.get("capabilities", []) or [DEFAULT_CAP]
+    cur = conv.get("capability_id","")
+    has_msgs = bool([m for m in conv.get("messages",[]) if not m.get("deleted")])
+    opts = "".join(f'<option value="{_esc(c["id"])}" {"selected" if c["id"]==cur else ""}>{_esc(c.get("label",c["id"]))}</option>' for c in caps)
+    confirm_attr = ' hx-confirm="Switching may require reprocessing context for this conversation - continue?"' if has_msgs else ""
+    return f"""<select class="module-select" style="font-size:.72rem;max-width:12rem;margin:0" name="value" hx-post="/im/in" hx-target="body" hx-swap="none"
+                       hx-vals='{_iv("athena_capability_change", cid=conv["id"])}' hx-trigger="change" hx-include="this"{confirm_attr}>{opts}</select>
+               <button class="btn-icon" style="font-size:.75rem" hx-post="/im/in" hx-target="#ath-chat-area" hx-swap="innerHTML" hx-vals='{_iv("athena_conv_settings_open", cid=conv["id"])}' title="Conversation Settings">&#x2699;</button>"""
+
+def _file_chips_html(conv):
+    sid = conv["id"]
+    return "".join(f"""<span style="display:inline-flex;align-items:center;gap:.2rem;background:var(--accent_dim);border:var(--border-thick) solid var(--accent);color:var(--accent);padding:.1rem .1rem;border-radius:.3rem;font-size:.7rem; max-width:12rem">
+                            <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{_esc(f["name"])}">{_esc(f["name"][:20])}</span>
+                            <button style="background:none;border:none;cursor:pointer;color:var(--accent);font-size:.8rem; padding:0; flex-shrink:0;line-height:1" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_delete_file", cid=sid, fid=f["id"])}'>&#x2715;</button>
+                        </span>""" for f in conv.get("attached_files",[]))
 
 def _chat_html(conv, requests = None):
     sid=conv["id"]
-    pipes=cfg.get("pipelines",[])
-    pipe_sel=""
-    if pipes:
-        opts="".join(f'<option value="{p["name"]}" {"selected" if p["name"]==conv.get("pipeline","") else ""}>{_esc(p["label"])}</option>' for p in pipes)
-        pipe_sel=(f"""<select class="module-select" style="font-size:.7rem; max-width:9rem" hx-post="{_u("pipeline",sid)}" hx-trigger="change" hx-target="#ath-pipe-{sid}" hx-include="this" name="pipeline"><option value="">General</option>{opts}</select>""")
-    hdr=(f"""<span style="font-size:.8rem;font-weight:600;flex:1">{_esc(conv.get("title","Chat"))}</span>{pipe_sel}<div id="ath-pipe-{sid}" style="font-size:.7rem; color:var(--text_muted)"></div>""")
-    attached = conv.get("attached_files",[])
-    file_chips = "".join(f"""<span style="display:inline-flex;align-items:center;gap:.2rem;background:var(--accent_dim);border:var(--border-thick) solid var(--accent);color:var(--accent);padding:.1rem .1rem;border-radius:.3rem;font-size:.7rem; max-width:12rem">
-                                 <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="{_esc(f["name"])}">{_esc(f["name"][:20])}</span>
-                                 <button onclick="athDelFile('{sid}','{f["id"]}')" style="background:none;border:none;cursor:pointer;color:var(--accent);font-size:.8rem; padding:0; flex-shrink:0;line-height:1">&#x2715;</button>
-                             </span>""" for f in attached)
-    extra_footer = (f"""<div style="display:flex;align-items:center; gap:.2rem; flex-wrap:wrap;padding-top:.1rem">
-                            <label class="btn-icon" title="Attach file" style="cursor:pointer;font-size:.9rem;flex-shrink:0">&#x1F4CE;<input type="file" style="display:none" accept="image/*,.csv,.txt,.md,.xlsx,.xls" onchange="athUpload(this,'{sid}')" multiple></label>
-                            <div id="ath-files-{sid}" style="display:flex;gap:.2rem;flex-wrap:wrap;flex:1;min-width:0">{file_chips}</div>
-                        </div>""")
+    hdr=(f"""<span style="font-size:.8rem;font-weight:600;flex:1">{_esc(conv.get("title","Chat"))}</span>{_capability_bar_html(conv)}""")
+    extra_footer = ""
+    if cfg.get("allow_files", True):
+        extra_footer = (f"""<div style="display:flex;align-items:center; gap:.2rem; flex-wrap:wrap;padding-top:.1rem">
+                                <label class="btn-icon" title="Attach file" style="cursor:pointer;font-size:.9rem;flex-shrink:0">&#x1F4CE;
+                                    <input type="file" name="files" multiple style="display:none" accept="image/*,.csv,.txt,.md,.xlsx,.xls,.pdf" hx-post="/im/in" hx-target="body" hx-swap="none" hx-encoding="multipart/form-data" hx-trigger="change" hx-vals='{_iv("athena_upload", cid=sid)}'>
+                                </label>
+                                <div id="ath-files-{sid}" style="display:flex;gap:.2rem;flex-wrap:wrap;flex:1;min-width:0">{_file_chips_html(conv)}</div>
+                                <a class="cm-qbtn" href="{_u("export",sid)}" download>&#x2B07; Export</a>
+                            </div>""")
     buf=_STREAM_BUFFERS.get(sid)
     is_working=bool(buf and not buf.get("done"))
-    shell=CM.shell(sid, messages=conv.get("messages",[]), viewer_name=conv.get("user_display",""), header_html=hdr, extra_footer=extra_footer, is_working=is_working, stop_url=_u("stop",sid) if is_working else "")
+    shell=CM.shell(sid, messages=conv.get("messages",[]), viewer_name=conv.get("user_display",""), header_html=hdr, extra_footer=extra_footer,
+                   is_working=is_working, stop_url=_u("stop",sid) if is_working else "", owns_conversation=True)
     resume=""
     if is_working:
-        full=buf.get("full",""); tb=buf.get("thinking","")
+        full=buf.get("full","")
+        tb=buf.get("thinking","")
         think_html=(f"""<details class="cm-think" open><summary>&#x1F9E0; Thinking ({len(tb)//4}t)\u2026</summary><div class="cm-think-body">{_esc(tb)}</div></details>""") if tb.strip() else ""
         stream_content=think_html+(f'<div class="cm-stream-bubble">{_esc(full)}</div>' if full else "")
         resume=f'<script>document.getElementById("cm-stream-{sid}").innerHTML={json.dumps(stream_content)};</script>'
     scroll=f'<script>requestAnimationFrame(function(){{var m=document.getElementById("cm-msgs-{sid}");if(m)m.scrollTop=m.scrollHeight;}});</script>'
     return shell+resume+scroll
 
-# --- Main Route ---
+# --- Main route ---
 
 @router.get("")
 @router.get("/")
@@ -394,273 +448,501 @@ async def root(request:Request):
     conv=_load_conv(cid) if cid else None
     if not conv or conv.get("username")!=username:
         convs=_list_convs(username)
-        conv=_load_conv(convs[0].get("id","") or convs[0].get("_id","")) if convs else None
+        conv=_load_conv(convs[0].get("id","")) if convs else None
     if not conv: conv=_new_conv(user); _save_conv(conv)
     await ENV["set_state"](request, conv["id"], scope="user", namespace="athena", key="active_conv_id")
     return ENV["templates"].TemplateResponse(name = "base.html", request = request, context = {"request": request,"user": user, "nesting_level": 2, "shell_id": IM.branch_id,
                                                                                                "toolbars": {"left": UI.toolbar(side="left", content=f'<div id="ath-left" style="display:flex;flex-direction:column;height:100%;overflow:hidden">{_left(username, conv["id"])}', size="16rem", overlay=False, start_open=False, id="ath-left-bar", nesting_level=2)},
-                                                                                               "content":f'<div id="ath-chat-area" style="height:100%; overflow:hidden;">{_chat_html(conv,request)}</div>', "extra_css": CSS + CM.CSS, "extra_script": EXTRA_JS + CM.SCRIPT})
+                                                                                               "content":f'<div id="ath-chat-area" style="height:100%; overflow:hidden;">{_chat_html(conv,request)}</div>', "extra_css": CM.CSS, "extra_script": CM.SCRIPT})
 
-@router.post("/new")
-async def conv_new(request:Request):
+# --- Intent handlers: conversation lifecycle ---
+
+async def _h_new(request, payload, imr):
     user=request.state.user
     conv=_new_conv(user)
     _save_conv(conv)
     await ENV["set_state"](request,conv["id"],scope="user",namespace="athena",key="active_conv_id")
-    return HTMLResponse(_chat_html(conv,request)+f'<div id="ath-left" hx-swap-oob="innerHTML">{_left(user.username,conv["id"])}</div>')
+    return imr.raw(_chat_html(conv,request)+f'<div id="ath-left" hx-swap-oob="innerHTML">{_left(user.username,conv["id"])}</div>')
 
-@router.get("/load/{cid}")
-async def conv_load(cid:str, request:Request):
-    user=request.state.user; conv=_load_conv(cid)
-    if not conv or conv.get("username")!=user.username: return HTMLResponse("Not found",status_code=404)
+async def _h_load(request, payload, imr):
+    user=request.state.user; cid=payload.get("cid","")
+    conv=_load_conv(cid)
+    if not conv or conv.get("username")!=user.username: return imr.raw("Not found")
     await ENV["set_state"](request,cid,scope="user",namespace="athena",key="active_conv_id")
-    return HTMLResponse(_chat_html(conv,request)+f'<div id="ath-left" hx-swap-oob="innerHTML">{_left(user.username,cid)}</div>')
+    return imr.raw(_chat_html(conv,request)+f'<div id="ath-left" hx-swap-oob="innerHTML">{_left(user.username,cid)}</div>')
 
-@router.post("/stop/{sid}")
-async def conv_stop(sid:str): _STOP_FLAGS[sid]=True; return HTMLResponse("")
-
-@router.post("/conv/delete/{cid}")
-async def delete_conv(cid: str, request: Request):
+async def _h_conv_delete(request, payload, imr):
     user = request.state.user
+    cid = payload.get("cid","")
     conv = _load_conv(cid)
     if conv and conv.get("username") == user.username: _del_conv(cid)
-    org = _org(user.username); org.get("conv_folders",{}).pop(cid, None); _save_org(user.username, org)
+    org = _org(user.username)
+    org.get("conv_folders",{}).pop(cid, None)
+    _save_org(user.username, org)
     remaining = _list_convs(user.username)
+    active = await ENV["get_state"](request, scope="user", namespace="athena", key="active_conv_id")
+    if active != cid:
+        imr.oob(_left(user.username, active), "ath-left", swap="innerHTML")
+        return imr
     if remaining:
-        next_cid = remaining[0].get("id","") or remaining[0].get("_id","")
+        next_cid = remaining[0].get("id","")
         next_conv = _load_conv(next_cid)
         if next_conv:
             await ENV["set_state"](request, next_cid, scope="user", namespace="athena", key="active_conv_id")
-            return HTMLResponse(_chat_html(next_conv, request) + f'<div id="ath-left" hx-swap-oob="innerHTML">{_left(user.username, next_cid)}</div>')
-    new_conv = _new_conv(user); _save_conv(new_conv)
+            imr.oob(_chat_html(next_conv, request), "ath-chat-area", swap="innerHTML")
+            imr.oob(_left(user.username, next_cid), "ath-left", swap="innerHTML")
+            return imr
+    new_conv = _new_conv(user)
+    _save_conv(new_conv)
     await ENV["set_state"](request, new_conv["id"], scope="user", namespace="athena", key="active_conv_id")
-    return HTMLResponse(_chat_html(new_conv, request) + f'<div id="ath-left" hx-swap-oob="innerHTML">{_left(user.username, new_conv["id"])}</div>')
+    imr.oob(_chat_html(new_conv, request), "ath-chat-area", swap="innerHTML")
+    imr.oob(_left(user.username, new_conv["id"]), "ath-left", swap="innerHTML")
+    return imr
 
-@router.post("/conv/rename/{cid}")
-async def conv_rename(cid:str, request:Request):
-    form=await request.form(); user=request.state.user; conv=_load_conv(cid)
-    if not conv or conv.get("username")!=user.username: return HTMLResponse("")
-    conv["title"]=form.get("value","").strip() or conv.get("title","Chat"); _save_conv(conv)
-    return HTMLResponse(_left(user.username,cid))
-
-@router.get("/conv/rename_form/{cid}")
-async def conv_rename_form(cid:str):
+async def _h_conv_rename_form(request, payload, imr):
+    cid = payload.get("cid","")
     conv=_load_conv(cid)
-    if not conv: return HTMLResponse("")
-    return HTMLResponse(f"""<div id="ath-ci-{cid}" style="padding:.25rem .4rem;display:flex;gap:.25rem"><form hx-post="{_u("conv","rename",cid)}" hx-target="#ath-left" hx-swap="innerHTML" style="display:flex;gap:.25rem;width:100%"><input type="text" name="value" value="{_esc(conv.get("title",""))}" class="module-select" style="flex:1;font-size:.75rem" autofocus onclick="event.stopPropagation()"><button type="submit" class="btn-icon" onclick="event.stopPropagation()">&#x2713;</button></form></div>""")
+    if not conv: return imr
+    return imr.oob(f"""<div id="ath-ci-{cid}" style="padding:.25rem .4rem;display:flex;gap:.25rem"><form hx-post="/im/in" hx-target="body" hx-swap="none" style="display:flex;gap:.25rem;width:100%">
+                            <input type="hidden" name="type" value="athena_conv_rename">
+                            <input type="hidden" name="cid" value="{cid}">
+                            <input type="hidden" name="lvl" value="2">
+                            <input type="text" name="value" value="{_esc(conv.get("title",""))}" class="module-select" style="flex:1;font-size:.75rem" autofocus onclick="event.stopPropagation()">
+                            <button type="submit" class="btn-icon" onclick="event.stopPropagation()">&#x2713;</button>
+                            </form>
+                        </div>""", f"ath-ci-{cid}", swap="outerHTML")
 
-@router.post("/msg/delete")
-async def msg_delete(request:Request):
-    form = await request.form()
-    mid = form.get("id", "")
+async def _h_conv_rename(request, payload, imr):
     user = request.state.user
-    conv, idx, m=_find_msg(user.username,mid)
-    if conv and m: conv["messages"][idx]["deleted"]=True; _save_conv(conv)
-    return HTMLResponse("")
+    cid = payload.get("cid", "")
+    conv = _load_conv(cid)
+    if not conv or conv.get("username")!=user.username: return imr
+    conv["title"]=payload.get("value","").strip() or conv.get("title","Chat")
+    _save_conv(conv)
+    return imr.oob(_left(user.username, cid), "ath-left", swap="innerHTML")
 
-@router.get("/msg/edit_form/{mid}")
-async def msg_edit_form(mid:str, request:Request):
-    user=request.state.user; conv,idx,m=_find_msg(user.username,mid)
-    if not conv or not m: return HTMLResponse("")
-    role_cls="cm-me" if m.get("role")=="user" else "cm-other"; avatar=CM._avatar_html(m.get("user_name","?"))
-    return HTMLResponse(f"""<div class="cm-msg {role_cls}" id="cm-msg-{mid}" data-msg-id="{mid}">{avatar}<div class="cm-bwrap" style="max-width:90%"><form hx-post="{_u("msg","edit_save",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML" style="display:flex;flex-direction:column;gap:.3rem;width:100%"><textarea name="content" class="cm-input" style="min-height:4rem;overflow-y:auto">{_esc(m.get("content",""))}</textarea><div style="display:flex;gap:.3rem"><button type="submit" class="button" style="font-size:.75rem;margin-top:0">Save</button><button type="button" class="btn-icon" hx-get="{_u("msg","cancel_edit",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML">Cancel</button></div></form></div></div>""")
+# --- Intent handlers: folders ---
 
-@router.post("/msg/edit_save/{mid}")
-async def msg_edit_save(mid:str, request:Request):
-    form=await request.form(); user=request.state.user; conv,idx,m=_find_msg(user.username,mid)
-    if not conv or not m: return HTMLResponse("")
-    conv["messages"][idx]["content"]=form.get("content","").strip(); conv["messages"][idx]["edited"]=True; _save_conv(conv)
-    is_me=m.get("role")=="user"
-    return HTMLResponse(CM.render_message(conv["messages"][idx],is_me=is_me,can_delete=True,can_edit=is_me))
+async def _h_folder_new_form(request, payload, imr):
+    return imr.oob(f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" style="display:flex;gap:.3rem;padding:.3rem .5rem;border-bottom:var(--border-thick) solid var(--border)">
+                            <input type="hidden" name="type" value="athena_folder_create"><input type="hidden" name="lvl" value="2">
+                            <input type="text" name="name" class="module-select" placeholder="Folder name" style="flex:1;font-size:.75rem" required>
+                            <button type="submit" class="btn-icon">&#x2713;</button>
+                            <button type="button" class="btn-icon" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_folder_cancel")}'>&#x2715;</button>
+                        </form>""", "ath-folder-new", swap="innerHTML")
 
-@router.get("/msg/cancel_edit/{mid}")
-async def msg_cancel_edit(mid:str, request:Request):
-    user=request.state.user; conv,_,m=_find_msg(user.username,mid)
-    if not conv or not m: return HTMLResponse("")
-    is_me=m.get("role")=="user"
-    return HTMLResponse(CM.render_message(m,is_me=is_me,can_delete=True,can_edit=is_me))
+async def _h_folder_cancel(request, payload, imr): return imr.oob("", "ath-folder-new", swap="innerHTML")
 
-@router.post("/msg/retry/{mid}")
-async def msg_retry(mid:str, request:Request):
-    user=request.state.user; conv,idx,m=_find_msg(user.username,mid)
-    if not conv or not m: return HTMLResponse("")
-    role_cls="cm-me" if m.get("role")=="user" else "cm-other"; avatar=CM._avatar_html(m.get("user_name","?"))
-    return HTMLResponse(f"""<div class="cm-msg {role_cls}" id="cm-msg-{mid}" data-msg-id="{mid}">{avatar}<div class="cm-bwrap" style="max-width:90%"><form hx-post="{_u("msg","retry_send",mid)}" hx-target="#cm-msgs-{conv["id"]}" hx-swap="outerHTML" style="display:flex;flex-direction:column;gap:.3rem;width:100%"><textarea name="content" class="cm-input" style="min-height:4rem">{_esc(m.get("content",""))}</textarea><div style="display:flex;gap:.3rem"><button type="submit" class="button" style="font-size:.75rem;margin-top:0">&#x21BA; Retry</button><button type="button" class="btn-icon" hx-get="{_u("msg","cancel_edit",mid)}" hx-target="#cm-msg-{mid}" hx-swap="outerHTML">Cancel</button></div></form></div></div>""")
+async def _h_folder_create(request, payload, imr):
+    user = request.state.user
+    name=payload.get("name","").strip()
+    if not name: return imr
+    org=_org(user.username)
+    org.setdefault("folders",{})[f"f_{uuid.uuid4().hex[:8]}"]={"name":name,"order":len(org.get("folders",{}))}
+    _save_org(user.username,org)
+    active=await ENV["get_state"](request, scope="user", namespace="athena", key="active_conv_id")
+    imr.oob(_left(user.username, active or ""), "ath-left", swap="innerHTML")
+    imr.oob("", "ath-folder-new", swap="innerHTML")
+    return imr
 
-@router.post("/msg/retry_send/{mid}")
-async def msg_retry_send(mid:str, request:Request):
-    form=await request.form(); user=request.state.user; new_content=form.get("content","").strip()
-    conv,idx,m=_find_msg(user.username,mid)
-    if not conv or not m: return HTMLResponse("")
-    conv["messages"][idx]["content"]=new_content; conv["messages"][idx]["edited"]=True
-    conv["messages"]=conv["messages"][:idx+1]; _save_conv(conv); sid=conv["id"]
-    remaining="".join(CM.render_message(msg,is_me=(msg.get("role")=="user"),can_delete=True,can_edit=(msg.get("role")=="user")) for msg in conv["messages"] if not msg.get("deleted"))
-    asyncio.create_task(_do_stream(user.username,{"content":new_content,"cid":sid},sid))
-    return HTMLResponse(f'<div id="cm-msgs-{sid}" class="cm-msgs" data-pinned="true" hx-swap-oob="outerHTML">{remaining}</div>')
-
-@router.get("/folder/new_form")
-async def folder_new_form(): return HTMLResponse(f"""<form hx-post="{_u("folder","create")}" hx-target="#ath-left" hx-swap="innerHTML" style="display:flex;gap:.3rem;padding:.3rem .5rem;border-bottom:var(--border-thick) solid var(--border)"><input type="text" name="name" class="module-select" placeholder="Folder name" style="flex:1;font-size:.75rem" required><button type="submit" class="btn-icon">&#x2713;</button><button type="button" class="btn-icon" hx-get="{_u("folder","cancel")}" hx-target="#ath-folder-new" hx-swap="innerHTML">&#x2715;</button></form>""")
-
-@router.get("/folder/cancel")
-async def folder_cancel(): return HTMLResponse("")
-
-@router.post("/folder/create")
-async def folder_create(request:Request):
-    form=await request.form(); name=form.get("name","").strip(); user=request.state.user
-    if not name: return HTMLResponse(_left(user.username,""))
-    org=_org(user.username); fid=f"f_{uuid.uuid4().hex[:8]}"
-    org.setdefault("folders",{})[fid]={"name":name,"order":len(org.get("folders",{}))}; _save_org(user.username,org)
-    active=await ENV["get_state"](request,scope="user",namespace="athena",key="active_conv_id")
-    return HTMLResponse(_left(user.username,active or ""))
-
-@router.post("/folder/delete/{fid}")
-async def folder_delete(fid:str, request:Request):
-    user=request.state.user; org=_org(user.username)
+async def _h_folder_delete(request, payload, imr):
+    user = request.state.user
+    fid=payload.get("fid","")
+    org=_org(user.username)
     org.get("folders",{}).pop(fid,None)
     for cid,f in list(org.get("conv_folders",{}).items()):
         if f==fid: org["conv_folders"].pop(cid)
     _save_org(user.username,org)
-    active=await ENV["get_state"](request,scope="user",namespace="athena",key="active_conv_id")
-    return HTMLResponse(_left(user.username,active or ""))
+    active=await ENV["get_state"](request,scope="user", namespace="athena", key="active_conv_id")
+    return imr.oob(_left(user.username, active or ""), "ath-left", swap="innerHTML")
 
-@router.get("/folder/rename_form/{fid}")
-async def folder_rename_form(fid:str): return HTMLResponse(f"""<span id="ath-fn-{fid}" style="display:inline-flex;align-items:center;gap:.2rem"><form hx-post="{_u("folder","rename",fid)}" hx-target="#ath-left" hx-swap="innerHTML" style="display:inline-flex;gap:.2rem" onclick="event.stopPropagation()"><input type="text" name="name" class="module-select" style="font-size:.7rem;width:8rem" autofocus><button type="submit" class="btn-icon">&#x2713;</button></form></span>""")
+async def _h_folder_rename_form(request, payload, imr):
+    fid = payload.get("fid","")
+    return imr.oob(f"""<span id="ath-fn-{fid}" style="display:inline-flex;align-items:center;gap:.2rem">
+                           <form hx-post="/im/in" hx-target="body" hx-swap="none" style="display:inline-flex;gap:.2rem" onclick="event.stopPropagation()">
+                               <input type="hidden" name="type" value="athena_folder_rename">
+                               <input type="hidden" name="fid" value="{fid}">
+                               <input type="hidden" name="lvl" value="2">
+                               <input type="text" name="name" class="module-select" style="font-size:.7rem;width:8rem" autofocus>
+                               <button type="submit" class="btn-icon">&#x2713;</button>
+                            </form>
+                        </span>""", f"ath-fn-{fid}", swap="outerHTML")
 
-@router.post("/folder/rename/{fid}")
-async def folder_rename(fid:str, request:Request):
-    form=await request.form(); name=form.get("name","").strip(); user=request.state.user
-    org=_org(user.username)
-    if name and fid in org.get("folders",{}): org["folders"][fid]["name"]=name; _save_org(user.username,org)
-    active=await ENV["get_state"](request,scope="user",namespace="athena",key="active_conv_id")
-    return HTMLResponse(_left(user.username,active or ""))
-
-@router.post("/folder/assign/{cid}")
-async def folder_assign(cid:str, request:Request):
-    form=await request.form(); fid=form.get("folder_id",""); user=request.state.user
-    org=_org(user.username); org.setdefault("conv_folders",{})[cid]=fid if fid else None; _save_org(user.username,org)
-    active=await ENV["get_state"](request,scope="user",namespace="athena",key="active_conv_id")
-    return HTMLResponse(_left(user.username,active or ""))
-
-@router.get("/prompts/dropdown")
-async def get_prompt_dropdown():
-    prompts = _list_prompts()
-    options = "".join(f'<option value="{p["id"]}">{_esc(p["name"])}</option>' for p in prompts)
-    return HTMLResponse(f"""<select name="system_prompt_id" class="ath-dropdown"><option value="">-- Select Saved Prompt --</option>{options}</select>""")
-
-@router.post("/pipeline/{sid}")
-async def pipeline(sid:str, request:Request):
-    form=await request.form(); conv=_load_conv(sid)
-    if not conv: return HTMLResponse("")
-    pl=form.get("pipeline","")
-    pipe=next((p for p in cfg.get("pipelines",[]) if p.get("name")==pl),None)
-    conv["pipeline"]=pl; conv["system_prompt"]=pipe.get("system_prompt","") if pipe else cfg.get("system_prompt",""); _save_conv(conv)
-    return HTMLResponse(f'<span style="color:#00ffa2;font-size:.68rem">Pipeline: {_esc(pipe["label"] if pipe else "General")}</span>')
-
-@router.post("/admin/save")
-async def save(request: Request):
-    form = dict(await request.form())
-    group = cfg.get_group("general")
-    group.save(form)
-    return HTMLResponse("""<div id="settings-modal-container" hx-swap-oob="true"></div><div id="status" hx-swap-oob="true">Saved successfully.</div>""")
-
-@router.get("/admin")
-async def admin(request: Request):
-    if getattr(request.state.user, "role", "") != "admin": return HTMLResponse("Denied")
-    all_data = cfg.get_all()
-    group = cfg.get_group("general")
-    return HTMLResponse(f"""<div style="padding:0.5rem;position:relative">
-        <button type="button" class="close-btn" style="position:absolute;top:.2rem;right:.2rem" hx-get="{_u()}" hx-target="#ait-workspace" hx-swap="innerHTML">&#x2715;</button>
-        <form hx-post="{_u("admin","save")}" hx-target="#status">
-            <div id="athena-admin-fields">{group.render(all_data.get("general", {}))}</div>
-            <button type="submit" class="button" style="margin-top:1rem;">Save Settings</button>
-            <div id="status" style="margin-top:0.5rem; font-size:0.7rem; color:#00ffa2;"></div>
-        </form>
-    </div>""")
-
-@router.get("/admin/fields")
-async def admin_fields(request: Request):
-    """Target endpoint fired by HTMX change events to dynamically calculate transient field lists."""
-    if getattr(request.state.user, "role", "") != "admin": return HTMLResponse("Denied")
-    all_data = cfg.get_all()
-    values = all_data.get("general", {})
-    # Intercept live UI changes from HTMX query params before submission saves them
-    live_conn_id = request.query_params.get("conn_id")
-    if live_conn_id is not None: values["conn_id"] = live_conn_id
-    group = cfg.get_group("general")
-    return HTMLResponse(group.render(values))
-
-@router.post("/upload/{cid}")
-async def upload_file(cid: str, request: Request):
+async def _h_folder_rename(request, payload, imr):
     user = request.state.user
+    name=payload.get("name","").strip()
+    fid=payload.get("fid","")
+    org=_org(user.username)
+    if name and fid in org.get("folders",{}): org["folders"][fid]["name"]=name
+    _save_org(user.username,org)
+    active=await ENV["get_state"](request,scope="user",namespace="athena",key="active_conv_id")
+    return imr.oob(_left(user.username,active or ""), "ath-left", swap="innerHTML")
+
+async def _h_folder_assign(request, payload, imr):
+    user = request.state.user
+    cid=payload.get("cid","")
+    fid=payload.get("value","")
+    org=_org(user.username)
+    org.setdefault("conv_folders",{})[cid]=fid if fid else None
+    _save_org(user.username,org)
+    active=await ENV["get_state"](request,scope="user",namespace="athena",key="active_conv_id")
+    return imr.oob(_left(user.username,active or ""), "ath-left", swap="innerHTML")
+
+# --- Intent handlers: messages ---
+
+async def _h_msg_delete(request, payload, imr):
+    mid = payload.get("id","")
+    conv, idx, m = _find_msg(request.state.user.username, mid)
+    if conv and m:
+        conv["messages"][idx]["deleted"]=True
+        _save_conv(conv)
+    return imr.oob("", f"cm-msg-{mid}", swap="outerHTML")
+
+async def _h_msg_edit_form(request, payload, imr):
+    mid = payload.get("id","")
+    conv, idx, m = _find_msg(request.state.user.username, mid)
+    if not conv or not m: return imr
+    role_cls="cm-me" if m.get("role")=="user" else "cm-other"
+    avatar=CM._avatar_html(m.get("user_name","?"))
+    return imr.oob(f"""<div class="cm-msg {role_cls}" id="cm-msg-{mid}" data-msg-id="{mid}">
+                           {avatar}
+                           <div class="cm-bwrap" style="max-width:90%">
+                               <form hx-post="/im/in" hx-target="body" hx-swap="none" style="display:flex;flex-direction:column;gap:.3rem;width:100%">
+                                   <input type="hidden" name="type" value="athena_msg_edit_save">
+                                   <input type="hidden" name="id" value="{mid}"><input type="hidden" name="lvl" value="2">
+                                   <textarea name="content" class="cm-input" style="min-height:4rem;overflow-y:auto">{_esc(m.get("content",""))}</textarea>
+                                   <div style="display:flex;gap:.3rem">
+                                       <button type="submit" class="button" style="font-size:.75rem;margin-top:0">Save</button>
+                                       <button type="button" class="btn-icon" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_msg_cancel_edit", id=mid)}'>Cancel</button>
+                                   </div>
+                               </form>
+                            </div>
+                        </div>""", f"cm-msg-{mid}", swap="outerHTML")
+
+async def _h_msg_edit_save(request, payload, imr):
+    mid = payload.get("id","")
+    conv, idx, m = _find_msg(request.state.user.username, mid)
+    if not conv or not m: return imr
+    conv["messages"][idx]["content"]=payload.get("content","").strip()
+    conv["messages"][idx]["edited"]=True
+    _save_conv(conv)
+    is_me=m.get("role")=="user"
+    return imr.oob(CM.render_message(conv["messages"][idx],is_me=is_me,can_delete=True,can_edit=is_me), f"cm-msg-{mid}", swap="outerHTML")
+
+async def _h_msg_cancel_edit(request, payload, imr):
+    mid = payload.get("id","")
+    conv, _, m = _find_msg(request.state.user.username, mid)
+    if not conv or not m: return imr
+    is_me=m.get("role")=="user"
+    return imr.oob(CM.render_message(m,is_me=is_me,can_delete=True,can_edit=is_me), f"cm-msg-{mid}", swap="outerHTML")
+
+async def _h_msg_retry(request, payload, imr):
+    mid = payload.get("id","")
+    conv, idx, m = _find_msg(request.state.user.username, mid)
+    if not conv or not m: return imr
+    role_cls="cm-me" if m.get("role")=="user" else "cm-other"
+    avatar=CM._avatar_html(m.get("user_name","?"))
+    return imr.oob(f"""<div class="cm-msg {role_cls}" id="cm-msg-{mid}" data-msg-id="{mid}">
+                           {avatar}
+                           <div class="cm-bwrap" style="max-width:90%">
+                               <form hx-post="/im/in" hx-target="body" hx-swap="none" style="display:flex;flex-direction:column;gap:.3rem;width:100%">
+                                   <input type="hidden" name="type" value="athena_msg_retry_send"><input type="hidden" name="id" value="{mid}">
+                                   <input type="hidden" name="lvl" value="2">
+                                   <textarea name="content" class="cm-input" style="min-height:4rem">{_esc(m.get("content",""))}</textarea>
+                                   <div style="display:flex;gap:.3rem">
+                                       <button type="submit" class="button" style="font-size:.75rem;margin-top:0">&#x21BA; Retry</button>
+                                       <button type="button" class="btn-icon" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_msg_cancel_edit", id=mid)}'>Cancel</button>
+                                   </div>
+                               </form>
+                            </div>
+                        </div>""", f"cm-msg-{mid}", swap="outerHTML")
+
+async def _h_msg_retry_send(request, payload, imr):
+    user = request.state.user
+    new_content=payload.get("content","").strip()
+    mid=payload.get("id","")
+    conv, idx, m = _find_msg(user.username, mid)
+    if not conv or not m: return imr
+    conv["messages"][idx]["content"]=new_content
+    conv["messages"][idx]["edited"]=True
+    conv["messages"]=conv["messages"][:idx+1]
+    _save_conv(conv)
+    sid=conv["id"]
+    remaining="".join(CM.render_message(msg,is_me=(msg.get("role")=="user"), can_delete=True, can_edit=(msg.get("role")=="user")) for msg in conv["messages"] if not msg.get("deleted"))
+    cap = _resolve_capability(conv)
+    target = _do_stream_pipeline if cap.get("flow_pipeline_id") else _do_stream
+    asyncio.create_task(target(user.username,{"content":new_content},sid,skip_user_append=True))
+    return imr.oob(f'<div id="cm-msgs-{sid}" class="cm-msgs" data-pinned="true">{remaining}</div>', f"cm-msgs-{sid}", swap="outerHTML")
+
+# --- Intent handlers: attachments ---
+
+async def _h_upload(request, payload, imr):
+    cid = payload.get("cid","")
     conv = _load_conv(cid)
-    if not conv or conv.get("username") != user.username: return HTMLResponse("Unauthorized", status_code=403)
-    form = await request.form()
-    files = form.getlist("files")
+    if not conv or conv.get("username") != request.state.user.username: return imr
+    files_raw = payload.get("files")
+    files = files_raw if isinstance(files_raw, list) else ([files_raw] if files_raw else [])
     up_dir = _uploads_dir(cid)
     for f in files:
-        if not f.filename: continue
+        if not getattr(f, "filename", ""): continue
         fid = uuid.uuid4().hex[:8]
         ext = Path(f.filename).suffix
         save_path = up_dir / f"{fid}{ext}"
-        with open(save_path, "wb") as out:
-            shutil.copyfileobj(f.file, out)
-        conv.setdefault("attached_files", []).append({ "id": fid, "name": f.filename, "path": str(save_path), "ext": ext})
+        save_path.write_bytes(await f.read())
+        conv.setdefault("attached_files", []).append({"id": fid, "name": f.filename, "path": str(save_path), "ext": ext})
     _save_conv(conv)
-    return HTMLResponse("".join(f"""<span style="background:var(--glass);padding:.1rem .3rem;border-radius:.3rem; display:inline-flex;align-items:center;gap:.2rem">{_esc(f["name"])}<button onclick="athDelFile('{cid}','{f["id"]}')" style="background:none;border:none;cursor:pointer;color:#ff5f5f;font-size:.8rem;padding:0">&#x2715;</button></span>""" for f in conv.get("attached_files",[])))
+    return imr.oob(_file_chips_html(conv), f"ath-files-{cid}", swap="innerHTML")
 
-    for f in files:
-        if not f.filename: continue
-        fid = uuid.uuid4().hex[:8]
-        ext = Path(f.filename).suffix
-        save_path = up_dir / f"{fid}{ext}"
-        with open(save_path, "wb") as out:
-            shutil.copyfileobj(f.file, out)
-        conv.setdefault("attached_files", []).append({ "id": fid, "name": f.filename, "path": str(save_path), "ext": ext})
-    _save_conv(conv)
-    return HTMLResponse("".join(f"""<span style="background:var(--glass);padding:.1rem .3rem;border-radius:.3rem; display:inline-flex;align-items:center;gap:.2rem">{_esc(f["name"])}<button onclick="athDelFile('{cid}','{f["id"]}')" style="background:none;border:none;cursor:pointer;color:#ff5f5f;font-size:.8rem;padding:0">&#x2715;</button></span>""" for f in conv.get("attached_files",[])))
-
-@router.post("/delete_file/{cid}/{fid}")
-async def delete_file(cid: str, fid: str, request: Request):
-    user = request.state.user
+async def _h_delete_file(request, payload, imr):
+    cid, fid = payload.get("cid",""), payload.get("fid","")
     conv = _load_conv(cid)
-    if not conv or conv.get("username") != user.username: return HTMLResponse("")
+    if not conv or conv.get("username") != request.state.user.username: return imr
     files = conv.get("attached_files", [])
-    conv["attached_files"] = [f for f in files if f["id"] != fid]
     for f in files:
         if f["id"] == fid:
             p = Path(f["path"])
             if p.exists(): p.unlink()
             break
+    conv["attached_files"] = [f for f in files if f["id"] != fid]
     _save_conv(conv)
-    return HTMLResponse("".join(f"""<span style="background:var(--glass);padding:.1rem .3rem;border-radius:.3rem; display:inline-flex;align-items:center;gap:.2rem">{_esc(f["name"])}<button onclick="athDelFile('{cid}','{f["id"]}')" style="background:none;border:none;cursor:pointer;color:#ff5f5f;font-size:.8rem;padding:0">&#x2715;</button></span>""" for f in conv.get("attached_files",[])))
+    return imr.oob(_file_chips_html(conv), f"ath-files-{cid}", swap="innerHTML")
+
+# --- Intent handlers: capability + conversation settings ---
+
+async def _h_capability_change(request, payload, imr):
+    cid = payload.get("cid","")
+    conv = _load_conv(cid)
+    if not conv or conv.get("username") != request.state.user.username: return imr
+    conv["capability_id"] = payload.get("value","")
+    _save_conv(conv)
+    imr.oob(_chat_html(conv, request), "ath-chat-area", swap="innerHTML")
+    return imr
+
+async def _h_conv_settings_open(request, payload, imr):
+    cid = payload.get("cid","")
+    conv = _load_conv(cid)
+    if not conv or conv.get("username") != request.state.user.username: return imr
+    cap = _resolve_capability(conv)
+    return imr.raw(f"""<div style="padding:1rem;height:100%;overflow-y:auto;box-sizing:border-box;max-width:40rem;margin:0 auto">
+                           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.8rem">
+                               <h3 style="margin:0">Conversation Settings</h3>
+                               <button class="close-btn" hx-post="/im/in" hx-target="#ath-chat-area" hx-swap="innerHTML" hx-vals='{_iv("athena_load", cid=cid)}'>&#x2715;</button>
+                           </div>
+                           <div style="font-size:.75rem;color:var(--text_muted);margin-bottom:.8rem">Currently: <b>{_esc(cap.get("label",""))}</b> - {_esc(cap.get("model","(no model configured)"))}. These fields override that capability's defaults for this conversation only.</div>
+                           <form hx-post="/im/in" hx-target="#ath-chat-area" hx-swap="innerHTML" style="display:flex;flex-direction:column;gap:.7rem">
+                               <input type="hidden" name="type" value="athena_conv_settings_save"><input type="hidden" name="cid" value="{cid}"><input type="hidden" name="lvl" value="2">
+                               <label style="font-size:.8rem;color:var(--text_muted)">System Prompt Override (blank = use capability default)
+                                   <textarea name="system_prompt_override" class="cm-input" rows="4">{_esc(conv.get("system_prompt_override",""))}</textarea>
+                               </label>
+                               <label style="font-size:.8rem;color:var(--text_muted)">Context Tokens Override (blank = use capability default: {cap.get("model_ctx",16384)})
+                                   <input type="number" name="model_ctx_override" value="{conv.get("model_ctx_override") or ""}" class="module-select">
+                               </label>
+                               <button type="submit" class="button">Save</button>
+                           </form>
+                       </div>""")
+
+async def _h_conv_settings_save(request, payload, imr):
+    cid = payload.get("cid","")
+    conv = _load_conv(cid)
+    if not conv or conv.get("username") != request.state.user.username: return imr
+    conv["system_prompt_override"] = payload.get("system_prompt_override","")
+    ctx_raw = payload.get("model_ctx_override","")
+    conv["model_ctx_override"] = int(ctx_raw) if str(ctx_raw).strip().isdigit() else None
+    _save_conv(conv)
+    return imr.raw(_chat_html(conv, request))
+
+# --- Intent handlers: export / import ---
+
+async def _h_import_form(request, payload, imr): return imr.raw(f"""<div style="padding:1rem;max-width:36rem;margin:0 auto">
+                                                                        <h3>Import Conversation</h3>
+                                                                        <p style="font-size:.75rem;color:var(--text_muted)">Paste text exported from this same feature (or hand-format as **You:**/**Assistant:** blocks).</p>
+                                                                        <form hx-post="/im/in" hx-target="#ath-chat-area" hx-swap="innerHTML">
+                                                                            <input type="hidden" name="type" value="athena_import"><input type="hidden" name="lvl" value="2">
+                                                                            <textarea name="text" class="cm-input" rows="14" style="width:100%"></textarea>
+                                                                            <button type="submit" class="button" style="margin-top:.5rem">Import</button>
+                                                                        </form>
+                                                                    </div>""")
+
+async def _h_import(request, payload, imr):
+    user = request.state.user
+    raw = payload.get("text","").strip()
+    if not raw: return imr
+    conv = _new_conv(user)
+    for block in re.split(r'\n(?=\*\*(?:You|Assistant):\*\*)', raw):
+        m = re.match(r'\*\*(You|Assistant):\*\*\s*(.*)', block.strip(), re.S)
+        if not m: continue
+        conv["messages"].append({"id":uuid.uuid4().hex[:8],"role":"user" if m.group(1)=="You" else "assistant","content":m.group(2).strip(),"user_name":user.username,"timestamp":datetime.utcnow().isoformat()})
+    conv["title"] = (conv["messages"][0]["content"][:50] if conv["messages"] else "Imported Chat")
+    _save_conv(conv)
+    await ENV["set_state"](request, conv["id"], scope="user", namespace="athena", key="active_conv_id")
+    imr.raw(_chat_html(conv, request))
+    imr.oob(_left(user.username,conv["id"]), "ath-left", swap="innerHTML")
+    return imr
+
+@router.get("/export/{cid}")
+async def export_conv(cid: str, request: Request):
+    """Real file download, browser-fetched - legitimate plain route, matches the pattern used for image/document downloads elsewhere in this codebase (not a mutation, not a fragment update)."""
+    conv = _load_conv(cid)
+    if not conv or conv.get("username") != request.state.user.username: raise HTTPException(404)
+    lines = [f"# {conv.get('title','Chat')}", ""]
+    for m in conv.get("messages",[]):
+        if m.get("deleted"): continue
+        lines.append(f"**{'You' if m.get('role')=='user' else 'Assistant'}:** {m.get('content','')}\n")
+    md = "\n".join(lines)
+    fname = re.sub(r'[^\w\-. ]', '_', conv.get("title","chat"))[:40] or "chat"
+    return Response(md, media_type="text/markdown", headers={"Content-Disposition": f'attachment; filename="{fname}.md"'})
+
+@router.post("/stop/{sid}")
+async def conv_stop(sid:str):
+    """Kept as a plain route: ChatManager.working_html's stop_url is a shared-component contract expecting a URL string (used identically by Tessa).
+    Converting this one button to an intent means changing that shared contract, which is a real, worthwhile core-file change - flagged for a deliberate pass, not done silently here since it affects more than this module."""
+    _STOP_FLAGS[sid]=True
+    return HTMLResponse("")
+
+# --- Admin: general settings ---
+
+async def _h_admin_save(request, payload, imr):
+    """Loads current disk state and updates only the fields THIS form actually submits, skipping 'capabilities' entirely (managed by its own editor below).
+    Deliberately does not call SettingsGroup.save() here - that method treats a call as authoritative for every registered field, which would silently reset capabilities to their default every time the general form is saved without them."""
+    if getattr(request.state.user, "role", "") != "admin": return imr
+    group = cfg.get_group("general")
+    data = group.load()
+    for field in group.fields:
+        if field.name == "capabilities": continue
+        raw = payload.get(field.name)
+        if field.type == "checkbox": data[field.name] = raw is not None
+        elif field.type == "json":
+            try: data[field.name] = json.loads(raw) if raw and raw.strip() else field.default
+            except Exception: data[field.name] = field.default
+        elif field.type == "number":
+            try: data[field.name] = float(raw) if field.step != 1 else int(raw)
+            except Exception: data[field.name] = field.default
+        else: data[field.name] = raw if raw is not None else field.default
+    group.json_path.write_text(json.dumps(data, indent=2))
+    return imr.raw('<span style="color:var(--accent)">&#x2713; Saved successfully.</span>')
+
+# --- Admin: capability editor (add/remove/edit blocks) ---
+
+def _save_capabilities(caps):
+    """Writes just the 'capabilities' key, preserving every other saved field - same non-destructive load-merge-write pattern as _h_admin_save, for the same reason."""
+    data = cfg.get_group("general").load()
+    data["capabilities"] = caps
+    cfg.get_group("general").json_path.write_text(json.dumps(data, indent=2))
+
+def _cap_by_id(caps, cap_id): return next((c for c in caps if c.get("id")==cap_id), None)
+
+def _capability_card_html(cap):
+    cid_field = cap.get("id","")
+    conn_opts = "".join(f'<option value="{c["_id"]}" {"selected" if c["_id"]==cap.get("conn_id") else ""}>{_esc(c.get("display_name",c["_id"]))}</option>' for c in AIM.connections.list_conns())
+    models = AIM.connections.list_models_sync(AIM.connections.get_conn(cap.get("conn_id",""))) if cap.get("conn_id") else []
+    model_opts = "".join(f'<option value="{_esc(m)}" {"selected" if m==cap.get("model") else ""}>{_esc(m)}{" (embedding - not for chat)" if AIM.steps.looks_like_embedding(m) else ""}</option>' for m in models)
+    kg_opts = "".join(f'<option value="{c["_id"]}" {"selected" if c["_id"]==cap.get("knowledge_conn_id") else ""}>{_esc(c.get("display_name",c["_id"]))}</option>' for c in AIM.connections.list_conns(conn_type="lightrag"))
+    pl_opts = "".join(f'<option value="{p["id"]}" {"selected" if p["id"]==cap.get("flow_pipeline_id") else ""}>{_esc(p.get("name",p["id"]))}</option>' for p in AIM.engine.list_pipelines())
+    return f"""<div class="glass" style="padding:.7rem;margin-bottom:.6rem" id="cap-card-{cid_field}">
+                   <form hx-post="/im/in" hx-target="body" hx-swap="none" style="display:flex;flex-direction:column;gap:.5rem">
+                       <input type="hidden" name="type" value="athena_cap_save"><input type="hidden" name="lvl" value="2">
+                       <input type="hidden" name="cap_id" value="{cid_field}">
+                       <div style="display:flex;gap:.4rem;align-items:center">
+                           <input type="text" name="label" value="{_esc(cap.get('label',''))}" placeholder="Label shown to users" class="module-select" style="flex:1;font-weight:600">
+                           <span style="font-size:.65rem;color:var(--text_muted);font-family:var(--font-mono)">{cid_field}</span>
+                           <button type="button" class="btn-icon" style="color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_cap_delete", cap_id=cid_field)}' hx-confirm="Delete this capability?">&#x2715;</button>
+                       </div>
+                       <div style="display:flex;gap:.4rem;flex-wrap:wrap">
+                           <label style="flex:1;min-width:10rem;font-size:.72rem;color:var(--text_muted)">Connection
+                               <select name="conn_id" class="module-select" hx-post="/im/in" hx-vals='{_iv("athena_cap_conn_change", cap_id=cid_field)}' hx-trigger="change" hx-include="closest form" hx-target="#cap-model-wrap-{cid_field}">
+                                   <option value="">-- none --</option>{conn_opts}
+                               </select>
+                           </label>
+                           <label id="cap-model-wrap-{cid_field}" style="flex:1;min-width:10rem;font-size:.72rem;color:var(--text_muted)">Model
+                               <select name="model" class="module-select"><option value="">(select connection first)</option>{model_opts}</select>
+                           </label>
+                           <label style="flex:1;min-width:8rem;font-size:.72rem;color:var(--text_muted)">Context Tokens<input type="number" name="model_ctx" value="{cap.get('model_ctx',16384)}" class="module-select"></label>
+                           <label style="flex:1;min-width:8rem;font-size:.72rem;color:var(--text_muted)">Max Response Tokens<input type="number" name="num_predict" value="{cap.get('num_predict', cfg.get('num_predict',8192))}" class="module-select" title="Raise this for thinking-heavy models - thinking tokens count against this budget too."></label>
+                       </div>
+                       <label style="display:flex;align-items:center;gap:.4rem;font-size:.8rem"><input type="checkbox" name="think" value="1" {"checked" if cap.get("think") else ""}> Thinking mode (show chain of thought)</label>
+                       <label style="font-size:.72rem;color:var(--text_muted)">System Prompt (not shown to users)<textarea name="system_prompt" class="cm-input" rows="3">{_esc(cap.get('system_prompt',''))}</textarea></label>
+                       <div style="border-top:var(--border-thick) solid var(--border);padding-top:.5rem;display:flex;gap:.4rem;flex-wrap:wrap;align-items:flex-end">
+                           <label style="display:flex;align-items:center;gap:.3rem;font-size:.78rem"><input type="checkbox" name="knowledge_enabled" value="1" {"checked" if cap.get("knowledge_enabled") else ""}> Knowledge Base</label>
+                           <label style="flex:1;min-width:10rem;font-size:.72rem;color:var(--text_muted)">Knowledge Connection<select name="knowledge_conn_id" class="module-select"><option value="">-- none --</option>{kg_opts}</select></label>
+                       </div>
+                       <div style="border-top:var(--border-thick) solid var(--border);padding-top:.5rem;display:flex;gap:.4rem;flex-wrap:wrap;align-items:flex-end">
+                           <label style="flex:1;min-width:10rem;font-size:.72rem;color:var(--text_muted)">Run via Pipeline instead of plain chat<select name="flow_pipeline_id" class="module-select"><option value="">-- none --</option>{pl_opts}</select></label>
+                           <label style="flex:1;min-width:8rem;font-size:.72rem;color:var(--text_muted)">Result Key<input type="text" name="flow_result_key" value="{_esc(cap.get('flow_result_key','text'))}" class="module-select" placeholder="text"></label>
+                       </div>
+                       <button type="submit" class="button" style="align-self:flex-start">Save Capability</button>
+                   </form>
+               </div>"""
+
+def _capabilities_editor_html():
+    caps = cfg.get("capabilities", []) or [DEFAULT_CAP]
+    return f"""<div id="cap-editor">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:.5rem">
+            <h4 style="margin:0">Capabilities</h4>
+            <button class="ui-btn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_cap_add")}'>+ Add Capability</button>
+        </div>
+        {"".join(_capability_card_html(c) for c in caps)}
+    </div>"""
+
+async def _h_cap_add(request, payload, imr):
+    if getattr(request.state.user, "role", "") != "admin": return imr
+    caps = cfg.get("capabilities", []) or []
+    caps.insert(0, {**DEFAULT_CAP, "id": f"cap_{uuid.uuid4().hex[:6]}", "label": "New Capability"})
+    _save_capabilities(caps)
+    return imr.oob(_capabilities_editor_html(), "cap-editor", swap="outerHTML")
+
+async def _h_cap_delete(request, payload, imr):
+    if getattr(request.state.user, "role", "") != "admin": return imr
+    caps = [c for c in cfg.get("capabilities", []) or [] if c.get("id") != payload.get("cap_id","")]
+    if not caps: caps = [dict(DEFAULT_CAP)]
+    _save_capabilities(caps)
+    return imr.oob(_capabilities_editor_html(), "cap-editor", swap="outerHTML")
+
+async def _h_cap_conn_change(request, payload, imr):
+    cap_id = payload.get("cap_id","")
+    conn = AIM.connections.get_conn(payload.get("conn_id",""))
+    models = AIM.connections.list_models_sync(conn) if conn else []
+    opts = "".join(f'<option value="{_esc(m)}">{_esc(m)}{" (embedding - not for chat)" if AIM.steps.looks_like_embedding(m) else ""}</option>' for m in models)
+    return imr.oob(f'<label id="cap-model-wrap-{cap_id}" style="flex:1;min-width:10rem;font-size:.72rem;color:var(--text_muted)">Model<select name="model" class="module-select"><option value="">(auto)</option>{opts}</select></label>', f"cap-model-wrap-{cap_id}", swap="outerHTML")
+
+async def _h_cap_save(request, payload, imr):
+    if getattr(request.state.user, "role", "") != "admin": return imr
+    cap_id = payload.get("cap_id","")
+    caps = cfg.get("capabilities", []) or []
+    existing = _cap_by_id(caps, cap_id)
+    updated = {"id": cap_id, "label": payload.get("label","").strip() or cap_id,
+               "conn_id": payload.get("conn_id",""), "model": payload.get("model",""),
+               "system_prompt": payload.get("system_prompt",""), "think": payload.get("think")=="1",
+               "model_ctx": int(payload.get("model_ctx", 16384) or 16384),
+               "num_predict": int(payload.get("num_predict", 8192) or 8192),
+               "knowledge_enabled": payload.get("knowledge_enabled")=="1", "knowledge_conn_id": payload.get("knowledge_conn_id",""),
+               "flow_pipeline_id": payload.get("flow_pipeline_id",""), "flow_result_key": payload.get("flow_result_key","text") or "text"}
+    if existing: caps[caps.index(existing)] = updated
+    else: caps.append(updated)
+    _save_capabilities(caps)
+    return imr.oob(_capability_card_html(updated), f"cap-card-{cap_id}", swap="outerHTML")
+
+@router.get("/admin")
+async def admin(request: Request):
+    """Page-load navigation into the ai_tools shell's content area - not a mutation, follows the same GET convention used throughout ai_tools for switching between submodule panels."""
+    if getattr(request.state.user, "role", "") != "admin": return HTMLResponse("Denied")
+    group = cfg.get_group("general")
+    values = cfg.get_all().get("general", {})
+    general_fields_html = "".join(group._render_field(f, values) for f in group.fields if f.name != "capabilities")
+    return HTMLResponse(f"""<div style="padding:0.5rem;position:relative;max-width:48rem;margin:0 auto">
+                                <button type="button" class="close-btn" style="position:absolute;top:.2rem;right:.2rem" hx-get="{_u()}" hx-target="#ait-workspace" hx-swap="innerHTML">&#x2715;</button>
+                                <h3 style="margin-top:0">Athena Admin Settings</h3>
+                                <form hx-post="/im/in" hx-target="#status" hx-swap="innerHTML">
+                                    <input type="hidden" name="type" value="athena_admin_save"><input type="hidden" name="lvl" value="2">
+                                    <div id="athena-admin-fields">{general_fields_html}</div>
+                                    <button type="submit" class="button" style="margin-top:1rem;">Save Settings</button>
+                                    <div id="status" style="margin-top:0.5rem; font-size:0.7rem; color:#00ffa2;"></div>
+                                </form>
+                                <hr style="margin:1.2rem 0;border-color:var(--border)">
+                                {_capabilities_editor_html()}
+                            </div>""")
 
 def right_panel() -> str: return f"""<div class="ait-rp"><div class="ait-rp-hd">Athena</div>
                                          <div style="font-size:.7rem; color:var(--text_muted); padding:.2rem .2rem .2rem">{_esc(cfg.get("title","Athena"))}</div>
-                                         <button class="ait-rp-btn" hx-post="{_u("new")}" hx-target="#ait-workspace" hx-swap="innerHTML">+ New Conversation</button>
+                                         <button class="ait-rp-btn" hx-post="/im/in" hx-target="#ait-workspace" hx-swap="innerHTML" hx-vals='{_iv("athena_new")}'>+ New Conversation</button>
                                          <button class="ait-rp-btn" hx-get="{_u("admin")}" hx-target="#ait-workspace" hx-swap="innerHTML">&#x2699; Admin Settings</button>
-                                         <div class="ait-rp-hd" style="margin-top:.5rem">Model</div>
-                                         <div style="font-size:.7rem;color:var(--text_muted);font-family:var(--font-main);padding:.1rem .2rem">{_esc(cfg.get("model","not configured"))}</div>
                                      </div>"""
-
-EXTRA_JS = """
-function athUpload(input,sid){var fd=new FormData(); for(var i=0;i<input.files.length;i++) fd.append('files',input.files[i]); fetch('/module/ai_tools/athena/upload/'+sid, {method:'POST', body:fd}).then(r=>r.text()).then(html=>htmx.process(htmx.swap(document.getElementById('ath-files-'+sid), 'innerHTML', html))); input.value='';}
-function athDelFile(sid,fid){ htmx.ajax('POST','/module/ai_tools/athena/delete_file/'+sid+'/'+fid,{target:'#ath-files-'+sid,swap:'innerHTML'}); }
-"""
-
-CSS = """
-.ath-sb-hdr{padding:.35rem .5rem;border-bottom:var(--border-thick) solid var(--border);display:flex;align-items:center;gap:.3rem;flex-shrink:0;}
-.ath-conv-list{flex:1;overflow-y:auto;}
-.ath-conv-item{padding:.38rem .6rem;cursor:pointer;border-bottom:var(--border-thick) solid var(--border);font-size:.78rem;display:flex;flex-direction:column;gap:.06rem;transition:background .12s;}
-.ath-conv-item:hover{background:var(--accent_dim);}
-.ath-conv-active{background:var(--glass);border-left:.15rem solid var(--accent);}
-.ath-conv-title{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500;}
-.ath-folder{border-bottom:var(--border-thick) solid var(--border);}
-.ath-folder-sum{padding:.3rem .5rem;cursor:pointer;font-size:.72rem;color:var(--text_muted);list-style:none;display:flex;align-items:center;gap:.3rem;user-select:none;}
-.ath-folder-sum::-webkit-details-marker{display:none;}
-.ath-folder-sum:hover{color:var(--accent);}
-.ath-folder-sel{background:var(--bg);color:var(--text);border:var(--border-thick) solid var(--border);border-radius:.2rem;font-size:.6rem;padding:.08rem .2rem;flex:1;min-width:0;}
-.ath-ungrouped-hdr{padding:.3rem .5rem;font-size:.63rem;text-transform:uppercase;letter-spacing:.05em;color:var(--text_muted);border-top:var(--border-thick) solid var(--border);margin-top:.3rem;}
-.ath-conv-actions{opacity:0;transition:opacity .15s;}
-.ath-conv-item:hover .ath-conv-actions,.ath-conv-item.ath-conv-active .ath-conv-actions{opacity:1;}
-.ath-conv-item{padding:.45rem .5rem;min-height:2.4rem;}
-"""

@@ -201,7 +201,7 @@ async def _do_stream(username, payload, pid, skip_user_append=False):
                 if _STOP.pop(pid, False): break
                 if err: await _err(err, retry_mid=user_msg["id"] if user_msg else None); return
                 if text: full += text
-                if thinking: tb = thinking
+                if thinking: tb += thinking
                 think_html = f'<details class="cm-think" open><summary>\U0001f9e0 Thinking\u2026</summary><div class="cm-think-body">{_esc(tb[-2000:])}</div></details>' if tb.strip() else ""
                 await _ws(f'<div id="cm-stream-{pid}" hx-swap-oob="innerHTML">{think_html}{"<div class=cm-stream-bubble>"+_esc(full)+"</div>" if full else ""}</div>')
                 if done: break
