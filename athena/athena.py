@@ -91,7 +91,7 @@ def init_tool(env:dict, prefix:str):
                        "athena_cap_delete": [_h_cap_delete],
                        "athena_cap_save": [_h_cap_save],
                        "athena_cap_conn_change": [_h_cap_conn_change]})
-    print(f"[athena] ready at {_P}")
+    print(f"[athena] ready")
 
 _STOP_FLAGS:dict = {}
 _ACTIVE_STREAMS:set = set()

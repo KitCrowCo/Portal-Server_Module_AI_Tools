@@ -51,10 +51,8 @@ def init_tool(env: dict, prefix: str):
                                         "docs":{"id":"docs","order":2,"label":"Documents","icon":"&#x1F4C4;"},
                                         "graph":{"id":"graph","order":3,"label":"Graph","icon":"&#x1F578;"}}, "active":"query"})
     IM.scripts["kimi_graph_limit"] = [_h_graph_limit]
-    IM.scripts.update({"kimi_conn_select": [_h_conn_select], "kimi_health": [_h_health], "kimi_select_file": [_h_select_file],
-                    "kimi_ingest_selected": [_h_ingest_selected], "kimi_insert_text": [_h_insert_text], "kimi_query": [_h_query],
-                    "kimi_clear_all": [_h_clear_all], "kimi_doc_delete": [_h_doc_delete], "kimi_upload_modal": [_h_upload_modal],
-                    "kimi_upload_kg": [lambda r,p,i: _h_upload(r,p,i,"kg")], "kimi_upload_common": [lambda r,p,i: _h_upload(r,p,i,"common")]})
+    IM.scripts["kimi_graph_limit"] = [_h_graph_limit]
+    IM.scripts.update({"kimi_conn_select": [_h_conn_select], "kimi_health": [_h_health], "kimi_select_file": [_h_select_file], "kimi_ingest_selected": [_h_ingest_selected], "kimi_insert_text": [_h_insert_text], "kimi_query": [_h_query], "kimi_clear_all": [_h_clear_all], "kimi_doc_delete": [_h_doc_delete], "kimi_upload_modal": [_h_upload_modal], "kimi_sync_now": [_h_sync_now], "kimi_upload_kg": [lambda r,p,i: _h_upload(r,p,i,"kg")], "kimi_upload_common": [lambda r,p,i: _h_upload(r,p,i,"common")]})
     print("[kimi] ready")
 
 def _ensure_sync_task():
@@ -78,7 +76,7 @@ async def _kg_state(request, state=None):
 
 def _conn_select_html(active_id):
     conns = AIM.connections.list_conns(conn_type="lightrag")
-    if not conns: return '<div style="font-size:.75rem;color:var(--text_muted)">No LightRAG connections - add one in AI Tools &rarr; Settings &rarr; Connections.</div>'
+    if not conns: return '<div style="font-size:.7rem;color:var(--text_muted)">No LightRAG connections - add one in AI Tools &rarr; Settings &rarr; Connections.</div>'
     active = AIM.connections.get_conn(active_id, conn_type="lightrag") or conns[0]
     notes = active.get("values", {}).get("domain_notes", "")
     sel = UI.select("conn_id", [(c["_id"], c.get("display_name", c["_id"])) for c in conns], selected=active["_id"], htmx={"post":"/im/in","trigger":"change","target":"#kg-health", "vals": json.dumps({"type": "kimi_conn_select", "branch": "kimi", "lvl": 2}), "include":"this"})
@@ -94,22 +92,22 @@ async def _left_panel(request):
     return f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
                     <div style="padding:.5rem;border-bottom:var(--border-thick) solid var(--border)">
                         {UI.field("Knowledge Group", _conn_select_html(s["conn_id"]))}
-                        <div id="kg-health" style="font-size:.7rem;color:var(--text_muted)" hx-post="/im/in" hx-vals='{{"type":"kimi_health","branch":"kimi","lvl":2}}' hx-trigger="load" hx-trigger="load" hx-swap="innerHTML">checking...</div>
+                        <div id="kg-health" style="font-size:.7rem;color:var(--text_muted)" hx-post="/im/in" hx-vals='{{"type":"kimi_health","branch":"kimi","lvl":2}}' hx-trigger="load" hx-swap="innerHTML">checking...</div>
                     </div>
                     <div style="flex:1;overflow-y:auto">
                         <details open style="border-bottom:var(--border-thick) solid var(--border)">
-                            <summary style="padding:.3rem .5rem;cursor:pointer;font-size:.72rem;color:var(--text_muted);text-transform:uppercase;list-style:none">&#x1F4DA; Shared Knowledge<button class="btn-icon" style="float:right;font-size:.7rem" hx-get="{_u('upload_modal/kg')}" hx-target="#kg-modal" hx-swap="innerHTML" onclick="event.stopPropagation()">&#x2795;</button></summary>
+                            <summary style="padding:.3rem .5rem;cursor:pointer;font-size:.7rem;color:var(--text_muted);text-transform:uppercase;list-style:none">&#x1F4DA; Shared Knowledge<button class="btn-icon" style="float:right;font-size:.7rem" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"kimi_upload_modal","branch":"kimi","lvl":2,"src":"kg"}}' onclick="event.stopPropagation()">&#x2795;</button></summary>
                             <div id="kg-tree-kg" style="padding:.2rem .4rem">{_source_tree_html(FM_KG, s["selected_kg"], "kg")}</div>
                         </details>
                         <details open style="border-bottom:var(--border-thick) solid var(--border)">
-                            <summary style="padding:.3rem .5rem;cursor:pointer;font-size:.72rem;color:var(--text_muted);text-transform:uppercase;list-style:none">&#x1F310; Common (server-wide)<button class="btn-icon" style="float:right;font-size:.7rem" hx-get="{_u('upload_modal/common')}" hx-target="#kg-modal" hx-swap="innerHTML" onclick="event.stopPropagation()">&#x2795;</button></summary>
+                            <summary style="padding:.3rem .5rem;cursor:pointer;font-size:.7rem;color:var(--text_muted);text-transform:uppercase;list-style:none">&#x1F310; Common (server-wide)<button class="btn-icon" style="float:right;font-size:.7rem" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"kimi_upload_modal","branch":"kimi","lvl":2,"src":"common"}}' onclick="event.stopPropagation()">&#x2795;</button></summary>
                             <div id="kg-tree-common" style="padding:.2rem .4rem">{_source_tree_html(FM_COMMON, s["selected_common"], "common")}</div>
                         </details>
                     </div>
                     <div style="padding:.5rem;border-top:var(--border-thick) solid var(--border)">
-                        <button class="ui-btn" style="width:100%;justify-content:center" hx-post="{_u('ingest_selected')}" hx-target="#kg-ingest-log" hx-swap="innerHTML">&#x2191; Ingest Selected</button>
-                        <div id="kg-ingest-log" style="font-size:.72rem;margin-top:.4rem;max-height:8rem;overflow-y:auto;font-family:var(--font-mono)"></div>
-                        <button class="ui-btn" style="width:100%;margin-top:.3rem" hx-post="{_u('sync_now')}" hx-target="#kg-sync-status" hx-swap="innerHTML">&#x21BB; Sync Now</button>
+                        <button class="ui-btn" style="width:100%;justify-content:center" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"kimi_ingest_selected","branch":"kimi","lvl":2}}'>&#x2191; Ingest Selected</button>
+                        <div id="kg-ingest-log" style="font-size:.7rem;margin-top:.4rem;max-height:8rem;overflow-y:auto;font-family:var(--font-mono)"></div>
+                        <button class="ui-btn" style="width:100%;margin-top:.3rem" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"kimi_sync_now","branch":"kimi","lvl":2}}'>&#x21BB; Sync Now</button>
                         <div id="kg-sync-status" style="font-size:.7rem;margin-top:.2rem"></div>
                     </div>
                     <div id="kg-modal"></div>
@@ -117,34 +115,42 @@ async def _left_panel(request):
 
 # --- Tab panels ---
 
+def build_field(k, spec):
+    label = _esc(spec.get("label", k))
+    if spec.get("type") == "boolean":
+        hint = _esc(spec.get("hint", ""))
+        checked = " checked" if spec.get("default") else ""
+        return f'<label style="display:flex;align-items:center;gap:.3rem;font-size:.7rem" title="{hint}"><input type="checkbox" name="opt_{k}" value="1"{checked}> {label}</label>'
+    else:
+        val = f' value="{spec["default"]}"' if "default" in spec else ""
+        return f'<label style="font-size:.7rem;color:var(--text_muted)">{label}<input type="number" name="opt_{k}" class="module-select" style="width:5rem"{val}></label>'
+
 async def _panel_query(request):
     s = await _kg_state(request)
     conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
     schema = AIM.connections.lightrag_query_options_schema(conn) if conn else {}
-    opt_fields = "".join(
-        f'<label style="display:flex;align-items:center;gap:.3rem;font-size:.72rem" title="{_esc(spec.get("hint",""))}"><input type="checkbox" name="opt_{k}" value="1"> {_esc(spec.get("label",k))}</label>'
-        if spec.get("type") == "boolean" else
-        f'<label style="font-size:.72rem;color:var(--text_muted)">{_esc(spec.get("label",k))}<input type="number" name="opt_{k}" class="module-select" style="width:5rem"></label>'
-        for k, spec in schema.items())
-    multi_opts = "".join(f'<label style="display:flex;align-items:center;gap:.3rem;font-size:.76rem"><input type="checkbox" name="conn_ids" value="{c["_id"]}" {"checked" if c["_id"]==s["conn_id"] else ""}> {_esc(c.get("display_name",c["_id"]))}</label>' for c in AIM.connections.list_conns(conn_type="lightrag"))
+    opt_fields = "".join(build_field(k, spec) for k, spec in schema.items())
+    multi_opts = "".join(f'<label style="display:flex;align-items:center;gap:.3rem;font-size:.7rem"><input type="checkbox" name="conn_ids" value="{c["_id"]}" {"checked" if c["_id"]==s["conn_id"] else ""}> {_esc(c.get("display_name", c["_id"]))}</label>' for c in AIM.connections.list_conns(conn_type="lightrag"))
     return f"""<div style="padding:1rem;height:100%;overflow-y:auto;box-sizing:border-box">
-                    <form hx-post="{_u('query')}" hx-target="#kg-query-result" style="display:flex;flex-direction:column;gap:.5rem;margin-bottom:.8rem">
+                    <form hx-post="/im/in" hx-target="body" hx-swap="none" style="display:flex;flex-direction:column;gap:.5rem;margin-bottom:.8rem">
+                        <input type="hidden" name="type" value="kimi_query"><input type="hidden" name="branch" value="kimi"><input type="hidden" name="lvl" value="2">
                         <div style="display:flex;gap:.4rem;flex-wrap:wrap">
                             <input type="text" name="q" placeholder="Ask the knowledge base..." class="module-select" style="flex:1;margin:0;min-width:14rem">
                             {UI.select("mode", [(m,m) for m in ("hybrid","local","global","naive","mix")], selected="hybrid", style="width:8rem;margin:0")}
                             <button class="ui-btn">Ask</button>
                         </div>
                         <div style="display:flex;gap:.6rem;flex-wrap:wrap;align-items:center">{opt_fields}</div>
-                        <details><summary style="cursor:pointer;font-size:.74rem;color:var(--text_muted);list-style:none">Compare across groups</summary>
+                        <details><summary style="cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none">Compare across groups</summary>
                             <div style="display:flex;flex-direction:column;gap:.2rem;margin-top:.4rem">{multi_opts}</div>
                         </details>
                     </form>
-                    <div id="kg-query-result" style="font-size:.85rem;white-space:pre-wrap;display:flex;flex-direction:column;gap:.6rem"></div>
+                    <div id="kg-query-result" style="font-size:.8rem;white-space:pre-wrap;display:flex;flex-direction:column;gap:.6rem"></div>
                 </div>"""
 
 async def _panel_paste(request):
     return f"""<div style="padding:1rem;height:100%;overflow-y:auto;box-sizing:border-box">
-                    <form hx-post="{_u('insert_text')}" hx-target="#kg-ingest-log2" hx-swap="innerHTML" style="display:flex;flex-direction:column;gap:.5rem">
+                    <form hx-post="/im/in" hx-target="body" hx-swap="none" style="display:flex;flex-direction:column;gap:.5rem">
+                        <input type="hidden" name="type" value="kimi_insert_text"><input type="hidden" name="branch" value="kimi"><input type="hidden" name="lvl" value="2">
                         {UI.field("Source label (optional)", UI.input("source"))}
                         {UI.field("Text", UI.textarea("text", rows=14))}
                         <button class="ui-btn">Insert</button>
@@ -168,22 +174,14 @@ async def _panel_docs(request):
                 priority = [h for h in headers if any(k in h.lower() for k in ("file","path","name","source"))]
                 headers = priority + [h for h in headers if h not in priority]
                 th = "".join(f'<th style="padding:.32rem .6rem;border-bottom:var(--border-thick) solid var(--border);text-align:left;">{_esc(h)}</th>' for h in headers) + ("<th></th>" if doc_id_field else "")
-                table_rows = "".join("<tr>" + "".join(f'<td style="padding:.28rem .6rem;border-bottom:var(--border-thick) solid var(--border);">{_esc(str(row.get(h,""))[:80])}</td>' for h in headers) + (f'<td style="padding:.28rem .6rem;border-bottom:var(--border-thick) solid var(--border)"><button class="cm-qbtn" style="color:#ff5f5f" hx-post="{_u("doc_delete")}" hx-vals=\'{{"doc_id":"{_esc(str(row.get(doc_id_field,"")))}"}}\' hx-target="#kimi-panel" hx-confirm="Delete this document from the knowledge base?">&#x2715;</button></td>' if doc_id_field else "") + "</tr>" for row in rows)
+                table_rows = "".join("<tr>" + "".join(f"""<td style="padding:.2rem .46rem;border-bottom:var(--border-thick) solid var(--border);">{_esc(str(row.get(h,""))[:80])}</td>' for h in headers) + (f'<td style="padding:.2rem .4rem;border-bottom:var(--border-thick) solid var(--border)"><button class="cm-qbtn" style="color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"kimi_doc_delete","branch":"kimi","lvl":2,"doc_id":"{_esc(str(row.get(doc_id_field,"")))}"}}' hx-confirm="Delete this document from the knowledge base?">&#x2715;</button></td>""" if doc_id_field else "") + "</tr>" for row in rows)
                 body = f'<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.8rem"><thead><tr>{th}</tr></thead><tbody>{table_rows}</tbody></table></div>'
             else:
                 body = f'<pre style="font-size:.72rem;white-space:pre-wrap">{_esc(json.dumps(r, indent=2))}</pre>'
     return f"""<div style="padding:1rem;height:100%;overflow-y:auto;box-sizing:border-box">
                    {body}
-                   <button class="ui-btn" style="margin-top:1rem;color:#ff5f5f" hx-post="{_u('clear_all')}" hx-target="#kimi-panel" hx-confirm="Delete the ENTIRE knowledge graph for this group? This cannot be undone.">Clear Entire Knowledge Group</button>
+                   <button class="ui-btn" style="margin-top:1rem;color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"kimi_clear_all","branch":"kimi","lvl":2}}' hx-confirm="Delete the ENTIRE knowledge graph for this group? This cannot be undone.">Clear Entire Knowledge Group</button>
                </div>"""
-
-@router.post("/doc_delete", response_class=HTMLResponse)
-async def doc_delete(request: Request):
-    form = await request.form()
-    s = await _kg_state(request)
-    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
-    if conn: await AIM.connections.lightrag_delete_document(conn, form.get("doc_id",""))
-    return await _panel_docs(request)
 
 async def _panel_graph(request):
     s = await _kg_state(request)
@@ -199,7 +197,7 @@ async def _panel_graph(request):
                <div style="padding:1rem;height:calc(100% - 3rem);overflow:auto;box-sizing:border-box">{body}</div>"""
 
 async def _h_graph_limit(request, payload, imr):
-    await ENV["set_state"](request, int(payload.get("value", 1000) or 1000), scope="user", namespace="knowledge", key="graph_limit")
+    await ENV["set_state"](request, int(payload.get("value", 5000) or 5000), scope="user", namespace="knowledge", key="graph_limit")
     return imr.raw(f'<div id="kimi-panel" style="height:100%;overflow:hidden">{await _panel_graph(request)}</div>')
 
 async def _render_panel(request, state):
@@ -285,7 +283,7 @@ async def _h_query(request, payload, imr):
     if not q: return imr.oob('<div style="color:#ff5f5f">Enter a question.</div>', "kg-query-result")
     extra = {}
     for k, v in payload.items():
-        if not k.startswith("opt_"): continue
+        if not k.startswith("opt_") or v in ("", None): continue
         extra[k[4:]] = True if v in ("1","true","on") else (int(v) if str(v).strip().lstrip("-").isdigit() else v)
     conn_ids = payload.get("conn_ids", [])
     if isinstance(conn_ids, str): conn_ids = [conn_ids] if conn_ids else []
@@ -299,12 +297,6 @@ async def _h_clear_all(request, payload, imr):
     s = await _kg_state(request)
     conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
     if conn: await AIM.connections.lightrag_clear_all(conn)
-    return imr.raw(f'<div id="kimi-panel" style="height:100%;overflow:hidden">{await _panel_docs(request)}</div>')
-
-async def _h_doc_delete(request, payload, imr):
-    s = await _kg_state(request)
-    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
-    if conn: await AIM.connections.lightrag_delete_document(conn, payload.get("doc_id",""))
     return imr.raw(f'<div id="kimi-panel" style="height:100%;overflow:hidden">{await _panel_docs(request)}</div>')
 
 async def _h_upload_modal(request, payload, imr):
@@ -338,6 +330,16 @@ async def _h_upload(request, payload, imr, src):
         p.parent.mkdir(parents=True, exist_ok=True)
         if not p.exists(): p.write_text("", encoding="utf-8")
     return imr.oob(_source_tree_html(fm, s.get(f"selected_{src}", []), src), f"kg-tree-{src}", swap="outerHTML")
+
+async def _h_doc_delete(request, payload, imr):
+    s = await _kg_state(request)
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    if conn: await AIM.connections.lightrag_delete_document(conn, payload.get("doc_id",""))
+    return imr.raw(f'<div id="kimi-panel" style="height:100%;overflow:hidden">{await _panel_docs(request)}</div>')
+
+async def _h_sync_now(request, payload, imr):
+    asyncio.create_task(_run_sync_pass())
+    return imr.oob('<span style="color:var(--accent);font-size:.7rem">&#x2713; Sync started (running in background)</span>', "kg-sync-status")
 
 # --- Scheduled sync ---
 
@@ -381,11 +383,6 @@ async def _scheduled_sync_loop():
         await asyncio.sleep(900)
 
 def right_panel() -> str: return """<div class="ait-rp"><div class="ait-rp-hd">Kimi</div><div style="font-size:.72rem;color:var(--text_muted);padding:.3rem">Knowledge Integration Manager - pick a knowledge group and ingest sources from the left panel.</div></div>"""
-
-@router.post("/sync_now", response_class=HTMLResponse)
-async def sync_now(request: Request):
-    asyncio.create_task(_run_sync_pass())
-    return HTMLResponse('<span style="color:var(--accent);font-size:.7rem">&#x2713; Sync started (running in background)</span>')
 
 async def _panel_graph(request):
     s = await _kg_state(request)
