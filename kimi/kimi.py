@@ -68,8 +68,9 @@ async def _kg_state(request, state=None):
     s = await ENV["get_state"](request, scope="user", namespace="knowledge") or {}
     if not s.get("conn_id"):
         conns = AIM.connections.list_conns(conn_type="lightrag")
-        s["conn_id"] = conns[0]["_id"] if conns else ""  # auto-default to the only/first connection - no blank placeholder requiring a manual re-select
+        s["conn_id"] = conns[0]["_id"] if conns else ""
     s.setdefault("selected_kg", []); s.setdefault("selected_common", [])
+    s.setdefault("last_query", ""); s.setdefault("last_mode", "hybrid"); s.setdefault("last_result", "")
     return s
 
 # --- Left panel (persistent, not part of tab switching) ---
@@ -129,22 +130,31 @@ async def _panel_query(request):
     s = await _kg_state(request)
     conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
     schema = AIM.connections.lightrag_query_options_schema(conn) if conn else {}
+    def build_field(k, spec):
+        label = _esc(spec.get("label", k))
+        if spec.get("type") == "boolean":
+            hint = _esc(spec.get("hint", ""))
+            checked = " checked" if spec.get("default") else ""
+            return f'<label style="display:flex;align-items:center;gap:.3rem;font-size:.72rem" title="{hint}"><input type="checkbox" name="opt_{k}" value="1"{checked}> {label}</label>'
+        val = f' value="{spec["default"]}"' if "default" in spec else ""
+        return f'<label style="font-size:.72rem;color:var(--text_muted)">{label}<input type="number" name="opt_{k}" class="module-select" style="width:5rem"{val}></label>'
     opt_fields = "".join(build_field(k, spec) for k, spec in schema.items())
-    multi_opts = "".join(f'<label style="display:flex;align-items:center;gap:.3rem;font-size:.7rem"><input type="checkbox" name="conn_ids" value="{c["_id"]}" {"checked" if c["_id"]==s["conn_id"] else ""}> {_esc(c.get("display_name", c["_id"]))}</label>' for c in AIM.connections.list_conns(conn_type="lightrag"))
+    multi_opts = "".join(f'<label style="display:flex;align-items:center;gap:.3rem;font-size:.76rem"><input type="checkbox" name="conn_ids" value="{c["_id"]}" {"checked" if c["_id"]==s["conn_id"] else ""}> {_esc(c.get("display_name",c["_id"]))}</label>' for c in AIM.connections.list_conns(conn_type="lightrag"))
     return f"""<div style="padding:1rem;height:100%;overflow-y:auto;box-sizing:border-box">
-                    <form hx-post="/im/in" hx-target="body" hx-swap="none" style="display:flex;flex-direction:column;gap:.5rem;margin-bottom:.8rem">
+                    <form hx-post="/im/in" hx-target="body" hx-swap="none" hx-indicator="#kg-query-spin" style="display:flex;flex-direction:column;gap:.5rem;margin-bottom:.8rem">
                         <input type="hidden" name="type" value="kimi_query"><input type="hidden" name="branch" value="kimi"><input type="hidden" name="lvl" value="2">
-                        <div style="display:flex;gap:.4rem;flex-wrap:wrap">
-                            <input type="text" name="q" placeholder="Ask the knowledge base..." class="module-select" style="flex:1;margin:0;min-width:14rem">
-                            {UI.select("mode", [(m,m) for m in ("hybrid","local","global","naive","mix")], selected="hybrid", style="width:8rem;margin:0")}
+                        <div style="display:flex;gap:.4rem;flex-wrap:wrap;align-items:center">
+                            <input type="text" name="q" value="{_esc(s.get('last_query',''))}" placeholder="Ask the knowledge base..." class="module-select" style="flex:1;margin:0;min-width:14rem">
+                            {UI.select("mode", [(m,m) for m in ("hybrid","local","global","naive","mix")], selected=s.get("last_mode","hybrid"), style="width:8rem;margin:0")}
                             <button class="ui-btn">Ask</button>
+                            <span id="kg-query-spin" class="htmx-indicator spin" style="font-size:.9rem" title="Working...">&#x25CC;</span>
                         </div>
                         <div style="display:flex;gap:.6rem;flex-wrap:wrap;align-items:center">{opt_fields}</div>
-                        <details><summary style="cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none">Compare across groups</summary>
+                        <details><summary style="cursor:pointer;font-size:.74rem;color:var(--text_muted);list-style:none">Compare across groups</summary>
                             <div style="display:flex;flex-direction:column;gap:.2rem;margin-top:.4rem">{multi_opts}</div>
                         </details>
                     </form>
-                    <div id="kg-query-result" style="font-size:.8rem;white-space:pre-wrap;display:flex;flex-direction:column;gap:.6rem"></div>
+                    <div id="kg-query-result" style="font-size:.85rem;white-space:pre-wrap;display:flex;flex-direction:column;gap:.6rem">{s.get("last_result","")}</div>
                 </div>"""
 
 async def _panel_paste(request):
@@ -287,10 +297,13 @@ async def _h_query(request, payload, imr):
         extra[k[4:]] = True if v in ("1","true","on") else (int(v) if str(v).strip().lstrip("-").isdigit() else v)
     conn_ids = payload.get("conn_ids", [])
     if isinstance(conn_ids, str): conn_ids = [conn_ids] if conn_ids else []
-    targets = [c for c in (conn_ids or [(await _kg_state(request))["conn_id"]]) if c]
+    s = await _kg_state(request)
+    targets = [c for c in (conn_ids or [s["conn_id"]]) if c]
     if not targets: return imr.oob('<div style="color:#ff5f5f">No knowledge group selected.</div>', "kg-query-result")
     results = await asyncio.gather(*[_query_one(c, q, mode, extra) for c in targets])
     html = _esc(results[0][1]) if len(results)==1 else "".join(f'<div class="glass" style="padding:.6rem"><div style="font-weight:600;font-size:.8rem;margin-bottom:.3rem">{_esc(name)}</div>{_esc(text)}</div>' for name, text in results)
+    s["last_query"], s["last_mode"], s["last_result"] = q, mode, html
+    await _kg_state(request, s)
     return imr.oob(html, "kg-query-result")
 
 async def _h_clear_all(request, payload, imr):
