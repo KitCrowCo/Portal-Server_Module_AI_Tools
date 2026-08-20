@@ -106,9 +106,10 @@ async def _left_panel(request):
                         </details>
                     </div>
                     <div style="padding:.5rem;border-top:var(--border-thick) solid var(--border)">
-                        <button class="ui-btn" style="width:100%;justify-content:center" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"kimi_ingest_selected","branch":"kimi","lvl":2}}'>&#x2191; Ingest Selected</button>
+                        <button class="ui-btn" style="width:100%;justify-content:center" hx-post="/im/in" hx-target="body" hx-swap="none" hx-indicator="#kg-ingest-spin" hx-vals='{{"type":"kimi_ingest_selected","branch":"kimi","lvl":2}}'>&#x2191; Ingest Selected <span id="kg-ingest-spin" class="htmx-indicator spin">&#x25CC;</span></button>
+                        <span id="kg-ingest-spin" class="htmx-indicator spin" style="font-size:.8rem" title="Working...">&#x25CC;</span>
                         <div id="kg-ingest-log" style="font-size:.7rem;margin-top:.4rem;max-height:8rem;overflow-y:auto;font-family:var(--font-mono)"></div>
-                        <button class="ui-btn" style="width:100%;margin-top:.3rem" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"kimi_sync_now","branch":"kimi","lvl":2}}'>&#x21BB; Sync Now</button>
+                        <button class="ui-btn" style="width:100%;margin-top:.3rem" hx-post="/im/in" hx-target="body" hx-swap="none" hx-indicator="#kg-sync-spin" hx-vals='{{"type":"kimi_sync_now","branch":"kimi","lvl":2}}'>&#x21BB; Sync Now <span id="kg-sync-spin" class="htmx-indicator spin">&#x25CC;</span></button>
                         <div id="kg-sync-status" style="font-size:.7rem;margin-top:.2rem"></div>
                     </div>
                     <div id="kg-modal"></div>
@@ -163,7 +164,7 @@ async def _panel_paste(request):
                         <input type="hidden" name="type" value="kimi_insert_text"><input type="hidden" name="branch" value="kimi"><input type="hidden" name="lvl" value="2">
                         {UI.field("Source label (optional)", UI.input("source"))}
                         {UI.field("Text", UI.textarea("text", rows=14))}
-                        <button class="ui-btn">Insert</button>
+                        <button class="ui-btn" hx-indicator="#kg-insert-spin">Insert <span id="kg-insert-spin" class="htmx-indicator spin">&#x25CC;</span></button>
                     </form>
                     <div id="kg-ingest-log2" style="margin-top:.6rem;font-size:.8rem"></div>
                 </div>"""
@@ -184,13 +185,13 @@ async def _panel_docs(request):
                 priority = [h for h in headers if any(k in h.lower() for k in ("file","path","name","source"))]
                 headers = priority + [h for h in headers if h not in priority]
                 th = "".join(f'<th style="padding:.32rem .6rem;border-bottom:var(--border-thick) solid var(--border);text-align:left;">{_esc(h)}</th>' for h in headers) + ("<th></th>" if doc_id_field else "")
-                table_rows = "".join("<tr>" + "".join(f"""<td style="padding:.2rem .46rem;border-bottom:var(--border-thick) solid var(--border);">{_esc(str(row.get(h,""))[:80])}</td>' for h in headers) + (f'<td style="padding:.2rem .4rem;border-bottom:var(--border-thick) solid var(--border)"><button class="cm-qbtn" style="color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"kimi_doc_delete","branch":"kimi","lvl":2,"doc_id":"{_esc(str(row.get(doc_id_field,"")))}"}}' hx-confirm="Delete this document from the knowledge base?">&#x2715;</button></td>""" if doc_id_field else "") + "</tr>" for row in rows)
+                table_rows = "".join("<tr>" + "".join(f"""<td style="padding:.2rem .4rem;border-bottom:var(--border-thick) solid var(--border);">{_esc(str(row.get(h,""))[:80])}</td>""" for h in headers) + (f"""<td style="padding:.2rem .4rem;border-bottom:var(--border-thick) solid var(--border)"><button class="cm-qbtn" style="color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-indicator="closest button" hx-vals='{{"type":"kimi_doc_delete","branch":"kimi","lvl":2,"doc_id":"{_esc(str(row.get(doc_id_field,"")))}"}}' hx-confirm="Delete this document from the knowledge base?">&#x2715;</button></td>""" if doc_id_field else "") + "</tr>" for row in rows)
                 body = f'<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:.8rem"><thead><tr>{th}</tr></thead><tbody>{table_rows}</tbody></table></div>'
             else:
                 body = f'<pre style="font-size:.72rem;white-space:pre-wrap">{_esc(json.dumps(r, indent=2))}</pre>'
     return f"""<div style="padding:1rem;height:100%;overflow-y:auto;box-sizing:border-box">
                    {body}
-                   <button class="ui-btn" style="margin-top:1rem;color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"kimi_clear_all","branch":"kimi","lvl":2}}' hx-confirm="Delete the ENTIRE knowledge graph for this group? This cannot be undone.">Clear Entire Knowledge Group</button>
+                   <button class="ui-btn" style="margin-top:1rem;color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-indicator="#kg-clear-spin" hx-vals='{{"type":"kimi_clear_all","branch":"kimi","lvl":2}}' hx-confirm="Delete the ENTIRE knowledge graph for this group? This cannot be undone.">Clear Entire Knowledge Group <span id="kg-clear-spin" class="htmx-indicator spin">&#x25CC;</span></button>
                </div>"""
 
 async def _panel_graph(request):

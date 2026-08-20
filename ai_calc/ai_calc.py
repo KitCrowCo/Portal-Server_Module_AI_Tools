@@ -1,8 +1,9 @@
 """
-AI Calc - Speed/memory calculator, model finder, session monitor, hardware profiles.
+AI Calc - Speed/memory calculator, model finder, session monitor, hardware profiles, compare/sweep tools.
 Sub-module of ai_tools. Mounted at /module/ai_tools/ai_calc.
 
-Hardware profiles ARE CNodes (tools/ai_manager/resources.py) - no separate store. A CNode used only for connection routing doesn't need hardware fields; one used as a calculator/search hardware choice just has vram_gb/sys_ram_gb/etc. added via the Hardware tab here. Connections (Ollama, etc.) come from tools/ai_manager/connections.py - no separate connection scanning.
+Hardware profiles ARE CNodes (tools/ai_manager/resources.py) - no separate store. Connections (Ollama, etc.) come from tools/ai_manager/connections.py.
+Nearly everything here is an IM.scripts intent, not a route - the one GET route is the page load, per the platform's dispatch architecture.
 """
 import json, math, re, csv, threading, traceback, uuid, asyncio
 from pathlib import Path
@@ -11,7 +12,7 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
-TOOL_META = {"label": "AI Calc", "group": "model_tools", "icon": "&#x25B3;", "description": "Speed, context, benchmarks, model finder", "singleton": True}
+TOOL_META = {"label": "AI Calc", "group": "model_tools", "icon": "&#x25B3;", "description": "Speed, context, benchmarks, model finder, compare", "singleton": True}
 router = APIRouter(redirect_slashes=False)
 ENV = {}
 UI = BI = AIM = IM = TM = None
@@ -33,11 +34,10 @@ def load_config():
 
 # --- Hardware (CNode-backed) ---
 
-_HW_FIELDS = ("vram_gb", "shared_gb", "sys_ram_gb", "os_overhead_gb", "mem_bw_gbps", "gpu_tflops_fp16")
-_HW_DEFAULTS = {"vram_gb": 8.0, "shared_gb": 0.0, "sys_ram_gb": 16.0, "os_overhead_gb": 2.5, "mem_bw_gbps": 50.0, "gpu_tflops_fp16": 4.0}
-DEFAULT_HW = {"vram_gb": 16.0, "shared_gb": 8.0, "sys_ram_gb": 16.0, "os_overhead_gb": 3.5, "mem_bw_gbps": 89.0, "sys_ram_bw_gbps": 89.0, "gpu_tflops_fp16": 8.9, "gpu_eff": 0.72}
-_HW_LABELS = {"vram_gb": "Dedicated VRAM (GB)", "shared_gb": "Shared/iGPU VRAM (GB)", "sys_ram_gb": "System RAM (GB)", "os_overhead_gb": "OS Overhead (GB)", "mem_bw_gbps": "Memory Bandwidth (GB/s)", "gpu_tflops_fp16": "GPU TFLOPS FP16"}
-KNOWN_HW_REFS = [("Radeon 760M (iGPU, RDNA3 ~8CU)", 5.323, None), ("Radeon 780M (iGPU, RDNA3 12CU)", 8.91, None), ("Radeon 890M (iGPU, RDNA3.5 16CU, matrix/tensor path)", 5.94, None), ("Raspberry Pi 5 (CPU only, no usable GPU compute)", 0.15, 17.1),]
+_HW_FIELDS = ("vram_gb", "shared_gb", "sys_ram_gb", "os_overhead_gb", "mem_bw_gbps", "sys_ram_bw_gbps", "gpu_tflops_fp16")
+_HW_DEFAULTS = {"vram_gb": 8.0, "shared_gb": 0.0, "sys_ram_gb": 16.0, "os_overhead_gb": 2.5, "mem_bw_gbps": 50.0, "sys_ram_bw_gbps": 50.0, "gpu_tflops_fp16": 4.0}
+_HW_LABELS = {"vram_gb": "Dedicated VRAM (GB)", "shared_gb": "Shared/iGPU VRAM (GB)", "sys_ram_gb": "System RAM (GB)", "os_overhead_gb": "OS Overhead (GB)", "mem_bw_gbps": "Dedicated/iGPU Memory Bandwidth (GB/s)", "sys_ram_bw_gbps": "System RAM Bandwidth (GB/s)", "gpu_tflops_fp16": "GPU TFLOPS FP16 (matrix/tensor path, not vector)"}
+KNOWN_HW_REFS = [("Radeon 760M (iGPU, RDNA3 ~8CU)", 5.323, None), ("Radeon 780M (iGPU, RDNA3 12CU)", 8.91, None), ("Radeon 890M (iGPU, RDNA3.5 16CU, matrix/tensor path)", 5.94, None), ("Raspberry Pi 5 (CPU only, no usable GPU compute)", 0.15, 17.1)]
 
 GPU_EFF = 0.72  # fixed derate applied to raw bandwidth/flops - not yet per-node tunable, candidate for calibration once real logged data exists
 
@@ -62,6 +62,17 @@ def _hw_select_html(selected: str = "") -> str:
     opts = "".join(f'<option value="{c["id"]}" {"selected" if c["id"]==selected else ""}>{UI.escape(c.get("label",c["id"]))} ({c.get("vram_gb",0)+c.get("shared_gb",0):.0f}+{c.get("sys_ram_gb",0):.0f}GB)</option>' for c in hw_cnodes())
     return f"""<select name="cnode_id" class="module-select" style="width:auto">{opts or "<option value=''>(no hardware profiles - see Hardware tab)</option>"}</select>"""
 
+def _hw_ref_html() -> str:
+    rows = "".join(f"""<div style="display:flex;justify-content:space-between;align-items:center;padding:.2rem 0;font-size:.72rem;border-bottom:1px solid var(--border)">
+                            <span>{label}</span>
+                            <button type="button" class="cm-qbtn" onclick="document.querySelector('.hwin[name=gpu_tflops_fp16]').value={tflops};{f"document.querySelector('.hwin[name=sys_ram_bw_gbps]').value={bw};" if bw else ""}syncHW()">Apply {tflops} TFLOPS{f' / {bw} GB/s' if bw else ''}</button>
+                        </div>""" for label, tflops, bw in KNOWN_HW_REFS)
+    return f"""<details style="margin-bottom:.5rem;font-size:.75rem"><summary style="cursor:pointer;color:var(--text_muted)">Known hardware FP16 TFLOPS reference (click to apply)</summary>
+                   <div style="padding:.3rem 0">{rows}
+                       <div style="font-size:.65rem;color:var(--text_muted);padding-top:.3rem">NPUs aren't modeled - Ollama/llama.cpp inference doesn't currently route through the NPU on any known consumer setup, only iGPU/CPU/dGPU paths. Worth adding if that changes for your backend, not before.</div>
+                   </div>
+               </details>"""
+
 # --- Core Physics ---
 
 def arch_for(params_b):
@@ -82,6 +93,7 @@ def kv_cache_gb_for_ctx(params_b, ctx, kv_bits=8): return kv_bytes_per_token(par
 def max_ctx_tokens(params_b, avail_gb, kv_bits=8): return int(avail_gb * 1024**3 / max(kv_bytes_per_token(params_b, kv_bits), 1))
 
 def estimate_tps(params_b: float, quant: str, hw: dict) -> dict:
+    """Weights each half of the model separately by whichever bus it actually sits on - dedicated/iGPU bandwidth for the VRAM-resident portion, system-RAM bandwidth for anything spilled - rather than one blended figure."""
     mgb  = model_gb(params_b, quant)
     vt, tm, eff = total_vram(hw), total_mem(hw), hw["gpu_eff"]
     vram_bw, ram_bw = hw["mem_bw_gbps"], hw.get("sys_ram_bw_gbps", hw["mem_bw_gbps"])
@@ -110,10 +122,12 @@ def image_estimate(model_key, hw, steps=20):
     return {"feasible": True, "its": round(its, 2), "total_s": round(steps / max(its, 0.01), 1), "vram_min": m["vram_min_gb"], "note": m["note"]}
 
 # --- Scoring ---
+# All dimensions in SCORE_DIMS must be 0-1 normalized before weighting - _total_score does a single weighted average across them with no per-dim rescaling.
 
 _INTEL_WEIGHTS = {"hle": 4.0, "gpqa": 3.0, "mmlu_pro": 2.5, "ifeval": 2.5, "bbh": 2.0, "gsm8k": 1.5, "mmlu": 1.0, "arc": 1.0, "hellaswag": 0.5}
 
 def _compute_intelligence(scores):
+    """Weighted average of whatever fine-grained benchmarks are present, on the raw 0-100 scale those benchmarks report in. Caller normalizes to 0-1 - this function does not."""
     total = weight = 0.0
     for bench, w in _INTEL_WEIGHTS.items():
         if bench in scores: total += float(scores[bench]) * w; weight += w
@@ -125,16 +139,18 @@ def _sub_scores(perf, model, hw, target_tps):
     tps, tm, used, vt = perf.get("tps", 0.0), total_mem(hw), perf.get("total_mem_gb", 0), total_vram(hw)
     needed = perf.get("model_gb", 0.0) + perf.get("kv_gb", 0.0)
     pop_raw = math.log1p(model.get("likes", 0) or 0) * 0.4 + math.log1p(model.get("downloads", 0) or 0) * 0.6
+    intel_raw = _compute_intelligence(model.get("lb_detail", {}))  # 0-100 scale, or 0 if no fine-grained benchmarks matched
+    intel = intel_raw / 100.0 if intel_raw > 0 else raw_avg  # FIX: was stored un-normalized (0-100) against every other 0-1 dim, and fell to 0 with no fallback when lb_detail was empty even though leaderboard_avg had already been resolved
     return {"lb_avg": round(lb_avg, 4), "quant_qual": round(perf.get("quality_idx", 0.0), 4),
             "speed": round(min(tps / max(target_tps * 2.0, 1.0), 1.0) if tps > 0 else 0.0, 4),
             "mem_head": round(max(0.0, (tm - used) / max(tm, 1.0)), 4),
             "ctx_fit": round(min(needed, vt) / max(needed, 0.001) if needed > 0 else 1.0, 4),
             "popularity": round(min(pop_raw / 16.0, 1.0), 4),
-            "intel": round(_compute_intelligence(model.get("lb_detail", {})), 4)}  # FIX: was reading nonexistent "bench_detail" key - always 0
+            "intel": round(intel, 4)}
 
 def _total_score(sub, weights):
     tw = sum(weights.get(d, DEFAULT_WEIGHTS.get(d, 1)) for d in SCORE_DIMS)
-    return round(sum(sub.get(d, 0) * weights.get(d, DEFAULT_WEIGHTS.get(d, 1)) for d in SCORE_DIMS) / max(tw, 0.001), 4)  # FIX: was reading nonexistent per-dim "{d}_weight" from sub, ignoring caller weights entirely
+    return round(sum(sub.get(d, 0) * weights.get(d, DEFAULT_WEIGHTS.get(d, 1)) for d in SCORE_DIMS) / max(tw, 0.001), 4)
 
 def _rank_filtered(filtered: list, hw: dict, ctx: int, target_tps: float, weights: dict, top_n: int = 40, kv_bits: int = 8) -> list:
     rows = []
@@ -153,9 +169,7 @@ def _rank_filtered(filtered: list, hw: dict, ctx: int, target_tps: float, weight
 def _parse_weights(f): return {d: max(0.0, min(float(f.get(f"w_{d}", DEFAULT_WEIGHTS.get(d, 1))), 10.0)) for d in SCORE_DIMS}
 
 # --- Benchmark Resolution ---
-# Single cascade per model: curated static table (config-editable) -> HF card metadata -> base-model inheritance -> README table scrape.
-# A prior version of this file also had a broken parquet-scrape path that silently overrode this and returned confidence=0 for every
-# model - that path, and two other dead unused fetch functions, are gone. This is now the ONLY path that assigns bench scores.
+# Single cascade: curated static table (config-editable) -> HF card metadata -> base-model inheritance -> README table scrape.
 
 _BENCH_ALIASES = {"mmlu":"mmlu","massive multitask": "mmlu","mmlu_pro":"mmlu_pro","arc":"arc","arc_challenge":"arc","ai2_arc":"arc","hellaswag":"hellaswag","truthfulqa":"truthfulqa","truthful_qa":"truthfulqa","winogrande":"winogrande","gsm8k":"gsm8k","ifeval":"ifeval","humaneval":"humaneval","pass@1":"humaneval","bbh":"bbh","big bench hard":"bbh","gpqa":"gpqa","gpqa_diamond":"gpqa","hle":"hle"}
 
@@ -355,7 +369,8 @@ async def _pipeline(params):
         _job_up(step=f"Fetched {len(raw)} raw models - caching")
         cache.write_text(json.dumps(raw))
     params["fetched"] = len(raw)
-    _job_up(status=f"Filtering {len(raw)} models...", step=f"Params {params['min_params']}-{params['max_params']} | min_tps={params['min_tps']}")
+    min_quality = QUANTS.get(params.get("min_quant","Q2_K"), QUANTS["Q2_K"])["quality"]
+    _job_up(status=f"Filtering {len(raw)} models...", step=f"Params {params['min_params']}-{params['max_params']} | min_tps={params['min_tps']} | min_quant={params.get('min_quant','Q2_K')}")
     filtered, counts = [], {"oom": 0, "speed": 0, "params": 0, "quant": 0, "tags": 0, "exclude": 0}
     for idx, m in enumerate(raw):
         if idx % 50 == 0 and idx > 0: _job_up(step=f"  {idx}/{len(raw)} checked, {len(filtered)} passing")
@@ -365,17 +380,17 @@ async def _pipeline(params):
         if any_w and not any(w in blob for w in any_w): counts["tags"] += 1; continue
         pb = extract_params(m)
         if pb is None or not (params["min_params"] <= pb <= params["max_params"]): counts["params"] += 1; continue
-        avail = set(gguf_quants_from_siblings(m.get("siblings") or []))
+        avail = {q for q in gguf_quants_from_siblings(m.get("siblings") or []) if q in QUANTS and QUANTS[q]["quality"] >= min_quality}  # quality floor applied before a model is even kept, so a high-scoring Q2 can't win a search where it's below the acceptable floor (e.g. creative writing)
         if not avail: counts["quant"] += 1; continue
         any_fits = any_fast = False
-        for q in sorted(avail & set(QUANTS), key=lambda x: QUANTS[x]["bpp"]):
-            p = full_perf(pb, q, params["ctx_tokens"], hw)
+        for q in sorted(avail, key=lambda x: QUANTS[x]["bpp"]):
+            p = full_perf(pb, q, params["ctx_tokens"], hw, params.get("kv_bits", 8))
             if p["mem_ok"]:
                 any_fits = True
                 if p["tps"] >= params["min_tps"]: any_fast = True; break
         if not any_fits: counts["oom"] += 1; continue
         if not any_fast: counts["speed"] += 1; continue
-        filtered.append({**m, "params_b": pb, "avail_quants": sorted(avail & set(QUANTS), key=lambda q: QUANTS[q]["bpp"]), "leaderboard_avg": 0.0, "lb_detail": {}, "bench_confidence": 0.0, "bench_source": "none", "bench_inferred": False})
+        filtered.append({**m, "params_b": pb, "avail_quants": sorted(avail, key=lambda q: QUANTS[q]["bpp"]), "leaderboard_avg": 0.0, "lb_detail": {}, "bench_confidence": 0.0, "bench_source": "none", "bench_inferred": False})
     _job_up(step=f"Filter done: {len(filtered)} pass all hard gates")
     _job_up(status="Resolving benchmarks...", step=f"Checking {len(filtered)} models")
     bench_res = await _resolve_all_bench(filtered, deep)
@@ -388,7 +403,7 @@ async def _pipeline(params):
     _job_up(step=f"Bench resolved: {lb_hits}/{len(filtered)} have scores")
     with _job_lock: _job["filtered"] = filtered
     _job_up(status="Scoring...", step=f"target_tps={params['target_tps']}")
-    rows = _rank_filtered(filtered, hw, params["ctx_tokens"], params["target_tps"], params["weights"], params["top_n"])
+    rows = _rank_filtered(filtered, hw, params["ctx_tokens"], params["target_tps"], params["weights"], params["top_n"], params.get("kv_bits", 8))
     _write_csv(rows, key)
     top = rows[0] if rows else None
     _job_up(step=f"Done. Top: {top['id']} [{top['quant']}] score={top['total_score']}" if top else "Done - no results")
@@ -423,6 +438,48 @@ def _session_card_html(m, hw):
                    <div style="display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--bg);border:1px solid var(--border);margin-top:.3rem"><div style="width:{pct:.1f}%;background:#3d9aff"></div></div>
                    <div style="font-size:.65rem;color:var(--text_muted);margin-top:.15rem">{vram_gb:.1f} / {total_vram(hw):.0f} GB VRAM</div>
                </div>"""
+
+# --- SVG chart helpers (server-rendered, no client charting lib - matches this platform's no-framework-JS default) ---
+
+def _svg_bar_chart(items: list, value_key: str, label_key: str, width=680, height=300, title="") -> str:
+    if not items: return '<div class="dim" style="padding:1rem">No data to chart.</div>'
+    pad_l, pad_b, pad_t = 40, 60, 24
+    plot_w, plot_h = width - pad_l - 20, height - pad_b - pad_t
+    maxv = max(i[value_key] for i in items) or 1
+    bw = plot_w / len(items)
+    bars = labels = ""
+    for idx, it in enumerate(items):
+        v = it[value_key]; bh = (v / maxv) * plot_h
+        x, y = pad_l + idx * bw + bw * 0.12, pad_t + plot_h - (v / maxv) * plot_h
+        bars += f'<rect x="{x:.1f}" y="{y:.1f}" width="{bw*0.76:.1f}" height="{bh:.1f}" fill="#3d9aff" rx="3"/><text x="{x+bw*0.38:.1f}" y="{y-4:.1f}" font-size="10" fill="var(--text)" text-anchor="middle">{v:.1f}</text>'
+        labels += f'<text x="{x+bw*0.38:.1f}" y="{pad_t+plot_h+16:.1f}" font-size="9" fill="var(--text_muted)" text-anchor="middle" transform="rotate(28 {x+bw*0.38:.1f} {pad_t+plot_h+16:.1f})">{UI.escape(str(it[label_key])[:16])}</text>'
+    axis = f'<line x1="{pad_l}" y1="{pad_t+plot_h}" x2="{pad_l+plot_w}" y2="{pad_t+plot_h}" stroke="var(--border)"/><line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{pad_t+plot_h}" stroke="var(--border)"/>'
+    title_html = f'<text x="{width/2}" y="14" font-size="11" fill="var(--text_muted)" text-anchor="middle">{UI.escape(title)}</text>' if title else ""
+    return f'<svg viewBox="0 0 {width} {height}" style="width:100%;max-width:{width}px;height:auto;font-family:var(--font-mono)">{title_html}{axis}{bars}{labels}</svg>'
+
+def _svg_line_chart(series: list, width=680, height=320, title="") -> str:
+    """series: [{"label":str, "points":[(x,y),...]}, ...]. Auto-scales both axes across all series combined."""
+    all_pts = [p for s in series for p in s["points"]]
+    if not all_pts: return '<div class="dim" style="padding:1rem">No data to chart.</div>'
+    pad_l, pad_b, pad_t, pad_r = 54, 36, 24, 20
+    plot_w, plot_h = width - pad_l - pad_r, height - pad_b - pad_t
+    xs, ys = [p[0] for p in all_pts], [p[1] for p in all_pts]
+    xmin, xmax, ymin, ymax = min(xs), max(xs) or 1, 0, max(ys) or 1
+    def _sx(x): return pad_l + ((x - xmin) / max(xmax - xmin, 1e-9)) * plot_w
+    def _sy(y): return pad_t + plot_h - ((y - ymin) / max(ymax - ymin, 1e-9)) * plot_h
+    paths = dots = legend = ""
+    palette = ["#3d9aff", "#ff9a3c", "#00ffa2", "#b06aff"]
+    for i, s in enumerate(series):
+        pts = sorted(s["points"])
+        col = palette[i % len(palette)]
+        paths += f"""<path d="{' '.join(f"{'M' if j==0 else 'L'}{_sx(x):.1f},{_sy(y):.1f}" for j,(x,y) in enumerate(pts))}" fill="none" stroke="{col}" stroke-width="2"/>"""
+        dots += "".join(f"""<circle cx="{_sx(x):.1f}" cy="{_sy(y):.1f}" r="2.5" fill="{col}"/>""" for x,y in pts)
+        legend += f'<span style="display:inline-flex;align-items:center;gap:.25rem;margin-right:.8rem;font-size:.7rem;color:var(--text_muted)"><span style="width:.6rem;height:.6rem;border-radius:50%;background:{col};display:inline-block"></span>{UI.escape(s["label"])}</span>'
+    axis = f'<line x1="{pad_l}" y1="{pad_t+plot_h}" x2="{pad_l+plot_w}" y2="{pad_t+plot_h}" stroke="var(--border)"/><line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{pad_t+plot_h}" stroke="var(--border)"/>'
+    yticks = "".join(f'<text x="{pad_l-6}" y="{_sy(ymin+frac*(ymax-ymin))+3:.1f}" font-size="9" fill="var(--text_muted)" text-anchor="end">{ymin+frac*(ymax-ymin):.1f}</text>' for frac in (0,.25,.5,.75,1))
+    xticks = "".join(f'<text x="{_sx(xmin+frac*(xmax-xmin)):.1f}" y="{pad_t+plot_h+14}" font-size="9" fill="var(--text_muted)" text-anchor="middle">{xmin+frac*(xmax-xmin):.0f}</text>' for frac in (0,.25,.5,.75,1))
+    title_html = f'<text x="{width/2}" y="14" font-size="11" fill="var(--text_muted)" text-anchor="middle">{UI.escape(title)}</text>' if title else ""
+    return f'<div><svg viewBox="0 0 {width} {height}" style="width:100%;max-width:{width}px;height:auto;font-family:var(--font-mono)">{title_html}{axis}{yticks}{xticks}{paths}{dots}</svg><div style="margin-top:.3rem">{legend}</div></div>'
 
 # --- UI: Calculator ---
 
@@ -535,20 +592,25 @@ def _panel_search():
             <div class="frow wrap">
                 <label>Min T/s (hard floor)<input class="fin" name="min_tps" type="number" step="any" value="1.0"></label>
                 <label>Target T/s (score ref)<input class="fin" name="target_tps" type="number" step="any" value="5.0"></label>
+                <label>KV Cache Quant<select class="fin" name="kv_bits"><option value="16">FP16</option><option value="8" selected>INT8</option><option value="4">INT4</option></select></label>
+                <label>Minimum Model Quant<select class="fin" name="min_quant">{"".join(f'<option value="{q}" {"selected" if q=="Q3_K_M" else ""}>{q}</option>' for q in QUANTS)}</select><span class="dim tiny">excludes anything below this quality floor regardless of score</span></label>
+            </div>
+            <div class="frow wrap">
                 <label style="flex:2">Must contain ALL<input class="fin" name="must_contain" type="text" placeholder="instruct, chat"></label>
                 <label style="flex:2">Must contain ANY<input class="fin" name="any_contain" type="text" placeholder="creative, roleplay"></label>
+                <label style="flex:2">Exclude terms<input class="fin" name="exclude" type="text" placeholder="vision, embed, base"></label>
             </div>
             <div class="frow wrap">
                 <label style="flex:2">Extra HF query<input class="fin" name="extra_query" type="text"></label>
-                <label style="flex:2">Exclude terms<input class="fin" name="exclude" type="text" placeholder="vision, embed, base"></label>
                 <label>Results cap<input class="fin" name="top_n" type="number" value="40"></label>
             </div>
             <div class="fsect-hd" style="margin-top:.7rem">Scoring Weights</div>
             <div class="wsblock">{wsliders}</div>
-            <div class="frow" style="align-items:center;gap:1rem;margin-top:.5rem">
+            <div class="frow" style="align-items:center;gap:1rem;margin-top:.5rem;flex-wrap:wrap">
                 <label style="flex-direction:row;align-items:center;gap:.4rem;flex:0"><input type="checkbox" name="force_refresh" value="1"> Force HF refresh</label>
                 <label style="flex-direction:row;align-items:center;gap:.4rem;flex:0" title="Also scrapes each candidate's README.md - slower, higher hit rate"><input type="checkbox" name="deep_scan" value="1"> Deep bench scan</label>
                 <button class="rbtn" type="submit">Search &amp; Rank</button>
+                <button type="button" class="rbtn" style="background:var(--bg_panel)" hx-post="/im/in" hx-target="#srch-out" hx-swap="innerHTML" hx-include="closest form" hx-vals='{{"type":"ai_calc_rerank","branch":"ai_calc","lvl":2}}' title="Re-scores the last fetched result set with the current weights above, without re-querying HuggingFace">&#x21BB; Re-rank cached results</button>
             </div>
         </form>
         <div id="srch-out" class="rzone"><div class="placeholder">Configure and run search above</div></div>
@@ -559,7 +621,7 @@ def _search_html(res):
     total_w = sum(weights.get(d, 0) for d in SCORE_DIMS)
     sbar = (f'<div class="sbar">Fetched <b>{s.get("fetched","?")}</b> | Filtered <b>{s.get("passed","?")}</b> | Ranked <b>{s.get("ranked",len(rows))}</b> | '
             f'OOM <b>{s.get("oom","?")}</b> | Slow <b>{s.get("speed","?")}</b> | Bench <b>{s.get("lb_hits","?")}</b> hits{" [deep]" if s.get("deep") else ""} <span class="dim">&#8594; {Path(s.get("csv","")).name}</span></div>')
-    if not rows: return sbar + '<div class="placeholder">No results. Try a wider param range, lower min T/s, or fewer filters.</div>'
+    if not rows: return sbar + '<div class="placeholder">No results. Try a wider param range, lower min T/s, a lower minimum quant floor, or fewer filters.</div>'
     wleg = '<div class="wleg">' + "".join(f'<span class="wli"><span class="wld" style="background:{SCORE_DIM_COLORS.get(d,"#888")}"></span>{SCORE_DIM_LABELS.get(d,d)} <b>w={weights.get(d,0):.0f}</b></span>' for d in SCORE_DIMS) + '</div>'
     RC = ["#ffd700", "#c0c0c0", "#cd7f32"]
     cards = ""
@@ -597,6 +659,7 @@ def _hw_form_html(cnode):
     return f"""<form class="glass" style="padding:.7rem;display:flex;flex-direction:column;gap:.4rem" hx-post="/im/in" hx-target="body" hx-swap="none">
         <input type="hidden" name="type" value="ai_calc_hw_save"><input type="hidden" name="branch" value="ai_calc"><input type="hidden" name="lvl" value="2"><input type="hidden" name="cid" value="{cnode['id']}">
         <div style="font-weight:600;font-size:.8rem">{UI.escape(cnode.get("label",cnode["id"]))}</div>
+        {_hw_ref_html()}
         <div class="hwg">{fields}</div>
         <button type="submit" class="rbtn" style="align-self:flex-start">Save Hardware Specs</button>
     </form>"""
@@ -605,7 +668,7 @@ def _panel_hardware():
     rows = ""
     for c in AIM.resources.list_cnodes():
         has_hw = any(k in c for k in _HW_FIELDS)
-        spec = f'{c.get("vram_gb",0)+c.get("shared_gb",0):.0f}+{c.get("sys_ram_gb",0):.0f}GB | {c.get("mem_bw_gbps",0):.0f}GB/s' if has_hw else "no hardware specs yet"
+        spec = f'{c.get("vram_gb",0)+c.get("shared_gb",0):.0f}+{c.get("sys_ram_gb",0):.0f}GB | {c.get("mem_bw_gbps",0):.0f}/{c.get("sys_ram_bw_gbps",0):.0f}GB/s' if has_hw else "no hardware specs yet"
         rows += f"""<div class="glass" style="padding:.5rem .7rem;margin-bottom:.3rem"><div style="display:flex;align-items:center;gap:.5rem">
             <span style="flex:1;font-weight:600;font-size:.82rem">{UI.escape(c.get("label",c["id"]))}</span><span class="dim tiny">{UI.escape(", ".join(c.get("tags",[])))}</span><span class="dim tiny" style="font-family:var(--font-mono)">{spec}</span>
             <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{{"type":"ai_calc_hw_form","branch":"ai_calc","lvl":2,"cid":"{c["id"]}"}}'>Edit specs</button>
@@ -617,6 +680,35 @@ def _panel_hardware():
         <div id="hw-form-slot" style="margin-top:.6rem"></div>
     </div>"""
 
+# --- UI: Compare (frontier reference + sweep) ---
+
+def _frontier_chart_html():
+    items = sorted(({"name": r[0], "provider": r[1], "quality": r[2]} for r in PROPRIETARY_REFS), key=lambda i: i["quality"], reverse=True)
+    chart = _svg_bar_chart(items, "quality", "name", title="Leaderboard-style composite quality score")
+    rows = "".join(f'<tr><td>{UI.escape(r[0])}</td><td class="dim">{UI.escape(r[1])}</td><td>{r[2]}</td><td>{r[3]}</td><td>${r[4]}/M tok</td><td class="dim tiny">{UI.escape(r[5])}</td></tr>' for r in sorted(PROPRIETARY_REFS, key=lambda x: x[2], reverse=True))
+    return f'{chart}<div class="tbl-scroll" style="margin-top:.5rem"><table class="cmp-table"><thead><tr><th>Model</th><th>Provider</th><th>Quality</th><th>Coding</th><th>Cost</th><th>Note</th></tr></thead><tbody>{rows}</tbody></table></div>'
+
+def _panel_compare():
+    return f"""<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box">
+        <div class="fsect-hd">Frontier Model Reference</div>
+        <p class="dim tiny">What your local setup's speed/quality trade-off is actually competing against. Edit PROPRIETARY_REFS in ai_calc_config.json to update figures - not fetched live.</p>
+        <div id="cmp-frontier">{_frontier_chart_html()}</div>
+        <div class="fsect-hd" style="margin-top:1.2rem">Sweep: Context Window vs Speed</div>
+        <p class="dim tiny">Compares up to 3 model/quant combinations across a context-token range on the selected hardware - e.g. is a KV-cache size increase worth the speed you give up.</p>
+        <form class="pform" hx-post="/im/in" hx-target="#cmp-sweep-out" hx-swap="innerHTML">
+            <input type="hidden" name="type" value="ai_calc_sweep"><input type="hidden" name="branch" value="ai_calc"><input type="hidden" name="lvl" value="2">
+            <div class="frow wrap">
+                <label>Hardware{_hw_select_html()}</label>
+                <label>Ctx range min-max (tokens)<input class="fin" name="ctx_range" value="4096-65536"></label>
+                <label>Steps<input class="fin" name="ctx_steps" type="number" value="8"></label>
+                <label>KV Quant<select class="fin" name="kv_bits"><option value="16">FP16</option><option value="8" selected>INT8</option><option value="4">INT4</option></select></label>
+            </div>
+            {"".join(f'''<div class="frow wrap"><label>Series {i+1} Params (B){(" - required" if i==0 else " - optional")}<input class="fin" name="s{i}_params" type="number" step="any" value="{"7" if i==0 else ""}"></label><label>Quant<select class="fin" name="s{i}_quant">{_quant_opts()}</select></label></div>''' for i in range(3))}
+            <button class="rbtn" type="submit">Run Sweep</button>
+        </form>
+        <div id="cmp-sweep-out" class="rzone"></div>
+    </div>"""
+
 # --- Intent Handlers ---
 
 async def _render_panel(request, state):
@@ -624,6 +716,7 @@ async def _render_panel(request, state):
     if active == "search": return state, _panel_search()
     if active == "session": return state, '<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box" hx-post="/im/in" hx-vals=\'{"type":"ai_calc_session_poll","branch":"ai_calc","lvl":2}\' hx-trigger="load, every 5s" hx-target="this" hx-swap="innerHTML">Loading...</div>'
     if active == "hardware": return state, _panel_hardware()
+    if active == "compare": return state, _panel_compare()
     return state, _panel_calc()
 
 async def _h_calc_run(request, payload, imr):
@@ -658,12 +751,27 @@ async def _h_search(request, payload, imr):
               "min_tps": max(0.0, float(payload.get("min_tps",1.0) or 0)), "target_tps": max(0.1, float(payload.get("target_tps",5.0) or 0.1)),
               "extra_query": payload.get("extra_query",""), "must_contain": payload.get("must_contain",""), "any_contain": payload.get("any_contain",""), "exclude": payload.get("exclude",""),
               "hw": hw, "weights": _parse_weights(payload), "force_refresh": payload.get("force_refresh") == "1", "deep_scan": payload.get("deep_scan") == "1",
+              "kv_bits": int(payload.get("kv_bits", 8) or 8), "min_quant": payload.get("min_quant","Q2_K") if payload.get("min_quant","Q2_K") in QUANTS else "Q2_K",
               "top_n": max(5, min(int(payload.get("top_n",40) or 40), 200)), "fetched": 0}
     _job_reset(); _job_up(running=True, status="Starting...", params=params)
     threading.Thread(target=_run_thread, args=(params,), daemon=True).start()
     return imr.raw(_search_status_html())
 
 async def _h_search_status(request, payload, imr): return imr.raw(_search_status_html())
+
+async def _h_rerank(request, payload, imr):
+    """Re-scores the already-fetched candidate set against new weight sliders without re-querying HuggingFace - lets you compare weighting strategies live off one fetch, which is the same underlying need as the sweep tool: exploring a configuration space rather than accepting one fixed point."""
+    with _job_lock: filtered, params = _job.get("filtered"), _job.get("params")
+    if not filtered: return imr.raw('<div class="err-box">No cached search results to re-rank - run a search first.</div>')
+    weights = _parse_weights(payload)
+    rows = _rank_filtered(filtered, params["hw"], params["ctx_tokens"], params["target_tps"], weights, params["top_n"], params.get("kv_bits", 8))
+    _write_csv(rows, "rerank")
+    with _job_lock:
+        prior_stats = (_job.get("result") or {}).get("stats", {})
+        result = {"rows": rows, "stats": {**prior_stats, "csv": "data/ai_tools/ai_calc/analysis_rerank.csv"}, "weights": weights}
+        _job["result"] = result
+    return imr.raw(_search_html(result))
+
 async def _h_hw_form(request, payload, imr):
     c = AIM.resources.get_cnode(payload.get("cid",""))
     return imr.oob(_hw_form_html(c), "hw-form-slot") if c else imr
@@ -688,22 +796,31 @@ async def _h_session_poll(request, payload, imr):
         cards += "".join(_session_card_html(m, hw) for m in loaded) or '<div class="dim tiny" style="padding:.2rem 0">No models loaded.</div>'
     return imr.raw(cards)
 
-def _hw_ref_html():
-    rows = "".join(f"""<div style="display:flex;justify-content:space-between;align-items:center;padding:.2rem 0;font-size:.72rem;border-bottom:1px solid var(--border)">
-                            <span>{label}</span>
-                            <button type="button" class="cm-qbtn" onclick="document.querySelector('.hwin[name=gpu_tflops_fp16]').value={tflops};{f"document.querySelector('.hwin[name=sys_ram_bw_gbps]').value={bw};" if bw else ""}syncHW()">Apply {tflops} TFLOPS{f' / {bw} GB/s' if bw else ''}</button>
-                        </div>""" for label, tflops, bw in KNOWN_HW_REFS)
-    return f"""<details style="margin-bottom:.5rem;font-size:.75rem"><summary style="cursor:pointer;color:var(--text_muted)">Known hardware FP16 TFLOPS reference (click to apply)</summary>
-                   <div style="padding:.3rem 0">{rows}
-                       <div style="font-size:.65rem;color:var(--text_muted);padding-top:.3rem">NPUs aren't modeled - Ollama/llama.cpp inference doesn't currently route through the NPU on any known consumer setup, only iGPU/CPU/dGPU paths. Worth adding if that changes for your backend, not before.</div>
-                   </div>
-               </details>"""
+async def _h_sweep(request, payload, imr):
+    hw = get_hw(payload.get("cnode_id",""))
+    kv_bits = int(payload.get("kv_bits", 8) or 8)
+    try: lo, hi = (float(x) for x in payload.get("ctx_range","4096-65536").split("-"))
+    except Exception: lo, hi = 4096.0, 65536.0
+    steps = max(2, min(int(payload.get("ctx_steps",8) or 8), 30))
+    ctx_vals = [lo + (hi-lo)*i/(steps-1) for i in range(steps)]
+    series = []
+    for i in range(3):
+        raw = (payload.get(f"s{i}_params") or "").strip()
+        if not raw: continue
+        try: pb = float(raw)
+        except Exception: continue
+        quant = payload.get(f"s{i}_quant","Q4_K_M")
+        if quant not in QUANTS: continue
+        pts = [(c, full_perf(pb, quant, int(c), hw, kv_bits)["tps"]) for c in ctx_vals]
+        series.append({"label": f"{pb}B {quant}", "points": pts})
+    if not series: return imr.raw('<div class="err-box">Enter at least one series (Params + Quant) to sweep.</div>')
+    return imr.raw(_svg_line_chart(series, title="Tokens/sec vs context window"))
 
 def _hw_from_form(f) -> dict:
-    hw = DEFAULT_HW.copy()
-    for k, lo, hi in [("vram_gb", 0.5, 512), ("shared_gb", 0, 512), ("sys_ram_gb", 0, 1024), ("os_overhead_gb", 0, 64),("mem_bw_gbps", 1, 10000), ("sys_ram_bw_gbps", 1, 10000), ("gpu_tflops_fp16", 0.1, 1000)]:
+    hw = dict(_HW_DEFAULTS)
+    for k, lo, hi in [("vram_gb", 0.5, 512), ("shared_gb", 0, 512), ("sys_ram_gb", 0, 1024), ("os_overhead_gb", 0, 64), ("mem_bw_gbps", 1, 10000), ("sys_ram_bw_gbps", 1, 10000), ("gpu_tflops_fp16", 0.1, 1000)]:
         hw[k] = max(lo, min(float(f.get(k, hw[k])), hi))
-    hw["gpu_eff"] = DEFAULT_HW["gpu_eff"]
+    hw["gpu_eff"] = GPU_EFF
     return hw
 
 # --- Routes / Init ---
@@ -719,6 +836,7 @@ def _script():
                 if(sl){{ sl.value = ws[d]; var lbl = sl.parentElement.querySelector('.wsv'); if(lbl) lbl.textContent = ws[d]; }}
             }});
         }};
+        window.syncHW = function(){{}};  // hooked so _hw_ref_html's inline onclick has a stable target even before any hw form field listens; individual .hwin values are read generically on form submit, no per-field JS needed
     }})();
     function calcLogActual(cnodeId, paramsB, quant, ctx) {{
         var v = document.getElementById('calc-actual-tps').value; if (!v) return;
@@ -737,9 +855,10 @@ def init_tool(env, prefix):
     IM = env["InterfaceManager"](nesting_level=2, db_path="ai_tools/ai_calc_im.db")
     TM = BI.TabManager(namespace="ai_calc", tab_bar_id="calc-tab-bar", content_id="calc-panel", render_content_fn=_render_panel, intent_prefix="ai_calc", IM=IM, scope="user", nesting_level=2, allow_new=False, closable=False,
                         empty={"tabs": {"calc":{"id":"calc","order":0,"label":"Calculator","icon":"&#x223C;"}, "search":{"id":"search","order":1,"label":"Model Finder","icon":"&#x1F50D;"},
-                                        "session":{"id":"session","order":2,"label":"Session","icon":"&#x25CF;"}, "hardware":{"id":"hardware","order":3,"label":"Hardware","icon":"&#x1F5A5;"}}, "active":"calc"})
+                                        "compare":{"id":"compare","order":2,"label":"Compare","icon":"&#x1F4CA;"}, "session":{"id":"session","order":3,"label":"Session","icon":"&#x25CF;"}, "hardware":{"id":"hardware","order":4,"label":"Hardware","icon":"&#x1F5A5;"}}, "active":"calc"})
     IM.scripts.update({"ai_calc_run": [_h_calc_run], "ai_calc_image": [_h_image_calc], "ai_calc_log_actual": [_h_log_actual], "ai_calc_search": [_h_search],
-                        "ai_calc_search_status": [_h_search_status], "ai_calc_hw_form": [_h_hw_form], "ai_calc_hw_save": [_h_hw_save], "ai_calc_session_poll": [_h_session_poll]})
+                        "ai_calc_search_status": [_h_search_status], "ai_calc_rerank": [_h_rerank], "ai_calc_sweep": [_h_sweep],
+                        "ai_calc_hw_form": [_h_hw_form], "ai_calc_hw_save": [_h_hw_save], "ai_calc_session_poll": [_h_session_poll]})
     print("[ai_calc] ready")
 
 @router.get("")
@@ -753,7 +872,7 @@ async def root(request: Request):
         "toolbars": {"top": UI.toolbar(side="top", content=tab_bar, size="2.5rem", id="calc-top", nesting_level=2, start_open=True, locked=True)},
         "content": f'<div id="calc-panel" style="height:100%;overflow:hidden">{panel_html}</div>', "extra_css": CSS, "extra_script": _script()})
 
-def right_panel(): return '<div class="ait-rp"><div class="ait-rp-hd">AI Calc</div><div style="font-size:.72rem;color:var(--text_muted);padding:.3rem">Speed/memory calculator, model finder, session monitor, hardware profiles.</div></div>'
+def right_panel(): return '<div class="ait-rp"><div class="ait-rp-hd">AI Calc</div><div style="font-size:.72rem;color:var(--text_muted);padding:.3rem">Speed/memory calculator, model finder, hardware profiles, frontier compare, sweep.</div></div>'
 
 # --- CSS ---
 
