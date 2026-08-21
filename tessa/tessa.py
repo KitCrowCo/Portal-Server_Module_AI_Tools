@@ -44,15 +44,6 @@ def _list_projects(username):
         except: pass
     return out[:200]
 
-def _new_project(user):
-    cfg = _SETTINGS.get_group("defaults").load() if _SETTINGS else {}
-    return {"id": f"stu_{uuid.uuid4().hex[:8]}", "username": user.username, "title": "New Project",
-            "content": "", "conn_id": cfg.get("conn_id",""), "model": cfg.get("model",""),
-            "model_ctx": int(cfg.get("model_ctx", 32768)), "system_prompt": cfg.get("system_prompt",""),
-            "conversation": [], "selected_files": [], "context_summary": "",
-            "settings": {"view":"edit","font":"mono","wrap":True},
-            "created": datetime.utcnow().isoformat(), "modified": datetime.utcnow().isoformat()}
-
 def _compress(doc):
     hist = [m for m in doc.get("conversation",[]) if not m.get("deleted")]
     if len(hist) <= 40: return doc
@@ -62,9 +53,13 @@ def _compress(doc):
     doc["context_summary"] = (ex + " | " if ex else "") + " | ".join(lines)
     return doc
 
-async def _stream(conn, messages, model, num_ctx, think=False):
+def _new_project(user):
+    cfg = _SETTINGS.get_group("defaults").load() if _SETTINGS else {}
+    return {"id": f"stu_{uuid.uuid4().hex[:8]}", "username": user.username, "title": "New Project", "content": "", "conn_id": cfg.get("conn_id",""), "model": cfg.get("model",""), "model_ctx": int(cfg.get("model_ctx", 32768)), "system_prompt": cfg.get("system_prompt",""), "temperature": float(cfg.get("temperature", 0.7)), "conversation": [], "selected_files": [], "context_summary": "", "settings": {"view":"edit","font":"mono","wrap":True}, "created": datetime.utcnow().isoformat(), "modified": datetime.utcnow().isoformat()}
+
+async def _stream(conn, messages, model, num_ctx, think=False, temperature=0.7):
     try:
-        async for text, thinking in AIM.connections.stream_llm(conn, messages, model, think=think, num_ctx=num_ctx, num_predict=4096):
+        async for text, thinking in AIM.connections.stream_llm(conn, messages, model, think=think, num_ctx=num_ctx, num_predict=4096, temperature=temperature):
             yield text, thinking, False, None
         yield "", "", True, None
     except asyncio.CancelledError: yield "", "", True, None
@@ -156,7 +151,7 @@ def init_tool(env: dict, prefix: str):
     IM.scripts.update({"tessa_doc_apply_ai": [_h_doc_apply_ai], "tessa_doc_conn": [_h_doc_conn], "tessa_doc_model": [_h_doc_model], "tessa_doc_ctx": [_h_doc_ctx], "tessa_files_toggle": [_h_files_toggle]})
     IM.scripts["tessa_shadow_action"] = [_h_shadow_action]
     IM.scripts["tessa_git_action"] = [_h_git_action]
-    IM.scripts.update({"tessa_bottom_shadow_wiki":[_h_bottom_shadow_wiki], "tessa_bottom_shadow_kg":[_h_bottom_shadow_kg], "tessa_bottom_git":[_h_bottom_git], "tessa_bottom_git_link":[_h_bottom_git_link], "tessa_bottom_git_create_ws":[_h_bottom_git_create_ws]})
+    IM.scripts.update({"tessa_bottom_shadow_wiki":[_h_bottom_shadow_wiki], "tessa_bottom_shadow_kg":[_h_bottom_shadow_kg], "tessa_bottom_git":[_h_bottom_git], "tessa_bottom_git_link":[_h_bottom_git_link], "tessa_bottom_git_create_ws":[_h_bottom_git_create_ws], "tessa_doc_temp": [_h_doc_temp]})
     print("[tessa] ready")
 
 async def _handle_submit(request, payload, imr):
@@ -197,7 +192,7 @@ async def _do_stream(username, payload, pid, skip_user_append=False):
         if _tok(content) > int(num_ctx * 0.65): await _err(f"Input too long (~{_tok(content)}t, limit ~{int(num_ctx*0.65)}t for {num_ctx} context). Edit the message above and retry.", retry_mid=user_msg["id"] if user_msg else None); return
         files_txt = _files_content(doc.get("selected_files",[])); _ACTIVE.add(pid)
         try:
-            async for text, thinking, done, err in _stream(conn, _build_messages(doc, content, files_txt), model, num_ctx, think):
+            async for text, thinking, done, err in _stream(conn, _build_messages(doc, content, files_txt), model, num_ctx, think, doc.get("temperature", 0.7)):
                 if _STOP.pop(pid, False): break
                 if err: await _err(err, retry_mid=user_msg["id"] if user_msg else None); return
                 if text: full += text
@@ -238,13 +233,14 @@ def _proj_list_html(username, active_id=""):
     return out
 
 def _conn_bar_html(doc, conns, models):
-    pid = doc["id"]; cid = doc.get("conn_id",""); mdl = doc.get("model",""); ctx = doc.get("model_ctx",32768)
+    pid = doc["id"]; cid = doc.get("conn_id",""); mdl = doc.get("model",""); ctx = doc.get("model_ctx",32768); temp = doc.get("temperature", 0.7)
     c_opts = AIM.connections.conn_opts_html(cid) or '<option value="">No connections</option>'
     m_opts = "".join(f'<option value="{m}" {"selected" if m==mdl else ""}>{m}</option>' for m in models) or AIM.connections.model_opts_html(cid, mdl)
     return f"""<div style="display:flex;align-items:center;gap:.4rem;height:100%;padding:0 .2rem;overflow:hidden;">
         <select class="module-select" style="font-size:.7rem;max-width:8rem;flex-shrink:0" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_conn","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-target="#tessa-model-wrap" hx-swap="innerHTML" hx-include="this">{c_opts}</select>
         <div id="tessa-model-wrap" style="flex-shrink:0"><select class="module-select" style="font-size:.7rem;max-width:11rem" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_model","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none">{m_opts}</select></div>
         <label style="font-size:.6rem;color:var(--text_muted);white-space:nowrap;flex-shrink:0">ctx <input type="number" name="value" value="{ctx}" min="512" max="262144" class="module-select" style="width:5rem;font-size:.6rem;padding:.2rem .2rem" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_ctx","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none"></label>
+        <label style="font-size:.6rem;color:var(--text_muted);white-space:nowrap;flex-shrink:0">temp <input type="number" name="value" value="{temp}" min="0" max="2" step="any" class="module-select" style="width:4rem;font-size:.6rem;padding:.2rem .2rem" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_temp","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none"></label>
         <button class="btn-icon" style="font-size:.6rem;flex-shrink:0;margin-left:auto" hx-get="{_u("settings")}" hx-target="#tessa-center" hx-swap="innerHTML" title="Tessa Settings">&#x2699;</button>
     </div>"""
 
@@ -369,6 +365,11 @@ async def _h_doc_model(request, payload, imr):
 async def _h_doc_ctx(request, payload, imr):
     doc = _load(payload.get("branch",""))
     if doc: doc["model_ctx"] = max(512, int(payload.get("value",32768) or 32768)); _save(doc)
+    return imr
+
+async def _h_doc_temp(request, payload, imr):
+    doc = _load(payload.get("branch",""))
+    if doc: doc["temperature"] = max(0.0, min(float(payload.get("value", 0.7) or 0.7), 2.0)); _save(doc)
     return imr
 
 async def _h_files_toggle(request, payload, imr):

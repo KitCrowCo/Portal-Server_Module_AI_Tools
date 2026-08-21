@@ -441,8 +441,8 @@ def _session_card_html(m, hw):
 
 # --- SVG chart helpers (server-rendered, no client charting lib - matches this platform's no-framework-JS default) ---
 
-def _svg_bar_chart(items: list, value_key: str, label_key: str, width=680, height=300, title="") -> str:
-    if not items: return '<div class="dim" style="padding:1rem">No data to chart.</div>'
+def _svg_bar_chart(items: list, value_key: str, label_key: str, width=680, height=300, title="", color_key=None, color_true="#3d9aff", color_false="#ffaa44") -> str:
+    if not items: return '<div class="dim tiny" style="padding:1rem">No data to chart.</div>'
     pad_l, pad_b, pad_t = 40, 60, 24
     plot_w, plot_h = width - pad_l - 20, height - pad_b - pad_t
     maxv = max(i[value_key] for i in items) or 1
@@ -451,11 +451,15 @@ def _svg_bar_chart(items: list, value_key: str, label_key: str, width=680, heigh
     for idx, it in enumerate(items):
         v = it[value_key]; bh = (v / maxv) * plot_h
         x, y = pad_l + idx * bw + bw * 0.12, pad_t + plot_h - (v / maxv) * plot_h
-        bars += f'<rect x="{x:.1f}" y="{y:.1f}" width="{bw*0.76:.1f}" height="{bh:.1f}" fill="#3d9aff" rx="3"/><text x="{x+bw*0.38:.1f}" y="{y-4:.1f}" font-size="10" fill="var(--text)" text-anchor="middle">{v:.1f}</text>'
+        color = color_true if (color_key is None or it.get(color_key)) else color_false
+        bars += f'<rect x="{x:.1f}" y="{y:.1f}" width="{bw*0.76:.1f}" height="{bh:.1f}" fill="{color}" rx="3"/><text x="{x+bw*0.38:.1f}" y="{y-4:.1f}" font-size="10" fill="var(--text)" text-anchor="middle">{v:.1f}</text>'
         labels += f'<text x="{x+bw*0.38:.1f}" y="{pad_t+plot_h+16:.1f}" font-size="9" fill="var(--text_muted)" text-anchor="middle" transform="rotate(28 {x+bw*0.38:.1f} {pad_t+plot_h+16:.1f})">{UI.escape(str(it[label_key])[:16])}</text>'
     axis = f'<line x1="{pad_l}" y1="{pad_t+plot_h}" x2="{pad_l+plot_w}" y2="{pad_t+plot_h}" stroke="var(--border)"/><line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{pad_t+plot_h}" stroke="var(--border)"/>'
     title_html = f'<text x="{width/2}" y="14" font-size="11" fill="var(--text_muted)" text-anchor="middle">{UI.escape(title)}</text>' if title else ""
-    return f'<svg viewBox="0 0 {width} {height}" style="width:100%;max-width:{width}px;height:auto;font-family:var(--font-mono)">{title_html}{axis}{bars}{labels}</svg>'
+    legend = f'<div style="margin-top:.3rem;font-size:.7rem;color:var(--text_muted)"><span style="color:{color_true}">&#9632;</span> your search results &nbsp; <span style="color:{color_false}">&#9632;</span> frontier reference</div>' if color_key else ""
+    return f'<div><svg viewBox="0 0 {width} {height}" style="width:100%;max-width:{width}px;height:auto;font-family:var(--font-mono)">{title_html}{axis}{bars}{labels}</svg>{legend}</div>'
+
+def _svg_path_d(pts: list) -> str: return " ".join(f"{'M' if j==0 else 'L'}{x:.1f},{y:.1f}" for j, (x, y) in enumerate(pts))
 
 def _svg_line_chart(series: list, width=680, height=320, title="") -> str:
     """series: [{"label":str, "points":[(x,y),...]}, ...]. Auto-scales both axes across all series combined."""
@@ -470,10 +474,10 @@ def _svg_line_chart(series: list, width=680, height=320, title="") -> str:
     paths = dots = legend = ""
     palette = ["#3d9aff", "#ff9a3c", "#00ffa2", "#b06aff"]
     for i, s in enumerate(series):
-        pts = sorted(s["points"])
-        col = palette[i % len(palette)]
-        paths += f"""<path d="{' '.join(f"{'M' if j==0 else 'L'}{_sx(x):.1f},{_sy(y):.1f}" for j,(x,y) in enumerate(pts))}" fill="none" stroke="{col}" stroke-width="2"/>"""
-        dots += "".join(f"""<circle cx="{_sx(x):.1f}" cy="{_sy(y):.1f}" r="2.5" fill="{col}"/>""" for x,y in pts)
+        pts = sorted(s["points"]); col = palette[i % len(palette)]
+        sx_pts = [(_sx(x), _sy(y)) for x, y in pts]
+        paths += f'<path d="{_svg_path_d(sx_pts)}" fill="none" stroke="{col}" stroke-width="2"/>'
+        dots += "".join(f'<circle cx="{x:.1f}" cy="{y:.1f}" r="2.5" fill="{col}"/>' for x, y in sx_pts)
         legend += f'<span style="display:inline-flex;align-items:center;gap:.25rem;margin-right:.8rem;font-size:.7rem;color:var(--text_muted)"><span style="width:.6rem;height:.6rem;border-radius:50%;background:{col};display:inline-block"></span>{UI.escape(s["label"])}</span>'
     axis = f'<line x1="{pad_l}" y1="{pad_t+plot_h}" x2="{pad_l+plot_w}" y2="{pad_t+plot_h}" stroke="var(--border)"/><line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{pad_t+plot_h}" stroke="var(--border)"/>'
     yticks = "".join(f'<text x="{pad_l-6}" y="{_sy(ymin+frac*(ymax-ymin))+3:.1f}" font-size="9" fill="var(--text_muted)" text-anchor="end">{ymin+frac*(ymax-ymin):.1f}</text>' for frac in (0,.25,.5,.75,1))
@@ -619,9 +623,10 @@ def _panel_search():
 def _search_html(res):
     rows, s, weights = res["rows"], res["stats"], res.get("weights", DEFAULT_WEIGHTS)
     total_w = sum(weights.get(d, 0) for d in SCORE_DIMS)
-    sbar = (f'<div class="sbar">Fetched <b>{s.get("fetched","?")}</b> | Filtered <b>{s.get("passed","?")}</b> | Ranked <b>{s.get("ranked",len(rows))}</b> | '
+    sbar = (f'<div class="info-bar">Fetched <b>{s.get("fetched","?")}</b> | Filtered <b>{s.get("passed","?")}</b> | Ranked <b>{s.get("ranked",len(rows))}</b> | '
             f'OOM <b>{s.get("oom","?")}</b> | Slow <b>{s.get("speed","?")}</b> | Bench <b>{s.get("lb_hits","?")}</b> hits{" [deep]" if s.get("deep") else ""} <span class="dim">&#8594; {Path(s.get("csv","")).name}</span></div>')
     if not rows: return sbar + '<div class="placeholder">No results. Try a wider param range, lower min T/s, a lower minimum quant floor, or fewer filters.</div>'
+    frontier_html = _frontier_overlay_chart(rows)
     wleg = '<div class="wleg">' + "".join(f'<span class="wli"><span class="wld" style="background:{SCORE_DIM_COLORS.get(d,"#888")}"></span>{SCORE_DIM_LABELS.get(d,d)} <b>w={weights.get(d,0):.0f}</b></span>' for d in SCORE_DIMS) + '</div>'
     RC = ["#ffd700", "#c0c0c0", "#cd7f32"]
     cards = ""
@@ -642,7 +647,7 @@ def _search_html(res):
                 <div class="mqts" style="margin-top:.3rem">{avail_qt}</div>
                 <div class="mpop" style="margin-top:.3rem"><span>&#9829; {r.get("likes",0):,}</span><span>&#8659; {r.get("downloads",0):,}</span><a href="{hfu}" target="_blank" class="hfl">HuggingFace &#8594;</a></div>
             </div></details></div></div>"""
-    return f'{sbar}{wleg}<div class="clist">{cards}</div>'
+    return f'{sbar}{frontier_html}{wleg}<div class="clist">{cards}</div>'
 
 def _search_status_html():
     with _job_lock: running, status, progress, result, error = _job["running"], _job["status"], list(_job["progress"]), _job["result"], _job["error"]
@@ -676,7 +681,7 @@ def _panel_hardware():
     return f"""<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box;max-width:44rem">
         <div class="fsect-hd">Hardware Profiles (CNodes)</div>
         <p style="font-size:.75rem;color:var(--text_muted)">Hardware specs live directly on your CNodes - the same machines used for pipeline connection routing. Add specs to a CNode here to make it usable as a calculator/search hardware profile; a CNode with no specs still works fine for connection routing.</p>
-        {rows or '<div class="dim" style="padding:.5rem 0">No CNodes yet - add one via AI Managers Resource Pool button, then set its hardware specs here.</div>'}
+        {rows or '<div class="dim tiny" style="padding:.5rem 0">No CNodes yet - add one via AI Manager Resource Pool button, then set its hardware specs here.</div>'}
         <div id="hw-form-slot" style="margin-top:.6rem"></div>
     </div>"""
 
@@ -687,6 +692,15 @@ def _frontier_chart_html():
     chart = _svg_bar_chart(items, "quality", "name", title="Leaderboard-style composite quality score")
     rows = "".join(f'<tr><td>{UI.escape(r[0])}</td><td class="dim">{UI.escape(r[1])}</td><td>{r[2]}</td><td>{r[3]}</td><td>${r[4]}/M tok</td><td class="dim tiny">{UI.escape(r[5])}</td></tr>' for r in sorted(PROPRIETARY_REFS, key=lambda x: x[2], reverse=True))
     return f'{chart}<div class="tbl-scroll" style="margin-top:.5rem"><table class="cmp-table"><thead><tr><th>Model</th><th>Provider</th><th>Quality</th><th>Coding</th><th>Cost</th><th>Note</th></tr></thead><tbody>{rows}</tbody></table></div>'
+
+def _frontier_overlay_chart(rows: list, top_n: int = 8) -> str:
+    """Puts your top local search results on the SAME 0-100 quality scale as the proprietary reference table, so a score is legible against something externally verifiable rather than only against other unknown open-weight models."""
+    local = [{"name": f"{r['name']} [{r['quant']}]", "quality": r.get("leaderboard_avg") or (r["sub_scores"]["intel"] * 100), "is_local": True} for r in rows[:top_n]]
+    local = [i for i in local if i["quality"] > 0]
+    frontier = [{"name": p[0], "quality": p[2], "is_local": False} for p in PROPRIETARY_REFS]
+    items = sorted(local + frontier, key=lambda i: i["quality"], reverse=True)
+    if not local: return '<div class="dim tiny" style="padding:.4rem 0">None of your top results have benchmark data yet - frontier reference alone shown below in the Compare tab. Try Deep bench scan to fill this in.</div>'
+    return _svg_bar_chart(items, "quality", "name", title="Your top results vs frontier models (same quality scale)", color_key="is_local")
 
 def _panel_compare():
     return f"""<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box">
@@ -887,11 +901,6 @@ CSS = """
 .rzone{margin-top:.7rem}.placeholder{color:var(--text_muted);font-size:.84rem;padding:1.2rem 0;text-align:center}
 .fsect-hd{font-size:.73rem;font-weight:700;color:var(--text_muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.5rem}
 .dim{color:var(--text_muted)}.tiny{font-size:.7rem}
-.stat{background:var(--bg);border:1px solid var(--border);border-top:2px solid var(--sc);border-radius:6px;padding:.55rem .7rem}
-.sl{font-size:.65rem;color:var(--text_muted);text-transform:uppercase}.sv{font-size:1.3rem;font-weight:800;color:var(--sc)}.su{font-size:.7rem;font-weight:400}.ss{font-size:.66rem;color:var(--text_muted);margin-top:.15rem}
-.cmp-table{width:100%;border-collapse:collapse;font-size:.8rem;white-space:nowrap}
-.cmp-table th{padding:.3rem .6rem;text-align:left;border-bottom:1px solid var(--border);color:var(--text_muted)}
-.cmp-table td{padding:.28rem .6rem;border-bottom:1px solid var(--border)}.cmp-table tr.oom td{opacity:.35}
 .qn{font-family:var(--font-mono);font-weight:700;color:var(--accent)}
 .tbl-scroll{overflow-x:auto}
 .wsblock{display:flex;flex-direction:column;gap:.28rem;padding:.3rem 0}
@@ -913,7 +922,6 @@ CSS = """
 .bdg{font-size:.63rem;padding:.08rem .32rem;border-radius:3px;font-weight:700}.bl{color:#00ffa2}
 .mdet summary{cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none}.mdet-body{padding:.45rem 0 .15rem;border-top:1px solid var(--border);margin-top:.28rem}
 .lb-row{display:flex;flex-wrap:wrap;gap:.28rem}.lbp{font-size:.68rem;padding:.08rem .38rem;border-radius:3px;background:var(--surface);border:1px solid var(--border);font-family:var(--font-mono)}
-.err-box{color:#ff4444;background:#ff44441a;border:1px solid #ff444433;border-radius:6px;padding:.6rem .8rem;font-size:.82rem}
 .sbar{display:flex;flex-wrap:wrap;gap:.3rem .7rem;font-size:.72rem;color:var(--text_muted);margin-bottom:.5rem;padding:.4rem .6rem;background:var(--bg);border:1px solid var(--border);border-radius:5px}
 .status-bar{display:flex;align-items:center;gap:.6rem;padding:.45rem .65rem;background:var(--surface);border:1px solid var(--accent);border-radius:5px;font-size:.8rem;margin-bottom:.4rem}
 .spin-anim{color:var(--accent);font-family:var(--font-mono)}
