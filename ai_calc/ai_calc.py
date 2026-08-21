@@ -837,6 +837,9 @@ def _hw_from_form(f) -> dict:
     hw["gpu_eff"] = GPU_EFF
     return hw
 
+def estimate_for_pipeline(cnode_id: str, params_b: float, quant: str, ctx: int, kv_bits: int = 8) -> dict: return full_perf(params_b, quant, ctx, get_hw(cnode_id), kv_bits) #Stable entry point for other modules (engine.py's future sDAG optimizer, PipelineBuilderUI's preflight) to get a speed/memory estimate without importing ai_calc's UI internals.
+    
+
 # --- Routes / Init ---
 
 def _script():

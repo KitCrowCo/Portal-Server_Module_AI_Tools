@@ -151,13 +151,13 @@ def init_tool(env: dict, prefix: str):
     IM.scripts.update({"tessa_doc_apply_ai": [_h_doc_apply_ai], "tessa_doc_conn": [_h_doc_conn], "tessa_doc_model": [_h_doc_model], "tessa_doc_ctx": [_h_doc_ctx], "tessa_files_toggle": [_h_files_toggle]})
     IM.scripts["tessa_shadow_action"] = [_h_shadow_action]
     IM.scripts["tessa_git_action"] = [_h_git_action]
-    IM.scripts.update({"tessa_bottom_shadow_wiki":[_h_bottom_shadow_wiki], "tessa_bottom_shadow_kg":[_h_bottom_shadow_kg], "tessa_bottom_git":[_h_bottom_git], "tessa_bottom_git_link":[_h_bottom_git_link], "tessa_bottom_git_create_ws":[_h_bottom_git_create_ws], "tessa_doc_temp": [_h_doc_temp]})
+    IM.scripts.update({"tessa_bottom_shadow_wiki":[_h_bottom_shadow_wiki], "tessa_bottom_shadow_kg":[_h_bottom_shadow_kg], "tessa_bottom_git":[_h_bottom_git], "tessa_bottom_git_link":[_h_bottom_git_link], "tessa_bottom_git_create_ws":[_h_bottom_git_create_ws], "tessa_doc_temp": [_h_doc_temp], "tessa_stop": [_h_stop]})
     print("[tessa] ready")
 
 async def _handle_submit(request, payload, imr):
     pid = payload.get("cid","").strip(); content = payload.get("content","").strip()
     if not pid or not content: return imr
-    imr.raw(CM.working_html(pid, _u("stop", pid)))
+    imr.raw(CM.working_html(sid, {"type":"tessa_stop","cid":sid,"lvl":2}))
     imr.raw(f'<textarea id="cm-in-{pid}" name="content" class="cm-input" placeholder="Chat about this project\u2026 (Ctrl+Enter)" hx-swap-oob="outerHTML"></textarea>')
     _STREAM_TASKS[pid] = asyncio.create_task(_do_stream(request.state.user.username, payload, pid))
     await asyncio.sleep(0.05)
@@ -286,7 +286,7 @@ def _left_panel(username, doc):
 async def _project_view(request, doc, models=None):
     username = request.state.user.username
     is_working = doc["id"] in _ACTIVE
-    return (PE.render_shell(doc) + f"""<div id="tessa-conn-bar-content" hx-swap-oob="outerHTML">{_conn_bar_html(doc, AIM.connections.list_conns(), models or [])}</div><div id="tessa-chat-area" hx-swap-oob="outerHTML"><div id="tessa-chat-area" style="height:100%;overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username, is_working=is_working, stop_url=_u("stop",doc["id"]) if is_working else "")}</div></div><div id="tessa-proj-list" hx-swap-oob="innerHTML">{_proj_list_html(username, doc["id"])}</div><div id="tessa-left-bottom" hx-swap-oob="innerHTML">{_left_bottom_html(doc)}</div>""")
+    return (PE.render_shell(doc) + f"""<div id="tessa-conn-bar-content" hx-swap-oob="outerHTML">{_conn_bar_html(doc, AIM.connections.list_conns(), models or [])}</div><div id="tessa-chat-area" hx-swap-oob="outerHTML"><div id="tessa-chat-area" style="height:100%;overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username, is_working=is_working, stop_intent={"type":"tessa_stop","cid":sid,"lvl":2} if is_working else "")}</div></div><div id="tessa-proj-list" hx-swap-oob="innerHTML">{_proj_list_html(username, doc["id"])}</div><div id="tessa-left-bottom" hx-swap-oob="innerHTML">{_left_bottom_html(doc)}</div>""")
 
 @router.get("")
 @router.get("/")
@@ -387,12 +387,10 @@ async def _h_files_toggle(request, payload, imr):
     imr.oob(_kg_html(doc), "tessa-kg-section", swap="outerHTML")
     return imr
 
-@router.post("/stop/{pid}")
-async def stop_stream(pid: str):
-    _STOP[pid] = True
-    task = _STREAM_TASKS.pop(pid, None)
-    if task and not task.done(): task.cancel()
-    return HTMLResponse("")
+async def _h_stop(request, payload, imr):
+    sid = payload.get("cid","")
+    if sid: _STOP_FLAGS[sid] = True
+    return imr
 
 @router.post("/doc/toggle_task/{pid}")
 async def doc_toggle_task(pid: str, request: Request):

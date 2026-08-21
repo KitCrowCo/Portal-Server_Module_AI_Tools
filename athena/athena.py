@@ -90,6 +90,7 @@ def init_tool(env:dict, prefix:str):
                        "athena_cap_add": [_h_cap_add],
                        "athena_cap_delete": [_h_cap_delete],
                        "athena_cap_save": [_h_cap_save],
+                       "athena_stop": [_h_stop],
                        "athena_cap_conn_change": [_h_cap_conn_change]})
     print(f"[athena] ready")
 
@@ -210,7 +211,7 @@ async def _handle_submit(request, payload:dict, imr):
     _save_conv(conv)
     imr.oob(CM.render_message(user_msg, is_me=True, can_delete=True, can_edit=True), f"cm-msgs-{sid}", swap="beforeend")
     imr.oob(_left(user.username, sid), "ath-left", swap="innerHTML")
-    imr.raw(CM.working_html(sid, _u("stop",sid)))
+    imr.raw(CM.working_html(sid, {"type":"athena_stop","cid":sid,"lvl":2}))
     imr.raw(f"""<textarea id="cm-in-{sid}" name="content" class="cm-input" placeholder="Type a message\u2026 (Ctrl+Enter)" spellcheck="true" hx-swap-oob="outerHTML"></textarea>""")
     cap = _resolve_capability(conv)
     target = _do_stream_pipeline if cap.get("flow_pipeline_id") else _do_stream
@@ -402,7 +403,8 @@ def _capability_bar_html(conv):
     confirm_attr = ' hx-confirm="Switching may require reprocessing context for this conversation - continue?"' if has_msgs else ""
     return f"""<select class="module-select" style="font-size:.72rem;max-width:12rem;margin:0" name="value" hx-post="/im/in" hx-target="body" hx-swap="none"
                        hx-vals='{_iv("athena_capability_change", cid=conv["id"])}' hx-trigger="change" hx-include="this"{confirm_attr}>{opts}</select>
-               <button class="btn-icon" style="font-size:.75rem" hx-post="/im/in" hx-target="#ath-chat-area" hx-swap="innerHTML" hx-vals='{_iv("athena_conv_settings_open", cid=conv["id"])}' title="Conversation Settings">&#x2699;</button>"""
+               """
+    # <button class="btn-icon" style="font-size:.75rem" hx-post="/im/in" hx-target="#ath-chat-area" hx-swap="innerHTML" hx-vals='{_iv("athena_conv_settings_open", cid=conv["id"])}' title="Conversation Settings">&#x2699;</button>
 
 def _file_chips_html(conv):
     sid = conv["id"]
@@ -425,8 +427,7 @@ def _chat_html(conv, requests = None):
                             </div>""")
     buf=_STREAM_BUFFERS.get(sid)
     is_working=bool(buf and not buf.get("done"))
-    shell=CM.shell(sid, messages=conv.get("messages",[]), viewer_name=conv.get("user_display",""), header_html=hdr, extra_footer=extra_footer,
-                   is_working=is_working, stop_url=_u("stop",sid) if is_working else "", owns_conversation=True)
+    shell=CM.shell(sid, messages=conv.get("messages",[]), viewer_name=conv.get("user_display",""), header_html=hdr, extra_footer=extra_footer, is_working=is_working, stop_intent={"type":"athena_stop","cid":sid,"lvl":2} if is_working else "", owns_conversation=True)
     resume=""
     if is_working:
         full=buf.get("full","")
@@ -707,6 +708,11 @@ async def _h_delete_file(request, payload, imr):
     _save_conv(conv)
     return imr.oob(_file_chips_html(conv), f"ath-files-{cid}", swap="innerHTML")
 
+async def _h_stop(request, payload, imr):
+    sid = payload.get("cid","")
+    if sid: _STOP_FLAGS[sid] = True
+    return imr
+
 # --- Intent handlers: capability + conversation settings ---
 
 async def _h_capability_change(request, payload, imr):
@@ -791,13 +797,6 @@ async def export_conv(cid: str, request: Request):
     md = "\n".join(lines)
     fname = re.sub(r'[^\w\-. ]', '_', conv.get("title","chat"))[:40] or "chat"
     return Response(md, media_type="text/markdown", headers={"Content-Disposition": f'attachment; filename="{fname}.md"'})
-
-@router.post("/stop/{sid}")
-async def conv_stop(sid:str):
-    """Kept as a plain route: ChatManager.working_html's stop_url is a shared-component contract expecting a URL string (used identically by Tessa).
-    Converting this one button to an intent means changing that shared contract, which is a real, worthwhile core-file change - flagged for a deliberate pass, not done silently here since it affects more than this module."""
-    _STOP_FLAGS[sid]=True
-    return HTMLResponse("")
 
 # --- Admin: general settings ---
 
