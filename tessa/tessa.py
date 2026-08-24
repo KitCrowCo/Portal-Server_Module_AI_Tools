@@ -241,6 +241,7 @@ def _conn_bar_html(doc, conns, models):
         <div id="tessa-model-wrap" style="flex-shrink:0"><select class="module-select" style="font-size:.7rem;max-width:11rem" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_model","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none">{m_opts}</select></div>
         <label style="font-size:.6rem;color:var(--text_muted);white-space:nowrap;flex-shrink:0">ctx <input type="number" name="value" value="{ctx}" min="512" max="262144" class="module-select" style="width:5rem;font-size:.6rem;padding:.2rem .2rem" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_ctx","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none"></label>
         <label style="font-size:.6rem;color:var(--text_muted);white-space:nowrap;flex-shrink:0">temp <input type="number" name="value" value="{temp}" min="0" max="2" step="any" class="module-select" style="width:4rem;font-size:.6rem;padding:.2rem .2rem" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_temp","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none"></label>
+        <span id="tessa-prefix-warn-{pid}" style="font-size:.6rem;color:#ffaa44"></span>
         <button class="btn-icon" style="font-size:.6rem;flex-shrink:0;margin-left:auto" hx-get="{_u("settings")}" hx-target="#tessa-center" hx-swap="innerHTML" title="Tessa Settings">&#x2699;</button>
     </div>"""
 
@@ -348,6 +349,11 @@ async def _h_doc_apply_ai(request, payload, imr):
     if last_ai: doc["content"] = last_ai; _save(doc)
     return imr.raw(PE.render_shell(doc))
 
+def _prefix_warn_html(pid, conn, field, has_history):
+    if not (conn and has_history and AIM.connections.is_prefix_breaking_change(conn, field)):
+        return f'<span id="tessa-prefix-warn-{pid}" hx-swap-oob="outerHTML" style="font-size:.6rem;color:#ffaa44"></span>'
+    return f'<span id="tessa-prefix-warn-{pid}" hx-swap-oob="outerHTML" style="font-size:.6rem;color:#ffaa44" title="This resets the connection\'s cached prompt prefix for this conversation - the next message reprocesses the full conversation instead of resuming.">&#x26A0; prefix reset on next message</span>'
+
 async def _h_doc_conn(request, payload, imr):
     pid = payload.get("branch",""); doc = _load(pid)
     if not doc: return imr
@@ -355,16 +361,21 @@ async def _h_doc_conn(request, payload, imr):
     conn = AIM.connections.get_conn(doc["conn_id"]); models = await AIM.connections.list_models_async(conn) if conn else []
     cur = doc.get("model",""); opts = "".join(f'<option value="{m}" {"selected" if m==cur else ""}>{m}</option>' for m in models) or '<option value="">No models</option>'
     imr.oob(f"""<select class="module-select" style="font-size:.7rem; max-width:11rem" name="value" hx-post="/im/in" hx-vals='{{"type":"tessa_doc_model","branch":"{pid}","lvl":2}}' hx-trigger="change" hx-include="this" hx-swap="none">{opts}</select>""", "tessa-model-wrap")
+    imr.raw(_prefix_warn_html(pid, conn, "model", bool(doc.get("conversation"))))
     return imr
 
 async def _h_doc_model(request, payload, imr):
-    doc = _load(payload.get("branch",""))
+    pid = payload.get("branch",""); doc = _load(pid)
     if doc: doc["model"] = payload.get("value",""); _save(doc)
+    conn = AIM.connections.get_conn(doc.get("conn_id","")) if doc else None
+    imr.raw(_prefix_warn_html(pid, conn, "model", bool(doc.get("conversation")) if doc else False))
     return imr
 
 async def _h_doc_ctx(request, payload, imr):
-    doc = _load(payload.get("branch",""))
+    pid = payload.get("branch",""); doc = _load(pid)
     if doc: doc["model_ctx"] = max(512, int(payload.get("value",32768) or 32768)); _save(doc)
+    conn = AIM.connections.get_conn(doc.get("conn_id","")) if doc else None
+    imr.raw(_prefix_warn_html(pid, conn, "num_ctx", bool(doc.get("conversation")) if doc else False))
     return imr
 
 async def _h_doc_temp(request, payload, imr):

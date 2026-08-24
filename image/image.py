@@ -137,9 +137,11 @@ async def _pick_base_image(request, payload, imr):
 
 async def _pick_mask_image(request, payload, imr):
     rel = payload.get("path", "")
+    fm = _fm()
     await _ui_state(request, {"selected_mask": rel})
     imr.oob(f'<input type="hidden" id="img-mask-path" name="mask_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-mask-path", swap="outerHTML")
     imr.oob(f'<span style="font-size:.7rem;color:var(--accent)">&#x2713; Using saved mask: {_esc(rel)}</span>', "img-mask-status", swap="outerHTML")
+    imr.raw(f'<script>imgLoadMaskCanvas({json.dumps(_data_uri(rel, fm))})</script>')
     return imr
 
 async def _pick_reference_image(request, payload, imr):
@@ -453,8 +455,8 @@ def _inpaint_panel_html(prompts, selected_prompt_id):
                     </details>
                     <div style="flex:1;overflow:auto;padding:.75rem;position:relative;text-align:center">
                         <div id="img-inpaint-canvas-wrap" style="position:relative;display:inline-block;max-width:100%">
-                            <canvas id="img-base-canvas" style="display:block;max-width:100%; background:var(--surface)"></canvas>
-                            <canvas id="img-mask-canvas" style="position:absolute;top:0;left:0;max-width:100%; opacity:.6; cursor:crosshair"></canvas>
+                            <canvas id="img-base-canvas" style="display:block;max-width:100%;background:var(--surface);position:relative;z-index:1"></canvas>
+                            <canvas id="img-mask-canvas" style="position:absolute;top:0;left:0;max-width:100%;opacity:.6;cursor:crosshair;z-index:2"></canvas>
                         </div>
                         <div id="img-inpaint-base-hint" style="margin-top:.4rem; font-size:.7rem;color:var(--text_muted)">Select an image above</div>
                     </div>
@@ -485,7 +487,7 @@ def _bottom_toolbar_inpaint_html(prompts, selected_prompt_id, selected_mask=""):
                        <form id="img-inpaint-form" hx-post="{_u("inpaint/submit")}" hx-target="#img-inpaint-status" style="display:flex;gap:.05rem;align-items:center">
                            <input type="hidden" name="image_path" id="img-base-path-mirror" form="img-inpaint-form" value="">
                            <input type="hidden" name="mask_path" id="img-mask-path" form="img-inpaint-form" value="">
-                           <button type="submit" class="button">&#x25B6; Queue Inpaint</button>
+                           <button type="button" class="button" onclick="imgQueueInpaint('{IM.branch_id}')">&#x25B6; Queue Inpaint</button>
                        </form>
                    </div>
                    <div id="img-mask-debug" style="font-size:.65rem;color:var(--text_muted);font-family:var(--font-mono)">save-mask: idle (never clicked)</div>
@@ -894,29 +896,55 @@ function imgLoadBaseCanvas(dataUri) {
     img.src = dataUri;
 }
 
+function imgLoadMaskCanvas(dataUri) {
+    var mc = document.getElementById('img-mask-canvas');
+    if (!mc || !mc.width || !dataUri) return;
+    var img = new Image();
+    img.onload = function() {
+        var mctx = mc.getContext('2d');
+        mctx.clearRect(0, 0, mc.width, mc.height);
+        mctx.drawImage(img, 0, 0, mc.width, mc.height);
+    };
+    img.src = dataUri;
+}
+
+function imgCanvasIsBlank(canvas) {
+    var ctx = canvas.getContext('2d');
+    var data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    for (var i = 3; i < data.length; i += 4) { if (data[i] !== 0) return false; }
+    return true;
+}
+
 function imgSaveMask(branchId) {
     const dbg = document.getElementById('img-mask-debug');
-    function setDbg(msg, color) { if (dbg) { dbg.textContent = 'save-mask: ' + msg; dbg.style.color = color || 'var(--text_muted)'; } console.log('[imgSaveMask]', msg);}
-    setDbg('button clicked, reading canvas...', '#ffcc00');
+    function setDbg(msg, color) { if (dbg) { dbg.textContent = 'save-mask: ' + msg; dbg.style.color = color || 'var(--text_muted)'; } }
+    return new Promise(function(resolve, reject) {
+        const mc = document.getElementById('img-mask-canvas');
+        if (!mc || !mc.width) { setDbg('FAILED - no canvas or canvas has zero width (select a base image first)', '#ff5f5f'); reject('no canvas'); return; }
+        let dataUrl;
+        try {
+            const tc = document.createElement('canvas');
+            tc.width = mc.width; tc.height = mc.height;
+            const cx = tc.getContext('2d');
+            cx.fillStyle = 'black'; cx.fillRect(0, 0, tc.width, tc.height);
+            cx.drawImage(mc, 0, 0);
+            dataUrl = tc.toDataURL('image/png');
+        } catch (e) { setDbg('FAILED - canvas extraction threw: ' + e.message, '#ff5f5f'); reject(e); return; }
+        const basePath = document.getElementById('img-base-path').value || 'mask';
+        htmx.ajax('POST', '/im/in', { values: { type: 'image_save_mask', branch: branchId, lvl: 2, mask_data: dataUrl, base_name: basePath }, swap: 'none' })
+            .then(function(){ setDbg('saved', '#00ffa2'); resolve(); })
+            .catch(function(e){ setDbg('FAILED - request rejected: ' + e, '#ff5f5f'); reject(e); });
+    });
+}
+
+function imgQueueInpaint(branchId) {
+    const maskPathInput = document.getElementById('img-mask-path');
     const mc = document.getElementById('img-mask-canvas');
-    if (!mc || !mc.width) { setDbg('FAILED — no canvas or canvas has zero width (did you select a base image first?)', '#ff5f5f'); return; }
-    let dataUrl;
-    try {
-        const tc = document.createElement('canvas');
-        tc.width = mc.width; tc.height = mc.height;
-        const cx = tc.getContext('2d');
-        cx.fillStyle = 'black';
-        cx.fillRect(0, 0, tc.width, tc.height);
-        cx.drawImage(mc, 0, 0);
-        dataUrl = tc.toDataURL('image/png');
-    } catch (e) { setDbg('FAILED — canvas extraction threw: ' + e.message, '#ff5f5f'); return; }
-    setDbg('canvas OK (' + dataUrl.length + ' chars), sending to server...', '#ffcc00');
-    const basePath = document.getElementById('img-base-path').value || 'mask';
-    if (typeof htmx === 'undefined') { setDbg('FAILED — htmx is not defined on this page', '#ff5f5f'); return; }
-    try {
-        htmx.ajax('POST', '/im/in', { values: { type: 'image_save_mask', branch: branchId, lvl: 2, mask_data: dataUrl, base_name: basePath }, swap: 'none',
-        }).then(() => { setDbg('request sent and completed — check status line above for server result', '#00ffa2');
-        }).catch((e) => { setDbg('FAILED — htmx.ajax rejected: ' + e, '#ff5f5f'); });
-    } catch (e) { setDbg('FAILED — htmx.ajax threw synchronously: ' + e.message, '#ff5f5f'); }
+    const form = document.getElementById('img-inpaint-form');
+    if (!maskPathInput.value && mc && mc.width && !imgCanvasIsBlank(mc)) {
+        imgSaveMask(branchId).then(function(){ htmx.trigger(form, 'submit'); });
+    } else {
+        htmx.trigger(form, 'submit');
+    }
 }
 """ + f'const _IMG_BASE = "{_u()}";'

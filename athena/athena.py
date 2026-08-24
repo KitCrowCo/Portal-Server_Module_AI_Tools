@@ -28,7 +28,7 @@ AIM = None
 BI = None
 cfg = {}
 
-DEFAULT_CAP = {"id":"standard", "label":"Standard", "conn_id":"", "model":"", "system_prompt":"You are a helpful, professional assistant.", "think": False, "num_predict": 8192, "model_ctx": 16384, "knowledge_enabled":False, "knowledge_conn_id":"", "flow_pipeline_id":"", "flow_result_key":"text", }
+DEFAULT_CAP = {"id":"standard", "label":"Standard", "conn_id":"", "model":"", "system_prompt":"You are a helpful, professional assistant.", "think": False, "num_predict": 8192, "model_ctx": 16384, "knowledge_enabled":False, "knowledge_conn_id":"", "flow_pipeline_id":"", "flow_result_key":"text", "allowed_roles": [], "allowed_users": []}
 
 def _u(*p): return "/".join(s.strip("/") for s in [_P,*p] if s)
 def _iv(intent_type, **extra): return json.dumps({"type": intent_type, "lvl": 2, **extra})
@@ -113,15 +113,27 @@ def _org(u): p=DATA_DIR/f"org_{u}.json"; return json.loads(p.read_text()) if p.e
 def _save_org(u,o): (DATA_DIR/f"org_{u}.json").write_text(json.dumps(o, indent=2))
 
 def _default_capability_id(user):
+    allowed = _visible_capabilities(user)
     override = cfg.get("user_overrides", {}).get(user.username)
-    if override: return override
-    return cfg.get("default_capability_id") or (cfg.get("capabilities") or [DEFAULT_CAP])[0].get("id","standard")
+    if override and any(c["id"] == override for c in allowed): return override
+    default = cfg.get("default_capability_id")
+    if default and any(c["id"] == default for c in allowed): return default
+    return allowed[0]["id"] if allowed else DEFAULT_CAP["id"]
 
 def _new_conv(user): return {"id": f"ath_{uuid.uuid4().hex[:8]}", "user_id": str(user.id), "username": user.username, "user_display": user.username, "title": "New Chat", "capability_id": _default_capability_id(user), "system_prompt_override": "", "model_ctx_override": None, "messages": [], "context_summary": "", "attached_files": [], "created": datetime.utcnow().isoformat(), "modified": datetime.utcnow().isoformat()}
 
 def _resolve_capability(conv) -> dict:
     caps = cfg.get("capabilities", []) or [DEFAULT_CAP]
     return next((c for c in caps if c.get("id") == conv.get("capability_id")), None) or caps[0]
+
+def _capability_allowed(cap, user) -> bool:
+    """Empty allowed_roles AND empty allowed_users means everyone - restriction only applies once at least one is set. Admins always pass, matching the pattern used elsewhere on this platform (e.g. module access)."""
+    if getattr(user, "role", "") == "admin": return True
+    roles, users = cap.get("allowed_roles") or [], cap.get("allowed_users") or []
+    if not roles and not users: return True
+    return getattr(user, "role", "") in roles or getattr(user, "username", "") in users
+
+def _visible_capabilities(user): return [c for c in (cfg.get("capabilities") or [DEFAULT_CAP]) if _capability_allowed(c, user)]
 
 def _conv_ctx_info(conv):
     if not conv: return ""
@@ -395,16 +407,13 @@ def _left(username, active=""):
 
 # --- Chat area ---
 
-def _capability_bar_html(conv):
-    caps = cfg.get("capabilities", []) or [DEFAULT_CAP]
+def _capability_bar_html(conv, user):
+    caps = _visible_capabilities(user)
     cur = conv.get("capability_id","")
-    has_msgs = bool([m for m in conv.get("messages",[]) if not m.get("deleted")])
     opts = "".join(f'<option value="{_esc(c["id"])}" {"selected" if c["id"]==cur else ""}>{_esc(c.get("label",c["id"]))}</option>' for c in caps)
-    confirm_attr = ' hx-confirm="Switching may require reprocessing context for this conversation - continue?"' if has_msgs else ""
-    return f"""<select class="module-select" style="font-size:.72rem;max-width:12rem;margin:0" name="value" hx-post="/im/in" hx-target="body" hx-swap="none"
-                       hx-vals='{_iv("athena_capability_change", cid=conv["id"])}' hx-trigger="change" hx-include="this"{confirm_attr}>{opts}</select>
-               """
-    # <button class="btn-icon" style="font-size:.75rem" hx-post="/im/in" hx-target="#ath-chat-area" hx-swap="innerHTML" hx-vals='{_iv("athena_conv_settings_open", cid=conv["id"])}' title="Conversation Settings">&#x2699;</button>
+    return f"""<select class="module-select" style="font-size:.7rem;max-width:12rem;margin:0" name="value" hx-post="/im/in" hx-target="body" hx-swap="none"
+                       hx-vals='{_iv("athena_capability_change", cid=conv["id"])}' hx-trigger="change" hx-include="this">{opts}</select>
+               <span id="ath-capability-warn" style="font-size:.65rem;color:#ffaa44"></span>"""
 
 def _file_chips_html(conv):
     sid = conv["id"]
@@ -415,16 +424,15 @@ def _file_chips_html(conv):
 
 def _chat_html(conv, requests = None):
     sid=conv["id"]
-    hdr=(f"""<span style="font-size:.8rem;font-weight:600;flex:1">{_esc(conv.get("title","Chat"))}</span>{_capability_bar_html(conv)}""")
+    hdr=(f"""<span style="font-size:.8rem;font-weight:600;flex:1">{_esc(conv.get("title","Chat"))}</span>{_capability_bar_html(conv, requests.state.user)}""")
     extra_footer = ""
-    if cfg.get("allow_files", True):
-        extra_footer = (f"""<div style="display:flex;align-items:center; gap:.2rem; flex-wrap:wrap;padding-top:.1rem">
-                                <label class="btn-icon" title="Attach file" style="cursor:pointer;font-size:.9rem;flex-shrink:0">&#x1F4CE;
-                                    <input type="file" name="files" multiple style="display:none" accept="image/*,.csv,.txt,.md,.xlsx,.xls,.pdf" hx-post="/im/in" hx-target="body" hx-swap="none" hx-encoding="multipart/form-data" hx-trigger="change" hx-vals='{_iv("athena_upload", cid=sid)}'>
-                                </label>
-                                <div id="ath-files-{sid}" style="display:flex;gap:.2rem;flex-wrap:wrap;flex:1;min-width:0">{_file_chips_html(conv)}</div>
-                                <a class="cm-qbtn" href="{_u("export",sid)}" download>&#x2B07; Export</a>
-                            </div>""")
+    if cfg.get("allow_files", True): extra_footer = (f"""<div style="display:flex;align-items:center; gap:.2rem; flex-wrap:wrap;padding-top:.1rem">
+                                                             <label class="btn-icon" title="Attach file" style="cursor:pointer;font-size:.9rem;flex-shrink:0">&#x1F4CE;
+                                                                 <input type="file" name="files" multiple style="display:none" accept="image/*,.csv,.txt,.md,.xlsx,.xls,.pdf" hx-post="/im/in" hx-target="body" hx-swap="none" hx-encoding="multipart/form-data" hx-trigger="change" hx-vals='{_iv("athena_upload", cid=sid)}'>
+                                                             </label>
+                                                             <div id="ath-files-{sid}" style="display:flex;gap:.2rem;flex-wrap:wrap;flex:1;min-width:0">{_file_chips_html(conv)}</div>
+                                                             <a class="cm-qbtn" href="{_u("export",sid)}" download>&#x2B07; Export</a>
+                                                         </div>""")
     buf=_STREAM_BUFFERS.get(sid)
     is_working=bool(buf and not buf.get("done"))
     shell=CM.shell(sid, messages=conv.get("messages",[]), viewer_name=conv.get("user_display",""), header_html=hdr, extra_footer=extra_footer, is_working=is_working, stop_intent={"type":"athena_stop","cid":sid,"lvl":2} if is_working else "", owns_conversation=True)
@@ -719,8 +727,19 @@ async def _h_capability_change(request, payload, imr):
     cid = payload.get("cid","")
     conv = _load_conv(cid)
     if not conv or conv.get("username") != request.state.user.username: return imr
-    conv["capability_id"] = payload.get("value","")
+    target = payload.get("value","")
+    if not any(c["id"] == target and _capability_allowed(c, request.state.user) for c in (cfg.get("capabilities") or [DEFAULT_CAP])): return imr
+    old_cap = _resolve_capability(conv)
+    conv["capability_id"] = target
     _save_conv(conv)
+    new_cap = _resolve_capability(conv)
+    conn = AIM.connections.get_conn(new_cap.get("conn_id",""))
+    has_history = bool([m for m in conv.get("messages",[]) if not m.get("deleted")])
+    changed = old_cap.get("conn_id") != new_cap.get("conn_id") or old_cap.get("model") != new_cap.get("model")
+    if conn and has_history and changed and AIM.connections.is_prefix_breaking_change(conn, "model"):
+        imr.oob('<span id="ath-capability-warn">&#x26A0; Switching capability resets this connection\'s cached prefix - the next reply reprocesses the full conversation.</span>', "ath-capability-warn", swap="outerHTML")
+    else:
+        imr.oob('<span id="ath-capability-warn"></span>', "ath-capability-warn", swap="outerHTML")
     imr.oob(_chat_html(conv, request), "ath-chat-area", swap="innerHTML")
     return imr
 
@@ -847,7 +866,7 @@ def _capability_card_html(cap):
                            <button type="button" class="btn-icon" style="color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_cap_delete", cap_id=cid_field)}' hx-confirm="Delete this capability?">&#x2715;</button>
                        </div>
                        <div style="display:flex;gap:.4rem;flex-wrap:wrap">
-                           <label style="flex:1;min-width:10rem;font-size:.72rem;color:var(--text_muted)">Connection
+                           <label style="flex:1;min-width:10rem;font-size:.7rem;color:var(--text_muted)">Connection
                                <select name="conn_id" class="module-select" hx-post="/im/in" hx-vals='{_iv("athena_cap_conn_change", cap_id=cid_field)}' hx-trigger="change" hx-include="closest form" hx-target="#cap-model-wrap-{cid_field}">
                                    <option value="">-- none --</option>{conn_opts}
                                </select>
@@ -859,7 +878,9 @@ def _capability_card_html(cap):
                            <label style="flex:1;min-width:8rem;font-size:.72rem;color:var(--text_muted)">Max Response Tokens<input type="number" name="num_predict" value="{cap.get('num_predict', cfg.get('num_predict',8192))}" class="module-select" title="Raise this for thinking-heavy models - thinking tokens count against this budget too."></label>
                        </div>
                        <label style="display:flex;align-items:center;gap:.4rem;font-size:.8rem"><input type="checkbox" name="think" value="1" {"checked" if cap.get("think") else ""}> Thinking mode (show chain of thought)</label>
-                       <label style="font-size:.72rem;color:var(--text_muted)">System Prompt (not shown to users)<textarea name="system_prompt" class="cm-input" rows="3">{_esc(cap.get('system_prompt',''))}</textarea></label>
+                       <label style="font-size:.7rem;color:var(--text_muted)">System Prompt (not shown to users)<textarea name="system_prompt" class="cm-input" rows="3">{_esc(cap.get('system_prompt',''))}</textarea></label>
+                       <label style="font-size:.7rem;color:var(--text_muted)">Allowed Roles (comma-sep, blank = everyone)<input type="text" name="allowed_roles" value="{','.join(cap.get('allowed_roles',[]))}" class="module-select"></label>
+                       <label style="font-size:.7rem;color:var(--text_muted)">Allowed Usernames (comma-sep, blank = everyone)<input type="text" name="allowed_users" value="{','.join(cap.get('allowed_users',[]))}" class="module-select"></label>
                        <div style="border-top:var(--border-thick) solid var(--border);padding-top:.5rem;display:flex;gap:.4rem;flex-wrap:wrap;align-items:flex-end">
                            <label style="display:flex;align-items:center;gap:.3rem;font-size:.78rem"><input type="checkbox" name="knowledge_enabled" value="1" {"checked" if cap.get("knowledge_enabled") else ""}> Knowledge Base</label>
                            <label style="flex:1;min-width:10rem;font-size:.72rem;color:var(--text_muted)">Knowledge Connection<select name="knowledge_conn_id" class="module-select"><option value="">-- none --</option>{kg_opts}</select></label>
@@ -914,6 +935,8 @@ async def _h_cap_save(request, payload, imr):
                "model_ctx": int(payload.get("model_ctx", 16384) or 16384),
                "num_predict": int(payload.get("num_predict", 8192) or 8192),
                "knowledge_enabled": payload.get("knowledge_enabled")=="1", "knowledge_conn_id": payload.get("knowledge_conn_id",""),
+               "allowed_roles": [r.strip() for r in payload.get("allowed_roles","").split(",") if r.strip()],
+               "allowed_users": [u.strip() for u in payload.get("allowed_users","").split(",") if u.strip()],
                "flow_pipeline_id": payload.get("flow_pipeline_id",""), "flow_result_key": payload.get("flow_result_key","text") or "text"}
     if existing: caps[caps.index(existing)] = updated
     else: caps.append(updated)
