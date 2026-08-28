@@ -253,7 +253,16 @@ async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=Fa
         knowledge_context = ""
         if cap.get("knowledge_enabled") and cap.get("knowledge_conn_id"):
             kg_conn = AIM.connections.get_conn(cap["knowledge_conn_id"], conn_type="lightrag")
-            if kg_conn: knowledge_context = await AIM.connections.lightrag_context_block(kg_conn, content, label="Company Knowledge")
+            if not kg_conn:
+                await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="font-size:.7rem;color:#ffaa44;padding:.2rem .4rem;border-left:var(--border-thick) solid #ffaa44">&#x26A0; Knowledge base enabled but connection is missing/deleted - answering without company knowledge.</div></div>')
+            else:
+                kg_result = await AIM.connections.lightrag_query_cached(kg_conn, content, "hybrid")
+                if kg_result.get("error"):
+                    await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="font-size:.7rem;color:#ff5f5f;padding:.2rem .4rem;border-left:var(--border-thick) solid #ff5f5f">&#x26A0; Knowledge lookup failed: {_esc(kg_result["error"][:200])} - answering without company knowledge.</div></div>')
+                else:
+                    kg_text = kg_result.get("response","").strip()
+                    knowledge_context = f"[Company Knowledge]\n{kg_text}\n" if kg_text else ""
+                    if not kg_text: await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="font-size:.65rem;color:var(--text_muted);padding:.1rem .4rem">(knowledge lookup returned no results for this question)</div></div>')
         try: built_msgs, truncated = _build_msgs(conv, content, knowledge_context)
         except ValueError as e: await _err(f"Context error: {e}"); return
         if truncated: await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="font-size:.7rem;color:#ffcc00;padding:.2rem .4rem;border-left:var(--border-thick) solid #ffcc00">&#x26A0; {truncated} older message{"s" if truncated>1 else ""} shifted out of context window.</div></div>')
@@ -314,8 +323,7 @@ async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=Fa
 
 async def _do_stream_pipeline(username: str, payload: dict, sid: str, skip_user_append=False):
     """A capability with flow_pipeline_id set hands the whole turn to an ai_manager pipeline instead of a direct chat call.
-    No live token streaming yet - the working indicator shows until the pipeline job finishes, then the result appears in one piece.
-    Live streaming for this path needs the shared interface_bridge.js pipeline_stream renderer wired up first (tracked separately, not Athena-specific)."""
+    Live token streaming for the pipeline's generate node(s) rides the same pipeline_stream WS push steps.py already emits (NodeContext.stream) - the listener below is best-effort: if interface_bridge.js's event-name mapping for step_start/error ever changes, this degrades to the old silent 'Working...' state rather than breaking, since job completion is still detected purely by polling below, not by any pushed event."""
     content = payload.get("content","").strip()
     async def _ws(html): await WS.send_personal_message(html, username); await asyncio.sleep(0.01)
     async def _err(msg): await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="color:#ff5f5f;font-size:.8rem;padding:.2rem .2rem">&#x26A0; {_esc(msg)}</div></div>{CM.working_hide_html(sid)}')
@@ -329,12 +337,21 @@ async def _do_stream_pipeline(username: str, payload: dict, sid: str, skip_user_
     pid = cap.get("flow_pipeline_id","")
     job_id, err = AIM.engine.submit(username, kind="id", pipeline_id=pid, inputs={"input": content})
     if err: await _err(f"Pipeline error: {err}"); return
+    await _ws(f"""<div id="cm-stream-{sid}" hx-swap-oob="innerHTML"><div data-pipeline-job="{job_id}" style="font-size:.75rem;color:var(--text_muted)">Starting pipeline\u2026</div></div>
+                  <script>if(!window._athenaPipelineBound){{window._athenaPipelineBound=true;
+                      document.addEventListener('pipeline:step_start',function(e){{var b=document.querySelector('[data-pipeline-job="'+e.detail.job_id+'"]');if(b)b.textContent='Running: '+(e.detail.node||'');}});
+                      document.addEventListener('pipeline:stream',function(e){{var b=document.querySelector('[data-pipeline-job="'+e.detail.job_id+'"]');if(b)b.textContent+=(e.detail.delta||'');}});
+                      document.addEventListener('pipeline:error',function(e){{var b=document.querySelector('[data-pipeline-job="'+e.detail.job_id+'"]');if(b)b.textContent='Error: '+(e.detail.message||JSON.stringify(e.detail));}});
+                  }}</script>""")
     job = None
     while True:
         await asyncio.sleep(1.0)
         job = AIM.engine.load_job(job_id)
         if not job or job["status"] in ("done","error","stopped","interrupted"): break
-    if not job or job["status"] != "done": await _err(f"Pipeline {job['status'] if job else 'lost'} - check AI Manager for node-level detail."); return
+    if not job or job["status"] != "done":
+        failed_node = next((n for n in (job["flow"]["nodes"] if job else []) if n.get("status") == "error"), None)
+        detail = f" - node '{failed_node.get('name') or failed_node['id']}': {failed_node.get('message','')}" if failed_node else ""
+        await _err(f"Pipeline {job['status'] if job else 'lost'}{detail}"); return
     result_key = cap.get("flow_result_key","text") or "text"
     full = str(job["data"].get(result_key,""))
     if not full: await _err(f"Pipeline finished but produced nothing under key '{result_key}' - check the pipeline's config with your admin."); return
