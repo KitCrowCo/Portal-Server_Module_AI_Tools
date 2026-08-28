@@ -29,6 +29,7 @@ BI = None
 cfg = {}
 
 DEFAULT_CAP = {"id":"standard", "label":"Standard", "conn_id":"", "model":"", "system_prompt":"You are a helpful, professional assistant.", "think": False, "num_predict": 8192, "model_ctx": 16384, "knowledge_enabled":False, "knowledge_conn_id":"", "flow_pipeline_id":"", "flow_result_key":"text", "allowed_roles": [], "allowed_users": []}
+_ACTIVE_TASKS:dict = {}  # sid -> asyncio.Task, guards against a second submit/retry/capability-switch racing an in-flight generation for the same conversation
 
 def _u(*p): return "/".join(s.strip("/") for s in [_P,*p] if s)
 def _iv(intent_type, **extra): return json.dumps({"type": intent_type, "lvl": 2, **extra})
@@ -90,6 +91,7 @@ def init_tool(env:dict, prefix:str):
                        "athena_cap_add": [_h_cap_add],
                        "athena_cap_delete": [_h_cap_delete],
                        "athena_cap_save": [_h_cap_save],
+                       "athena_cap_to_pipeline": [_h_cap_to_pipeline],
                        "athena_stop": [_h_stop],
                        "athena_cap_conn_change": [_h_cap_conn_change]})
     print(f"[athena] ready")
@@ -111,6 +113,13 @@ def _list_convs(u): return [c for c in (json.loads(p.read_text()) for p in sorte
 def _del_conv(cid): p=_cp(cid); p.unlink() if p.exists() else None
 def _org(u): p=DATA_DIR/f"org_{u}.json"; return json.loads(p.read_text()) if p.exists() else {"folders":{},"conv_folders":{}}
 def _save_org(u,o): (DATA_DIR/f"org_{u}.json").write_text(json.dumps(o, indent=2))
+
+def _think_effort(cap: dict) -> str:
+    """Normalizes legacy boolean 'think' values from before effort-level support existed, alongside the current '', 'low', 'medium', 'high' string format."""
+    v = cap.get("think", "")
+    if v is True: return "medium"
+    if v is False or v is None: return ""
+    return v
 
 def _default_capability_id(user):
     allowed = _visible_capabilities(user)
@@ -176,10 +185,10 @@ def _uploads_dir(cid): d=DATA_DIR/"uploads"/cid; d.mkdir(parents=True,exist_ok=T
 
 # --- Ollama streaming ---
 
-async def _stream_ollama(conn, msgs, model, ctx, think=False, images=None, temperature=0.7, num_predict=8192, top_k=40, top_p=0.8):
+async def _stream_ollama(conn, msgs, model, ctx, think="", images=None, temperature=0.7, num_predict=8192, top_k=40, top_p=0.8):
     if images and msgs: msgs[-1]["images"] = images
-    async for text, thinking in AIM.connections.stream_llm(conn, msgs, model, think=think, temperature=temperature, num_ctx=ctx, num_predict=num_predict, top_k=top_k, top_p=top_p):
-        yield text, thinking, False, None
+    async for text, thinking in AIM.connections.stream_llm(conn, msgs, model, think=False, temperature=temperature, num_ctx=ctx, num_predict=num_predict, top_k=top_k, top_p=top_p): yield text, thinking, False, None
+    # async for text, thinking, done, err in _stream_ollama(conn, msgs, model, ctx, think, images, temperature, num_predict, top_k, top_p): yield text, thinking, False, None
     yield "", "", True, None
 
 def _build_msgs(conv, user_msg, knowledge_context=""):
@@ -215,6 +224,7 @@ async def _handle_submit(request, payload:dict, imr):
     sid=payload.get("cid","").strip()
     content=payload.get("content","").strip()
     if not sid or not content: return imr
+    if sid in _ACTIVE_TASKS and not _ACTIVE_TASKS[sid].done(): return imr.raw('<span style="color:#ffaa44;font-size:.7rem">&#x26A0; Still generating - wait for it to finish or click Stop first.</span>')
     user = request.state.user
     conv = _load_conv(sid)
     if not conv or conv.get("username") != user.username: return imr
@@ -227,7 +237,7 @@ async def _handle_submit(request, payload:dict, imr):
     imr.raw(f"""<textarea id="cm-in-{sid}" name="content" class="cm-input" placeholder="Type a message\u2026 (Ctrl+Enter)" spellcheck="true" hx-swap-oob="outerHTML"></textarea>""")
     cap = _resolve_capability(conv)
     target = _do_stream_pipeline if cap.get("flow_pipeline_id") else _do_stream
-    asyncio.create_task(target(user.username, payload, sid, skip_user_append=True))
+    _ACTIVE_TASKS[sid] = asyncio.create_task(target(user.username, payload, sid, skip_user_append=True))
     return imr
 
 async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=False):
@@ -323,7 +333,7 @@ async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=Fa
 
 async def _do_stream_pipeline(username: str, payload: dict, sid: str, skip_user_append=False):
     """A capability with flow_pipeline_id set hands the whole turn to an ai_manager pipeline instead of a direct chat call.
-    Live token streaming for the pipeline's generate node(s) rides the same pipeline_stream WS push steps.py already emits (NodeContext.stream) - the listener below is best-effort: if interface_bridge.js's event-name mapping for step_start/error ever changes, this degrades to the old silent 'Working...' state rather than breaking, since job completion is still detected purely by polling below, not by any pushed event."""
+    Live rendering rides the real pipeline:running / pipeline:stream / pipeline:error events interface_bridge.js already dispatches from engine.py's per-node pushes and steps.py's NodeContext.stream - job completion is still detected purely by polling below, never by a pushed event, since pipeline:done fires per-node rather than once for the whole job and would be misleading as a completion signal for multi-node pipelines."""
     content = payload.get("content","").strip()
     async def _ws(html): await WS.send_personal_message(html, username); await asyncio.sleep(0.01)
     async def _err(msg): await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="color:#ff5f5f;font-size:.8rem;padding:.2rem .2rem">&#x26A0; {_esc(msg)}</div></div>{CM.working_hide_html(sid)}')
@@ -339,7 +349,7 @@ async def _do_stream_pipeline(username: str, payload: dict, sid: str, skip_user_
     if err: await _err(f"Pipeline error: {err}"); return
     await _ws(f"""<div id="cm-stream-{sid}" hx-swap-oob="innerHTML"><div data-pipeline-job="{job_id}" style="font-size:.75rem;color:var(--text_muted)">Starting pipeline\u2026</div></div>
                   <script>if(!window._athenaPipelineBound){{window._athenaPipelineBound=true;
-                      document.addEventListener('pipeline:step_start',function(e){{var b=document.querySelector('[data-pipeline-job="'+e.detail.job_id+'"]');if(b)b.textContent='Running: '+(e.detail.node||'');}});
+                      document.addEventListener('pipeline:running',function(e){{var b=document.querySelector('[data-pipeline-job="'+e.detail.job_id+'"]');if(b)b.textContent='Running: '+(e.detail.name||e.detail.node||'');}});
                       document.addEventListener('pipeline:stream',function(e){{var b=document.querySelector('[data-pipeline-job="'+e.detail.job_id+'"]');if(b)b.textContent+=(e.detail.delta||'');}});
                       document.addEventListener('pipeline:error',function(e){{var b=document.querySelector('[data-pipeline-job="'+e.detail.job_id+'"]');if(b)b.textContent='Error: '+(e.detail.message||JSON.stringify(e.detail));}});
                   }}</script>""")
@@ -697,7 +707,7 @@ async def _h_msg_retry_send(request, payload, imr):
     remaining="".join(CM.render_message(msg,is_me=(msg.get("role")=="user"), can_delete=True, can_edit=(msg.get("role")=="user")) for msg in conv["messages"] if not msg.get("deleted"))
     cap = _resolve_capability(conv)
     target = _do_stream_pipeline if cap.get("flow_pipeline_id") else _do_stream
-    asyncio.create_task(target(user.username,{"content":new_content},sid,skip_user_append=True))
+    _ACTIVE_TASKS[sid] = asyncio.create_task(target(user.username,{"content":new_content},sid,skip_user_append=True))
     return imr.oob(f'<div id="cm-msgs-{sid}" class="cm-msgs" data-pinned="true">{remaining}</div>', f"cm-msgs-{sid}", swap="outerHTML")
 
 # --- Intent handlers: attachments ---
@@ -742,6 +752,7 @@ async def _h_stop(request, payload, imr):
 
 async def _h_capability_change(request, payload, imr):
     cid = payload.get("cid","")
+    if cid in _ACTIVE_TASKS and not _ACTIVE_TASKS[cid].done(): return imr.oob('<span id="ath-capability-warn">&#x26A0; Wait for the current response to finish before switching capability.</span>', "ath-capability-warn", swap="outerHTML")
     conv = _load_conv(cid)
     if not conv or conv.get("username") != request.state.user.username: return imr
     target = payload.get("value","")
@@ -770,7 +781,7 @@ async def _h_conv_settings_open(request, payload, imr):
                                <h3 style="margin:0">Conversation Settings</h3>
                                <button class="close-btn" hx-post="/im/in" hx-target="#ath-chat-area" hx-swap="innerHTML" hx-vals='{_iv("athena_load", cid=cid)}'>&#x2715;</button>
                            </div>
-                           <div style="font-size:.75rem;color:var(--text_muted);margin-bottom:.8rem">Currently: <b>{_esc(cap.get("label",""))}</b> - {_esc(cap.get("model","(no model configured)"))}. These fields override that capability's defaults for this conversation only.</div>
+                           <div style="font-size:.7rem;color:var(--text_muted);margin-bottom:.8rem">Currently: <b>{_esc(cap.get("label",""))}</b> - {_esc(cap.get("model","(no model configured)"))}. These fields override that capability's defaults for this conversation only.</div>
                            <form hx-post="/im/in" hx-target="#ath-chat-area" hx-swap="innerHTML" style="display:flex;flex-direction:column;gap:.7rem">
                                <input type="hidden" name="type" value="athena_conv_settings_save"><input type="hidden" name="cid" value="{cid}"><input type="hidden" name="lvl" value="2">
                                <label style="font-size:.8rem;color:var(--text_muted)">System Prompt Override (blank = use capability default)
@@ -888,23 +899,32 @@ def _capability_card_html(cap):
                                    <option value="">-- none --</option>{conn_opts}
                                </select>
                            </label>
-                           <label id="cap-model-wrap-{cid_field}" style="flex:1;min-width:10rem;font-size:.72rem;color:var(--text_muted)">Model
+                           <label id="cap-model-wrap-{cid_field}" style="flex:1;min-width:10rem;font-size:.7rem;color:var(--text_muted)">Model
                                <select name="model" class="module-select"><option value="">(select connection first)</option>{model_opts}</select>
                            </label>
-                           <label style="flex:1;min-width:8rem;font-size:.72rem;color:var(--text_muted)">Context Tokens<input type="number" name="model_ctx" value="{cap.get('model_ctx',16384)}" class="module-select"></label>
-                           <label style="flex:1;min-width:8rem;font-size:.72rem;color:var(--text_muted)">Max Response Tokens<input type="number" name="num_predict" value="{cap.get('num_predict', cfg.get('num_predict',8192))}" class="module-select" title="Raise this for thinking-heavy models - thinking tokens count against this budget too."></label>
+                           <label style="flex:1;min-width:8rem;font-size:.7rem;color:var(--text_muted)">Context Tokens<input type="number" name="model_ctx" value="{cap.get('model_ctx',16384)}" class="module-select"></label>
+                           <label style="flex:1;min-width:8rem;font-size:.7rem;color:var(--text_muted)">Max Response Tokens<input type="number" name="num_predict" value="{cap.get('num_predict', cfg.get('num_predict',8192))}" class="module-select" title="Raise this for thinking-heavy models - thinking tokens count against this budget too."></label>
                        </div>
-                       <label style="display:flex;align-items:center;gap:.4rem;font-size:.8rem"><input type="checkbox" name="think" value="1" {"checked" if cap.get("think") else ""}> Thinking mode (show chain of thought)</label>
+                       <label style="font-size:.7rem;color:var(--text_muted)">
+                           Thinking Effort
+                           <select name="think" class="module-select">
+                               <option value="" {"selected" if _think_effort(cap)=="" else ""}>Off</option>
+                               <option value="low" {"selected" if _think_effort(cap)=="low" else ""}>Low</option>
+                               <option value="medium" {"selected" if _think_effort(cap)=="medium" else ""}>Medium</option>
+                               <option value="high" {"selected" if _think_effort(cap)=="high" else ""}>High</option>
+                           </select>
+                       </label>
                        <label style="font-size:.7rem;color:var(--text_muted)">System Prompt (not shown to users)<textarea name="system_prompt" class="cm-input" rows="3">{_esc(cap.get('system_prompt',''))}</textarea></label>
                        <label style="font-size:.7rem;color:var(--text_muted)">Allowed Roles (comma-sep, blank = everyone)<input type="text" name="allowed_roles" value="{','.join(cap.get('allowed_roles',[]))}" class="module-select"></label>
                        <label style="font-size:.7rem;color:var(--text_muted)">Allowed Usernames (comma-sep, blank = everyone)<input type="text" name="allowed_users" value="{','.join(cap.get('allowed_users',[]))}" class="module-select"></label>
                        <div style="border-top:var(--border-thick) solid var(--border);padding-top:.5rem;display:flex;gap:.4rem;flex-wrap:wrap;align-items:flex-end">
-                           <label style="display:flex;align-items:center;gap:.3rem;font-size:.78rem"><input type="checkbox" name="knowledge_enabled" value="1" {"checked" if cap.get("knowledge_enabled") else ""}> Knowledge Base</label>
-                           <label style="flex:1;min-width:10rem;font-size:.72rem;color:var(--text_muted)">Knowledge Connection<select name="knowledge_conn_id" class="module-select"><option value="">-- none --</option>{kg_opts}</select></label>
+                           <label style="display:flex;align-items:center;gap:.3rem;font-size:.8rem"><input type="checkbox" name="knowledge_enabled" value="1" {"checked" if cap.get("knowledge_enabled") else ""}> Knowledge Base</label>
+                           <label style="flex:1;min-width:10rem;font-size:.7rem;color:var(--text_muted)">Knowledge Connection<select name="knowledge_conn_id" class="module-select"><option value="">-- none --</option>{kg_opts}</select></label>
                        </div>
                        <div style="border-top:var(--border-thick) solid var(--border);padding-top:.5rem;display:flex;gap:.4rem;flex-wrap:wrap;align-items:flex-end">
-                           <label style="flex:1;min-width:10rem;font-size:.72rem;color:var(--text_muted)">Run via Pipeline instead of plain chat<select name="flow_pipeline_id" class="module-select"><option value="">-- none --</option>{pl_opts}</select></label>
-                           <label style="flex:1;min-width:8rem;font-size:.72rem;color:var(--text_muted)">Result Key<input type="text" name="flow_result_key" value="{_esc(cap.get('flow_result_key','text'))}" class="module-select" placeholder="text"></label>
+                           <label style="flex:1;min-width:10rem;font-size:.7rem;color:var(--text_muted)">Run via Pipeline instead of plain chat<select name="flow_pipeline_id" class="module-select"><option value="">-- none --</option>{pl_opts}</select></label>
+                           <button type="button" class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"athena_cap_to_pipeline","cap_id":cid_field,"lvl":2})}' title="Generate a starter knowledge+generate pipeline from this capability's current fields, and point this capability at it">&#x2699; Build pipeline from this capability</button>
+                           <label style="flex:1;min-width:8rem;font-size:.7rem;color:var(--text_muted)">Result Key<input type="text" name="flow_result_key" value="{_esc(cap.get('flow_result_key','text'))}" class="module-select" placeholder="text"></label>
                        </div>
                        <button type="submit" class="button" style="align-self:flex-start">Save Capability</button>
                    </form>
@@ -947,18 +967,39 @@ async def _h_cap_save(request, payload, imr):
     caps = cfg.get("capabilities", []) or []
     existing = _cap_by_id(caps, cap_id)
     updated = {"id": cap_id, "label": payload.get("label","").strip() or cap_id,
-               "conn_id": payload.get("conn_id",""), "model": payload.get("model",""),
-               "system_prompt": payload.get("system_prompt",""), "think": payload.get("think")=="1",
+               "conn_id": payload.get("conn_id",""),
+               "model": payload.get("model",""),
+               "system_prompt": payload.get("system_prompt",""),
+                "think": payload.get("think","") or "",
                "model_ctx": int(payload.get("model_ctx", 16384) or 16384),
                "num_predict": int(payload.get("num_predict", 8192) or 8192),
-               "knowledge_enabled": payload.get("knowledge_enabled")=="1", "knowledge_conn_id": payload.get("knowledge_conn_id",""),
+               "knowledge_enabled": payload.get("knowledge_enabled")=="1",
+               "knowledge_conn_id": payload.get("knowledge_conn_id",""),
                "allowed_roles": [r.strip() for r in payload.get("allowed_roles","").split(",") if r.strip()],
                "allowed_users": [u.strip() for u in payload.get("allowed_users","").split(",") if u.strip()],
-               "flow_pipeline_id": payload.get("flow_pipeline_id",""), "flow_result_key": payload.get("flow_result_key","text") or "text"}
+               "flow_pipeline_id": payload.get("flow_pipeline_id",""),
+               "flow_result_key": payload.get("flow_result_key","text") or "text"}
     if existing: caps[caps.index(existing)] = updated
     else: caps.append(updated)
     _save_capabilities(caps)
     return imr.oob(_capability_card_html(updated), f"cap-card-{cap_id}", swap="outerHTML")
+
+async def _h_cap_to_pipeline(request, payload, imr):
+    """Builds a starter knowledge-retrieval -> generate pipeline from this capability's current fields, pinned via conn_id so it runs with no CNode/resource-pool setup required. Points the capability's flow_pipeline_id at the result. Does not touch or remove the direct chat path - capabilities without a pipeline set still use it unchanged."""
+    if getattr(request.state.user, "role", "") != "admin": return imr
+    cap_id = payload.get("cap_id","")
+    caps = cfg.get("capabilities", []) or []
+    cap = _cap_by_id(caps, cap_id)
+    if not cap: return imr
+    pipeline = {"id": f"pl_{uuid.uuid4().hex[:10]}", "name": f"{cap.get('label',cap_id)} (from capability)", "owner": "athena", "tags": ["athena","knowledge"], "pool": AIM.engine.DEFAULT_POOL, "created": datetime.utcnow().isoformat(),
+        "flow": {"nodes": [
+            {"id":"n_retrieve","name":"Retrieve Context","type":"knowledge","config":{"mode":"query","query_template":"{input}","query_mode":"hybrid","conn_id":cap.get("knowledge_conn_id","")},"key_map":{"response":"kg_context"},"status":"idle"},
+            {"id":"n_answer","name":"Answer","type":"generate","config":{"modality":"text","conn_id":cap.get("conn_id",""),"model":cap.get("model",""),"system_prompt":cap.get("system_prompt",""),"user_template":"Context:\n{kg_context}\n\nQuestion: {input}","think":_think_effort(cap)},"key_map":{"text":"answer"},"extra_in_keys":["kg_context"],"status":"idle"}
+        ], "appearance": {}}}
+    AIM.engine.save_pipeline(pipeline)
+    cap["flow_pipeline_id"], cap["flow_result_key"] = pipeline["id"], "answer"
+    _save_capabilities(caps)
+    return imr.oob(_capability_card_html(cap), f"cap-card-{cap_id}", swap="outerHTML")
 
 @router.get("/admin")
 async def admin(request: Request):
