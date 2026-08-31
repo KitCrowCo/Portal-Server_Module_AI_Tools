@@ -5,7 +5,7 @@ Sub-module of ai_tools. Mounted at /module/ai_tools/kimi.
 Sources: the shared _knowledge dir (also used by Tessa/Athena pipelines) and the server-wide _common dir.
 All LightRAG protocol logic lives in AIM.connections.lightrag_* - this module is the UI, nothing duplicated here.
 """
-import json, asyncio
+import json, asyncio, docx
 from datetime import datetime
 from pathlib import Path
 from typing import List
@@ -21,6 +21,7 @@ _P = "/module/ai_tools/kimi"
 SYNC_STATE_FILE = Path("./data/ai_tools/kimi_sync_state.json")
 KG_DIR = Path("./data/ai_tools/_knowledge")
 COMMON_DIR = Path("./data/_common")
+SOURCESETS_PATH = Path("./data/ai_tools/kimi_sourcesets.json")
 
 UI = FM_KG = FM_COMMON = BI = IM = TM = AIM = cfg = None
 _SYNC_TASK = None
@@ -52,7 +53,9 @@ def init_tool(env: dict, prefix: str):
                                         "graph":{"id":"graph","order":3,"label":"Graph","icon":"&#x1F578;"}}, "active":"query"})
     IM.scripts["kimi_graph_limit"] = [_h_graph_limit]
     IM.scripts["kimi_graph_limit"] = [_h_graph_limit]
-    IM.scripts.update({"kimi_conn_select": [_h_conn_select], "kimi_health": [_h_health], "kimi_select_file": [_h_select_file], "kimi_ingest_selected": [_h_ingest_selected], "kimi_insert_text": [_h_insert_text], "kimi_query": [_h_query], "kimi_clear_all": [_h_clear_all], "kimi_doc_delete": [_h_doc_delete], "kimi_upload_modal": [_h_upload_modal], "kimi_sync_now": [_h_sync_now], "kimi_upload_kg": [lambda r,p,i: _h_upload(r,p,i,"kg")], "kimi_upload_common": [lambda r,p,i: _h_upload(r,p,i,"common")]})
+    IM.scripts.update({"kimi_move_modal": [_h_move_modal], "kimi_move": [_h_move]})
+    IM.scripts.update({"kimi_conn_select": [_h_conn_select], "kimi_health": [_h_health], "kimi_select_file": [_h_select_file], "kimi_ingest_selected": [_h_ingest_selected], "kimi_insert_text": [_h_insert_text], "kimi_query": [_h_query], "kimi_clear_all": [_h_clear_all], "kimi_doc_delete": [_h_doc_delete], "kimi_upload_modal": [_h_upload_modal], "kimi_sync_now": [_h_sync_now], "kimi_upload_kg": [lambda r,p,i: _h_upload(r,p,i,"kg")], "kimi_upload_common": [lambda r,p,i: _h_upload(r,p,i,"common")], "kimi_export_docx": [_h_export_docx], "kimi_chunk_selected": [_h_chunk_selected], "kimi_combine_selected": [_h_combine_selected]})
+    IM.scripts.update({"kimi_sourceset_save":[_h_sourceset_save],"kimi_sourceset_load":[_h_sourceset_load],"kimi_sourceset_delete":[_h_sourceset_delete]})
     print("[kimi] ready")
 
 def _ensure_sync_task():
@@ -73,6 +76,106 @@ async def _kg_state(request, state=None):
     s.setdefault("last_query", ""); s.setdefault("last_mode", "hybrid"); s.setdefault("last_result", "")
     return s
 
+def _chunk_text(text: str, target_chars: int = 4000) -> list:
+    """Splits on paragraph boundaries, packing consecutive paragraphs up to target_chars per chunk - never splits mid-paragraph."""
+    paras = text.split("\n\n")
+    chunks, cur = [], ""
+    for p in paras:
+        if cur and len(cur) + len(p) + 2 > target_chars: chunks.append(cur); cur = p
+        else: cur = f"{cur}\n\n{p}" if cur else p
+    if cur: chunks.append(cur)
+    return chunks
+
+def _load_sourcesets() -> dict: return json.loads(SOURCESETS_PATH.read_text()) if SOURCESETS_PATH.exists() else {}
+def _save_sourcesets(d: dict): SOURCESETS_PATH.parent.mkdir(parents=True, exist_ok=True); SOURCESETS_PATH.write_text(json.dumps(d, indent=2))
+
+def _sourceset_select_html() -> str:
+    sets = _load_sourcesets()
+    opts = "".join(f'<option value="{_esc(n)}">{_esc(n)} ({len(v.get("kg",[]))+len(v.get("common",[]))} files)</option>' for n,v in sets.items())
+    return f"""<div id="kg-sourceset-select" style="display:flex;gap:.2rem;align-items:center">
+                   <select id="kg-sourceset-picker" class="module-select" style="flex:1;font-size:.7rem"><option value="">-- source sets --</option>{opts}</select>
+                   <button type="button" class="cm-qbtn" onclick="htmx.ajax('POST','/im/in',{{values:{{type:'kimi_sourceset_load',branch:'kimi',lvl:2,name:document.getElementById('kg-sourceset-picker').value}},swap:'none'}})">Load</button>
+                   <button type="button" class="cm-qbtn" style="color:#ff5f5f" onclick="if(confirm('Delete this source set?'))htmx.ajax('POST','/im/in',{{values:{{type:'kimi_sourceset_delete',branch:'kimi',lvl:2,name:document.getElementById('kg-sourceset-picker').value}},swap:'none'}})">&#x2715;</button>
+               </div>"""
+
+async def _h_sourceset_save(request, payload, imr):
+    name = (payload.get("name") or "").strip()
+    if not name: return imr
+    s = await _kg_state(request)
+    sets = _load_sourcesets()
+    sets[name] = {"kg": s.get("selected_kg", []), "common": s.get("selected_common", [])}
+    _save_sourcesets(sets)
+    return imr.oob(_sourceset_select_html(), "kg-sourceset-select", swap="outerHTML")
+
+async def _h_sourceset_load(request, payload, imr):
+    entry = _load_sourcesets().get(payload.get("name",""))
+    if not entry: return imr
+    s = await _kg_state(request)
+    s["selected_kg"], s["selected_common"] = entry.get("kg",[]), entry.get("common",[])
+    await _kg_state(request, s)
+    imr.oob(_source_tree_html(FM_KG, s["selected_kg"], "kg"), "kg-tree-kg", swap="outerHTML")
+    imr.oob(_source_tree_html(FM_COMMON, s["selected_common"], "common"), "kg-tree-common", swap="outerHTML")
+    return imr
+
+async def _h_sourceset_delete(request, payload, imr):
+    sets = _load_sourcesets()
+    sets.pop(payload.get("name",""), None)
+    _save_sourcesets(sets)
+    return imr.oob(_sourceset_select_html(), "kg-sourceset-select", swap="outerHTML")
+
+async def _h_chunk_selected(request, payload, imr):
+    s = await _kg_state(request)
+    target = int(payload.get("chunk_size", 4000) or 4000)
+    log = []
+    for src, fm in (("kg", FM_KG), ("common", FM_COMMON)):
+        for rel in list(s.get(f"selected_{src}", [])):
+            try:
+                p = fm.resolve(rel)
+                if not p.is_file(): continue
+                chunks = _chunk_text(p.read_text(encoding="utf-8", errors="ignore"), target)
+                if len(chunks) < 2: log.append(f"{rel}: already fits in one chunk, skipped"); continue
+                stem, parent = p.stem, str(Path(rel).parent).lstrip("./")
+                for i, chunk in enumerate(chunks, 1):
+                    fm.write(f"{parent}/{stem}_{i:03d}.md" if parent else f"{stem}_{i:03d}.md", chunk)
+                log.append(f"{rel}: split into {len(chunks)} chunks")
+            except Exception as e: log.append(f"{rel}: error {e}")
+    imr.oob("".join(f'<div>{_esc(l)}</div>' for l in log) or '<div style="color:var(--text_muted)">Nothing selected.</div>', "kg-ingest-log")
+    imr.oob(_source_tree_html(FM_KG, s.get("selected_kg", []), "kg"), "kg-tree-kg", swap="outerHTML")
+    imr.oob(_source_tree_html(FM_COMMON, s.get("selected_common", []), "common"), "kg-tree-common", swap="outerHTML")
+    return imr
+
+async def _h_combine_selected(request, payload, imr):
+    s = await _kg_state(request)
+    out_name = (payload.get("combine_name") or "combined").strip()
+    src = payload.get("combine_src", "kg")
+    fm = FM_KG if src == "kg" else FM_COMMON
+    rels = sorted(s.get(f"selected_{src}", []))
+    if not rels: return imr.oob('<div style="color:var(--text_muted)">Select files from Knowledge or Common to combine.</div>', "kg-ingest-log")
+    parts = []
+    for rel in rels:
+        try: parts.append(f"# {rel}\n\n{fm.resolve(rel).read_text(encoding='utf-8', errors='ignore')}")
+        except Exception as e: parts.append(f"# {rel}\n\n[read error: {e}]")
+    dest = out_name if out_name.endswith(".md") else f"{out_name}.md"
+    fm.write(dest, "\n\n---\n\n".join(parts))
+    imr.oob(f'<div style="color:var(--accent)">Combined {len(rels)} file(s) into {_esc(dest)}</div>', "kg-ingest-log")
+    imr.oob(_source_tree_html(fm, s.get(f"selected_{src}", []), src), f"kg-tree-{src}", swap="outerHTML")
+    return imr
+
+async def _h_export_docx(request, payload, imr):
+    s = await _kg_state(request)
+    out_name = (payload.get("docx_name") or "export").strip()
+    parts = []
+    for src, fm in (("kg", FM_KG), ("common", FM_COMMON)):
+        for rel in s.get(f"selected_{src}", []):
+            try: parts.append(f"# {rel}\n\n{fm.resolve(rel).read_text(encoding='utf-8', errors='ignore')}")
+            except Exception as e: parts.append(f"# {rel}\n\n[read error: {e}]")
+    if not parts: return imr.oob('<div style="color:var(--text_muted)">Select files to export.</div>', "kg-ingest-log")
+    dest_name = out_name if out_name.endswith(".docx") else f"{out_name}.docx"
+    _md_to_docx("\n\n".join(parts), COMMON_DIR / dest_name)
+    imr.oob(f'<div style="color:var(--accent)">Exported to Common/{_esc(dest_name)} - open from the Wiki file browser to download.</div>', "kg-ingest-log")
+    imr.oob(_source_tree_html(FM_COMMON, s.get("selected_common", []), "common"), "kg-tree-common", swap="outerHTML")
+    return imr
+
 # --- Left panel (persistent, not part of tab switching) ---
 
 def _conn_select_html(active_id):
@@ -86,7 +189,7 @@ def _conn_select_html(active_id):
 
 def _source_tree_html(fm, selected, prefix):
     if not fm.root.exists(): return '<div style="color:var(--text_muted);font-size:.75rem;padding:.3rem">No files yet.</div>'
-    return UI.tree(items=fm.root, mode="file", selectable=True, selected=set(selected), post_url="/im/in", target=f"#kg-tree-{prefix}", swap="outerHTML", extra_vals={"type":"kimi_select_file","branch":"kimi","lvl":2,"src":prefix})
+    return UI.tree(items=fm.root, mode="file", selectable=True, selected=set(selected), post_url="/im/in", target=f"#kg-tree-{prefix}", swap="outerHTML", extra_vals={"type":"kimi_select_file","branch":"kimi","lvl":2,"src":prefix}, context_menu_url=f"{_u('ctx_menu')}?src={prefix}")
 
 async def _left_panel(request):
     s = await _kg_state(request)
@@ -106,15 +209,36 @@ async def _left_panel(request):
                         </details>
                     </div>
                     <div style="padding:.5rem;border-top:var(--border-thick) solid var(--border)">
-                        <button class="ui-btn" style="width:100%;justify-content:center" hx-post="/im/in" hx-target="body" hx-swap="none" hx-indicator="#kg-ingest-spin" hx-vals='{{"type":"kimi_ingest_selected","branch":"kimi","lvl":2}}'>&#x2191; Ingest Selected <span id="kg-ingest-spin" class="htmx-indicator spin">&#x25CC;</span></button>
-                        <span id="kg-ingest-spin" class="htmx-indicator spin" style="font-size:.8rem" title="Working...">&#x25CC;</span>
+                        <div style="font-size:.65rem;color:var(--text_muted);text-transform:uppercase;margin-bottom:.2rem">Source Sets</div>
+                        <div style="display:flex;gap:.2rem">
+                            <input type="text" id="kg-sourceset-name" placeholder="save selection as..." class="module-select" style="flex:1;font-size:.7rem">
+                            <button class="cm-qbtn" onclick="htmx.ajax('POST','/im/in',{{values:{{type:'kimi_sourceset_save',branch:'kimi',lvl:2,name:document.getElementById('kg-sourceset-name').value}},swap:'none'}})">Save</button>
+                        </div>
+                        <div id="kg-sourceset-select" style="margin-top:.2rem">{_sourceset_select_html()}</div>
+                    </div>
+                    <div style="padding:.5rem;border-top:var(--border-thick) solid var(--border)">
+                        <div style="font-size:.65rem;color:var(--text_muted);text-transform:uppercase;margin-bottom:.2rem">Batch Tools (act on files checked above)</div>
+                        <div style="display:flex;gap:.2rem">
+                            <input type="number" id="kg-chunk-size" value="4000" step="100" class="module-select" style="flex:1;font-size:.7rem" title="Approximate characters per chunk">
+                            <button class="ui-btn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='js:{{"type":"kimi_chunk_selected","branch":"kimi","lvl":2,"chunk_size":document.getElementById("kg-chunk-size").value}}'>&#x2702; Chunk</button>
+                        </div>
+                        <div style="display:flex;gap:.2rem;margin-top:.3rem">
+                            <input type="text" id="kg-combine-name" placeholder="combined file name" class="module-select" style="flex:1;font-size:.7rem">
+                            <button class="ui-btn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='js:{{"type":"kimi_combine_selected","branch":"kimi","lvl":2,"combine_name":document.getElementById("kg-combine-name").value,"combine_src":"kg"}}'>&#x1F517; Combine</button>
+                        </div>
+                        <div style="display:flex;gap:.2rem;margin-top:.3rem">
+                            <input type="text" id="kg-docx-name" placeholder="export file name" class="module-select" style="flex:1;font-size:.7rem">
+                            <button class="ui-btn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='js:{{"type":"kimi_export_docx","branch":"kimi","lvl":2,"docx_name":document.getElementById("kg-docx-name").value}}'>&#x1F4C4; Export .docx</button>
+                        </div>
+                    </div>
+                    <div style="padding:.5rem;border-top:var(--border-thick) solid var(--border)">
+                        <button class="ui-btn" style="width:100%;justify-content:center" hx-post="/im/in" hx-target="body" hx-swap="none" hx-indicator="#kg-ingest-spin" hx-vals='{{"type":"kimi_ingest_selected","branch":"kimi","lvl":2}}'>&#x2191; Ingest Selected <span id="kg-ingest-spin" class="htmx-indicator spin" title="Working...">&#x25CC;</span></button>
                         <div id="kg-ingest-log" style="font-size:.7rem;margin-top:.4rem;max-height:8rem;overflow-y:auto;font-family:var(--font-mono)"></div>
-                        <button class="ui-btn" style="width:100%;margin-top:.3rem" hx-post="/im/in" hx-target="body" hx-swap="none" hx-indicator="#kg-sync-spin" hx-vals='{{"type":"kimi_sync_now","branch":"kimi","lvl":2}}'>&#x21BB; Sync Now <span id="kg-sync-spin" class="htmx-indicator spin">&#x25CC;</span></button>
+                        <button class="ui-btn" style="width:100%;margin-top:.3rem" hx-post="/im/in" hx-target="body" hx-swap="none" hx-indicator="#kg-sync-spin" hx-vals='{{"type":"kimi_sync_now","branch":"kimi","lvl":2}}'>&#x21BB; Sync Now <span id="kg-sync-spin" class="htmx-indicator spin" title="Working...">&#x25CC;</span></button>
                         <div id="kg-sync-status" style="font-size:.7rem;margin-top:.2rem"></div>
                     </div>
                     <div id="kg-modal"></div>
                 </div>"""
-
 # --- Tab panels ---
 
 def build_field(k, spec):
@@ -355,6 +479,29 @@ async def _h_sync_now(request, payload, imr):
     asyncio.create_task(_run_sync_pass())
     return imr.oob('<span style="color:var(--accent);font-size:.7rem">&#x2713; Sync started (running in background)</span>', "kg-sync-status")
 
+def _md_to_docx(markdown_text: str, out_path: Path):
+    """First-pass markdown->docx converter covering the common cases (headers, paragraphs, bold/italic, lists). Not a full transpile of every markdown extension this codebase supports - tables/images/code blocks are left for a later pass."""
+    d = docx.Document()
+    for line in markdown_text.split("\n"):
+        stripped = line.strip()
+        if not stripped: d.add_paragraph(); continue
+        h = re.match(r'^(#{1,6})\s+(.*)$', stripped)
+        if h: d.add_heading(h.group(2), level=len(h.group(1))); continue
+        bullet = re.match(r'^[-*]\s+(.*)$', stripped)
+        if bullet: d.add_paragraph(bullet.group(1), style="List Bullet"); continue
+        numbered = re.match(r'^\d+\.\s+(.*)$', stripped)
+        if numbered: d.add_paragraph(numbered.group(1), style="List Number"); continue
+        p = d.add_paragraph()
+        pos = 0
+        for m in re.finditer(r'\*\*(.+?)\*\*|\*(.+?)\*', stripped):
+            if m.start() > pos: p.add_run(stripped[pos:m.start()])
+            run = p.add_run(m.group(1) or m.group(2))
+            if m.group(1): run.bold = True
+            else: run.italic = True
+            pos = m.end()
+        if pos < len(stripped): p.add_run(stripped[pos:])
+    d.save(str(out_path))
+
 # --- Scheduled sync ---
 
 def _load_sync_state() -> dict: return json.loads(SYNC_STATE_FILE.read_text()) if SYNC_STATE_FILE.exists() else {}
@@ -406,3 +553,30 @@ async def _panel_graph(request):
     except Exception as e: return f'<div style="padding:1rem;color:#ff5f5f">Graph fetch failed: {_esc(str(e))}</div>'
     if not dot: return '<div style="padding:1rem;color:var(--text_muted)">No graph data available.</div>'
     return f'<div style="padding:1rem;height:100%;overflow:auto;box-sizing:border-box">{BI.render_graphviz_block(dot, {})}</div>'
+
+async def _h_move_modal(request, payload, imr):
+    src = payload.get("src","kg")
+    fm = FM_KG if src == "kg" else FM_COMMON
+    path = payload.get("path","")
+    return imr.oob(BI.move_modal_html(f"kimi-move-{src}", f"/im/in", fm.folder_picker_html(), path, target_id=f"kg-tree-{src}", swap="outerHTML"), "kg-modal")
+
+async def _h_move(request, payload, imr):
+    src = payload.get("src","kg")
+    fm = FM_KG if src == "kg" else FM_COMMON
+    fm.move(payload.get("path",""), payload.get("parent",""))
+    s = await _kg_state(request)
+    return imr.oob(_source_tree_html(fm, s.get(f"selected_{src}", []), src), f"kg-tree-{src}", swap="outerHTML")
+
+@router.get("/raw/{src}/{path:path}")
+async def serve_raw(src: str, path: str):
+    fm = FM_KG if src == "kg" else FM_COMMON
+    p = fm.resolve(path)
+    if not p.exists(): raise HTTPException(404)
+    return FileResponse(p)
+
+@router.get("/ctx_menu")
+async def ctx_menu(path: str, src: str):
+    return HTMLResponse(f"""<div style="padding:.3rem .5rem;display:flex;flex-direction:column;gap:.25rem;font-size:.72rem">
+        <a href="{_u('raw', src, path)}" target="_blank" style="color:var(--accent)">&#x1F4C4; View</a>
+        <button class="btn-icon" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"kimi_move_modal","branch":"kimi","lvl":2,"src":src,"path":path})}'>&#x21C4; Move</button>
+    </div>""")

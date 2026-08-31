@@ -552,6 +552,7 @@ def _bottom_bar_html(doc):
                        <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals("shadow_kg")}'>Shadow (Knowledge)</button>
                        <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals("git")}'>Git Diff</button>
                        <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals("pipeline_form")}'>Run Pipeline on Project</button>
+                       <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"tessa_bottom_pipeline_run","lvl":2,"pid":pid})}'>Pipeline Builder</button>
                    </div>
                    <div id="tessa-bottom-content" style="flex:1;overflow-y:auto;padding:.4rem">{_shadow_rows_html()}</div>
                </div>"""
@@ -619,6 +620,8 @@ async def _h_bottom_pipeline_form(request, payload, imr):
                             <button type="submit" class="button">Run</button>
                         </form>
                         <div id="tessa-pipeline-out" style="margin-top:.5rem;font-size:.8rem;white-space:pre-wrap;font-family:var(--font-mono)"></div>""", "tessa-bottom-content")
+
+
 
 async def _h_bottom_pipeline_run(request, payload, imr):
     pid = payload.get("pid","")
