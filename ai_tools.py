@@ -1,5 +1,5 @@
 """
-AI Tools Module - router.py
+AI Tools Module
 Multi-tool AI dashboard shell. Discovers sub-tools from subdirectories.
 """
 import re, sys, json, uuid, importlib, importlib.util, pkg_resources, subprocess, httpx

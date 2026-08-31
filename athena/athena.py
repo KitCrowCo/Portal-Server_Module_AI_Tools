@@ -1,10 +1,8 @@
 # /modules/ai_tools/athena/athena.py
 """
-Athena - Managed AI chat. Thin front end over ai_manager's connections/pipeline layer - not an AI implementation
-of its own. Admin defines "capabilities" (labeled bundles of connection+model+system prompt+optional knowledge
-base+optional pipeline) as individually addable/editable blocks; users only ever pick a capability by its label,
-never a raw model name. Capability resolution happens live at send-time from admin config, not snapshotted into
-the conversation, so an admin fixing a capability's settings takes effect on existing conversations immediately.
+Athena - Managed AI chat. Thin front end over ai_manager's connections/pipeline layer - not an AI implementation of its own.
+Admin defines "capabilities" (labeled bundles of connection+model+system prompt+optional knowledge base+optional pipeline) as individually addable/editable blocks; users only ever pick a capability by its label, never a raw model name.
+Capability resolution happens live at send-time from admin config, not snapshotted into the conversation, so an admin fixing a capability's settings takes effect on existing conversations immediately.
 """
 import json, uuid, re, asyncio, base64
 from pathlib import Path
@@ -187,7 +185,7 @@ def _uploads_dir(cid): d=DATA_DIR/"uploads"/cid; d.mkdir(parents=True,exist_ok=T
 
 async def _stream_ollama(conn, msgs, model, ctx, think="", images=None, temperature=0.7, num_predict=8192, top_k=40, top_p=0.8):
     if images and msgs: msgs[-1]["images"] = images
-    async for text, thinking in AIM.connections.stream_llm(conn, msgs, model, think=False, temperature=temperature, num_ctx=ctx, num_predict=num_predict, top_k=top_k, top_p=top_p): yield text, thinking, False, None
+    async for text, thinking in AIM.connections.stream_llm(conn, msgs, model, think, temperature=temperature, num_ctx=ctx, num_predict=num_predict, top_k=top_k, top_p=top_p): yield text, thinking, False, None
     # async for text, thinking, done, err in _stream_ollama(conn, msgs, model, ctx, think, images, temperature, num_predict, top_k, top_p): yield text, thinking, False, None
     yield "", "", True, None
 

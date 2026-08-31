@@ -152,6 +152,7 @@ def init_tool(env: dict, prefix: str):
     IM.scripts["tessa_shadow_action"] = [_h_shadow_action]
     IM.scripts["tessa_git_action"] = [_h_git_action]
     IM.scripts.update({"tessa_bottom_shadow_wiki":[_h_bottom_shadow_wiki], "tessa_bottom_shadow_kg":[_h_bottom_shadow_kg], "tessa_bottom_git":[_h_bottom_git], "tessa_bottom_git_link":[_h_bottom_git_link], "tessa_bottom_git_create_ws":[_h_bottom_git_create_ws], "tessa_doc_temp": [_h_doc_temp], "tessa_stop": [_h_stop]})
+    IM.scripts.update({"tessa_bottom_pipeline_form": [_h_bottom_pipeline_form], "tessa_bottom_pipeline_run": [_h_bottom_pipeline_run]})
     print("[tessa] ready")
 
 async def _handle_submit(request, payload, imr):
@@ -550,6 +551,7 @@ def _bottom_bar_html(doc):
                        <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals("shadow_wiki")}'>Shadow (Wiki)</button>
                        <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals("shadow_kg")}'>Shadow (Knowledge)</button>
                        <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals("git")}'>Git Diff</button>
+                       <button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{vals("pipeline_form")}'>Run Pipeline on Project</button>
                    </div>
                    <div id="tessa-bottom-content" style="flex:1;overflow-y:auto;padding:.4rem">{_shadow_rows_html()}</div>
                </div>"""
@@ -604,6 +606,47 @@ async def _h_git_action(request, payload, imr):
     elif action == "reject": backend.reject(path)
     imr.oob(BI.shadow_review_html(backend, "tessa_git_action", {"pid":pid}, list_id="shadow-list-git"), "shadow-list-git", swap="innerHTML")
     return imr
+
+async def _h_bottom_pipeline_form(request, payload, imr):
+    pid = payload.get("pid","")
+    doc = _load(pid)
+    if not doc: return imr.oob("Project not found", "tessa-bottom-content")
+    pl_opts = "".join(f'<option value="{p["id"]}">{_esc(p.get("name",p["id"]))}</option>' for p in AIM.engine.list_pipelines())
+    return imr.oob(f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" style="display:flex;gap:.4rem;align-items:flex-end;flex-wrap:wrap;font-size:.8rem">
+                            <input type="hidden" name="type" value="tessa_bottom_pipeline_run"><input type="hidden" name="lvl" value="2"><input type="hidden" name="pid" value="{pid}">
+                            <label style="flex:1;min-width:12rem;color:var(--text_muted)">Run pipeline against this project<select name="pipeline_id" class="module-select"><option value="">-- select --</option>{pl_opts}</select></label>
+                            <label style="width:8rem;color:var(--text_muted)">Result Key<input type="text" name="result_key" value="text" class="module-select"></label>
+                            <button type="submit" class="button">Run</button>
+                        </form>
+                        <div id="tessa-pipeline-out" style="margin-top:.5rem;font-size:.8rem;white-space:pre-wrap;font-family:var(--font-mono)"></div>""", "tessa-bottom-content")
+
+async def _h_bottom_pipeline_run(request, payload, imr):
+    pid = payload.get("pid","")
+    doc = _load(pid)
+    if not doc: return imr.oob("Project not found", "tessa-pipeline-out")
+    plid = payload.get("pipeline_id","")
+    if not plid: return imr.oob('<span style="color:#ff5f5f">Pick a pipeline first</span>', "tessa-pipeline-out")
+    result_key = payload.get("result_key","text") or "text"
+    convo_text = "\n\n".join(f"{'User' if m.get('role')=='user' else 'AI'}: {m.get('content','')}" for m in doc.get("conversation",[]) if not m.get("deleted"))
+    job_id, err = AIM.engine.submit(request.state.user.username, kind="id", pipeline_id=plid, inputs={"document": doc.get("content",""), "conversation": convo_text, "input": doc.get("content","")})
+    if err: return imr.oob(f'<span style="color:#ff5f5f">{_esc(err)}</span>', "tessa-pipeline-out")
+    imr.oob('<span style="color:var(--text_muted)">Running\u2026</span>', "tessa-pipeline-out")
+    asyncio.create_task(_watch_pipeline_run(request.state.user.username, job_id, result_key))
+    return imr
+
+async def _watch_pipeline_run(username, job_id, result_key):
+    """Generic poll-to-completion for any pipeline run from Tessa - the pipeline itself decides what actually happens (handoff, summarize, translate, whatever), this just runs it and shows the declared result key."""
+    job = None
+    while True:
+        await asyncio.sleep(1.0)
+        job = AIM.engine.load_job(job_id)
+        if not job or job["status"] in ("done","error","stopped","interrupted"): break
+    if not job or job["status"] != "done":
+        await WS.send_personal_message(f'<div id="tessa-pipeline-out" hx-swap-oob="innerHTML"><span style="color:#ff5f5f">Pipeline {job["status"] if job else "lost"}</span></div>', username)
+        return
+    full = str(job["data"].get(result_key,""))
+    copy_btn = """<button type="button" class="ui-btn" style="margin-top:.4rem" onclick="cmCopyText(document.getElementById('tessa-pipeline-out').dataset.raw||'')">Copy Result</button>"""
+    await WS.send_personal_message(f'<div id="tessa-pipeline-out" hx-swap-oob="innerHTML" data-raw="{_esc(full)}">{_esc(full) or "(no output under that result key)"}{copy_btn}</div>', username)
 
 CSS = """
 #tessa-proj-list .active-item{background:var(--glass);border-left:.1rem solid var(--accent);}
