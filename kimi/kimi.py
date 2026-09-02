@@ -545,15 +545,6 @@ async def _scheduled_sync_loop():
 
 def right_panel() -> str: return """<div class="ait-rp"><div class="ait-rp-hd">Kimi</div><div style="font-size:.72rem;color:var(--text_muted);padding:.3rem">Knowledge Integration Manager - pick a knowledge group and ingest sources from the left panel.</div></div>"""
 
-async def _panel_graph(request):
-    s = await _kg_state(request)
-    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
-    if not conn: return '<div style="padding:1rem;color:var(--text_muted)">No connection selected.</div>'
-    try: dot = await AIM.connections.lightrag_graph_dot(conn)
-    except Exception as e: return f'<div style="padding:1rem;color:#ff5f5f">Graph fetch failed: {_esc(str(e))}</div>'
-    if not dot: return '<div style="padding:1rem;color:var(--text_muted)">No graph data available.</div>'
-    return f'<div style="padding:1rem;height:100%;overflow:auto;box-sizing:border-box">{BI.render_graphviz_block(dot, {})}</div>'
-
 async def _h_move_modal(request, payload, imr):
     src = payload.get("src","kg")
     fm = FM_KG if src == "kg" else FM_COMMON

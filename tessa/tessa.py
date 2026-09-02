@@ -158,7 +158,7 @@ def init_tool(env: dict, prefix: str):
 async def _handle_submit(request, payload, imr):
     pid = payload.get("cid","").strip(); content = payload.get("content","").strip()
     if not pid or not content: return imr
-    imr.raw(CM.working_html(sid, {"type":"tessa_stop","cid":sid,"lvl":2}))
+    imr.raw(CM.working_html(pid, {"type":"tessa_stop","cid":pid,"lvl":2}))
     imr.raw(f'<textarea id="cm-in-{pid}" name="content" class="cm-input" placeholder="Chat about this project\u2026 (Ctrl+Enter)" hx-swap-oob="outerHTML"></textarea>')
     _STREAM_TASKS[pid] = asyncio.create_task(_do_stream(request.state.user.username, payload, pid))
     await asyncio.sleep(0.05)
@@ -288,7 +288,7 @@ def _left_panel(username, doc):
 async def _project_view(request, doc, models=None):
     username = request.state.user.username
     is_working = doc["id"] in _ACTIVE
-    return (PE.render_shell(doc) + f"""<div id="tessa-conn-bar-content" hx-swap-oob="outerHTML">{_conn_bar_html(doc, AIM.connections.list_conns(), models or [])}</div><div id="tessa-chat-area" hx-swap-oob="outerHTML"><div id="tessa-chat-area" style="height:100%;overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username, is_working=is_working, stop_intent={"type":"tessa_stop","cid":sid,"lvl":2} if is_working else "")}</div></div><div id="tessa-proj-list" hx-swap-oob="innerHTML">{_proj_list_html(username, doc["id"])}</div><div id="tessa-left-bottom" hx-swap-oob="innerHTML">{_left_bottom_html(doc)}</div>""")
+    return (PE.render_shell(doc) + f"""<div id="tessa-conn-bar-content" hx-swap-oob="outerHTML">{_conn_bar_html(doc, AIM.connections.list_conns(), models or [])}</div><div id="tessa-chat-area" hx-swap-oob="outerHTML"><div id="tessa-chat-area" style="height:100%;overflow:hidden">{CM.shell(doc["id"], messages=doc.get("conversation",[]), viewer_name=username, is_working=is_working, stop_intent={"type":"tessa_stop","cid":doc["id"],"lvl":2} if is_working else "")}</div></div><div id="tessa-proj-list" hx-swap-oob="innerHTML">{_proj_list_html(username, doc["id"])}</div><div id="tessa-left-bottom" hx-swap-oob="innerHTML">{_left_bottom_html(doc)}</div>""")
 
 @router.get("")
 @router.get("/")

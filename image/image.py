@@ -126,6 +126,7 @@ def init_tool(env: dict, prefix: str):
     _base_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_base", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_base_image)
     _mask_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_mask", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_mask_image)
     _ref_picker  = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_ref",  nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_reference_image)
+    print("[image] ready")
 
 async def _pick_base_image(request, payload, imr):
     rel = payload.get("path", "")
@@ -844,10 +845,6 @@ async def serve_full(path: str):
     p = _fm().resolve(path)
     if not p.exists(): raise HTTPException(404)
     return FileResponse(p, headers={"Cache-Control": "public, max-age=3600"})
-    _base_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_base", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_base_image, thumb_url_fn=lambda rel: _u("thumb", rel))
-    _mask_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_mask", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_mask_image, thumb_url_fn=lambda rel: _u("thumb", rel))
-    _ref_picker  = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_ref",  nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_reference_image, thumb_url_fn=lambda rel: _u("thumb", rel))
-    print("[image] ready")
 
 CSS = """
 .img-prompt-item{display:flex;align-items:center;gap:.2rem;padding:.3rem .3rem;cursor:pointer;font-size:.8rem; border-bottom:var(--border-thick) solid var(--border)}
