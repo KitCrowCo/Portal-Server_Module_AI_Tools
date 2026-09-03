@@ -147,18 +147,16 @@ async def _h_chunk_selected(request, payload, imr):
 async def _h_combine_selected(request, payload, imr):
     s = await _kg_state(request)
     out_name = (payload.get("combine_name") or "combined").strip()
-    src = payload.get("combine_src", "kg")
-    fm = FM_KG if src == "kg" else FM_COMMON
-    rels = sorted(s.get(f"selected_{src}", []))
-    if not rels: return imr.oob('<div style="color:var(--text_muted)">Select files from Knowledge or Common to combine.</div>', "kg-ingest-log")
     parts = []
-    for rel in rels:
-        try: parts.append(f"# {rel}\n\n{fm.resolve(rel).read_text(encoding='utf-8', errors='ignore')}")
-        except Exception as e: parts.append(f"# {rel}\n\n[read error: {e}]")
+    for src, fm in (("kg", FM_KG), ("common", FM_COMMON)):
+        for rel in sorted(s.get(f"selected_{src}", [])):
+            try: parts.append(f"# {rel}\n\n{fm.resolve(rel).read_text(encoding='utf-8', errors='ignore')}")
+            except Exception as e: parts.append(f"# {rel}\n\n[read error: {e}]")
+    if not parts: return imr.oob('<div style="color:var(--text_muted)">Select files from Knowledge or Common to combine.</div>', "kg-ingest-log")
     dest = out_name if out_name.endswith(".md") else f"{out_name}.md"
-    fm.write(dest, "\n\n---\n\n".join(parts))
-    imr.oob(f'<div style="color:var(--accent)">Combined {len(rels)} file(s) into {_esc(dest)}</div>', "kg-ingest-log")
-    imr.oob(_source_tree_html(fm, s.get(f"selected_{src}", []), src), f"kg-tree-{src}", swap="outerHTML")
+    FM_KG.write(dest, "\n\n---\n\n".join(parts))
+    imr.oob(f'<div style="color:var(--accent)">Combined {len(parts)} file(s) into {_esc(dest)}</div>', "kg-ingest-log")
+    imr.oob(_source_tree_html(FM_KG, s.get("selected_kg", []), "kg"), "kg-tree-kg", swap="outerHTML")
     return imr
 
 async def _h_export_docx(request, payload, imr):
