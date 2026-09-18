@@ -46,6 +46,7 @@ def init_tool(env: dict, prefix: str):
     BI = env["tools"]["built_ins"]
     AIM = ENV["tools"]["ai_manager"]
     _SETTINGS = BI.SettingsPanel("Image", [BI.SettingsGroup("defaults", "Defaults", [
+        BI.SettingField("mock_mode", "Enable Offline Mock Mode", "checkbox", False, hint="Bypass real nodes and yield placeholder images (useful offline)"),
         BI.SettingField("text_encoder_conn_id", "Text Encoder Connection", "select", "", options=_conn_options),
         BI.SettingField("image_gen_conn_id", "Image Generation Connection", "select", "", options=_conn_options),
         BI.SettingField("model_name", "Model Filename", "text", "flux-2-klein-9b-Q6_K.gguf", hint="Filename — relative to node's transformer dir"),
@@ -89,11 +90,9 @@ def init_tool(env: dict, prefix: str):
         return imr
 
     async def _im_save_mask(request, payload, imr):
-        print(f"[image_save_mask] called. mask_data length={len(payload.get('mask_data',''))}")
         mask_data = payload.get("mask_data", "")
         base_name = payload.get("base_name", "mask")
         if not mask_data:
-            print("[image_save_mask] ABORT: mask_data empty on server side")
             imr.oob('<span style="color:#ff5f5f">No mask data reached the server</span>', "img-mask-status")
             return imr
         raw = mask_data.split("base64,")[-1] if "base64," in mask_data else mask_data
@@ -103,11 +102,9 @@ def init_tool(env: dict, prefix: str):
         try:
             fm = _fm()
             dest = fm.resolve(rel_path)
-            print(f"[image_save_mask] fm.root={fm.root}  dest={dest}  dest.parent.exists()={dest.parent.exists()}")
-            dest.parent.mkdir(parents=True, exist_ok=True)   # <-- mkdir the SAME path we're about to write, not a separate constant
+            dest.parent.mkdir(parents=True, exist_ok=True)
             decoded = base64.b64decode(raw)
             dest.write_bytes(decoded)
-            print(f"[image_save_mask] wrote {len(decoded)} bytes -> {dest} (exists={dest.exists()})")
             fm._trigger_change(rel_path, "created")
         except Exception as e:
             traceback.print_exc()
@@ -126,7 +123,6 @@ def init_tool(env: dict, prefix: str):
     _base_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_base", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_base_image)
     _mask_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_mask", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_mask_image)
     _ref_picker  = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_ref",  nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_reference_image)
-    print("[image] ready")
 
 async def _pick_base_image(request, payload, imr):
     rel = payload.get("path", "")
@@ -167,18 +163,13 @@ def _output_dir():
 def _lora_dir(): return Path(_cfg().get("lora_dir") or DATA_DIR / "models/loras")
 def _fm(): return ENV["tools"]["built_ins"].FileManager(_output_dir())
 
-# Shared helpers
-
 def _parse_targets(raw) -> list:
-    """Normalize gallery delete targets: hx-vals js:{array} arrives as JSON string."""
     if isinstance(raw, list): return raw
     if isinstance(raw, str):
         raw = raw.strip()
         if raw.startswith("["):
-            try:
-                return json.loads(raw)
-            except Exception:
-                pass
+            try: return json.loads(raw)
+            except Exception: pass
         return [raw] if raw else []
     return []
 
@@ -198,10 +189,8 @@ def _list(kind):
     d = PROMPTS_DIR if kind == "prompt" else JOB_RECORDS_DIR
     out = []
     for f in sorted(d.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
-        try:
-            out.append(json.loads(f.read_text()))
-        except Exception:
-            pass
+        try: out.append(json.loads(f.read_text()))
+        except Exception: pass
     return out
 
 # --- Per-user WIP state ---
@@ -293,12 +282,15 @@ async def prompts_save(pid: str, request: Request, title: str = Form(""), text: 
 async def _encode_prompt(request: Request, prompt_id: str):
     p = _load("prompt", prompt_id)
     if not p: return HTMLResponse("Not found", status_code=404)
+    
     conn = _conn("text_encoder_conn_id")
-    if not conn:
+    mock = _cfg().get("mock_mode")
+    if not conn and not mock:
         p["status"], p["error"] = "error", "No text encoder connection — set one in Settings"
         _save("prompt", p)
         await _push_prompts(request.state.user.username, prompt_id)
         return HTMLResponse(_prompt_editor_html(p))
+        
     p["status"] = "encoding"
     _save("prompt", p)
     asyncio.create_task(_do_encode(request.state.user.username, prompt_id))
@@ -307,10 +299,16 @@ async def _encode_prompt(request: Request, prompt_id: str):
 async def _do_encode(username: str, pid: str):
     p = _load("prompt", pid)
     if not p: return
-    conn = _conn("text_encoder_conn_id")
     cfg = _cfg()
-    max_len = int(cfg.get("max_sequence_length", 1024))
-    r = await AIM.connections.flux2_encode(conn, p["text"], job_id=pid, max_sequence_length=max_len, hard_truncate=True, force_recompute=True)
+    
+    if cfg.get("mock_mode"):
+        await asyncio.sleep(0.8) # Simulate encode delay
+        r = {"meta": {"tokenized_len": max(1, len(p["text"]) // 4)}}
+    else:
+        conn = _conn("text_encoder_conn_id")
+        max_len = int(cfg.get("max_sequence_length", 1024))
+        r = await AIM.connections.flux2_encode(conn, p["text"], job_id=pid, max_sequence_length=max_len, hard_truncate=True, force_recompute=True)
+    
     p = _load("prompt", pid)
     if r.get("error"):
         p["status"], p["error"] = "error", r["error"]
@@ -448,7 +446,6 @@ async def generate_submit(request: Request):
 # --- Inpainting ---
 
 def _inpaint_panel_html(prompts, selected_prompt_id):
-    """Canvas panel only — controls live in the bottom toolbar."""
     return (f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
                     <details style="border-bottom:var(--border-thick) solid var(--border); flex-shrink:0">
                         <summary style="cursor:pointer; font-size:.7rem; color:var(--text_muted); list-style:none">Select base image</summary>
@@ -515,7 +512,6 @@ def _data_uri(rel: str, fm) -> str:
 
 @router.post("/inpaint/submit")
 async def inpaint_submit(request: Request):
-    """Queue an inpaint job using a saved mask file path."""
     f = await request.form()
     username = request.state.user.username
     image_path = f.get("image_path", "").strip()
@@ -529,14 +525,13 @@ async def inpaint_submit(request: Request):
     if not prompt or prompt["status"] != "ready": return HTMLResponse('<span style="color:#ff5f5f">Select a ready (encoded) prompt</span>')
     form = dict((await _ui_state(request))["form"])
     form["steps"] = int(f.get("steps", 20) or 20)
-    # Match geometry to base image
     try:
         with PILImage.open(_output_dir() / image_path) as im:
             iw, ih = im.size
         form["width"] = max(32, (iw // 32) * 32)
         form["height"] = max(32, (ih // 32) * 32)
-    except Exception as e:
-        pass  # use form defaults
+    except Exception:
+        pass
     job = {"id": f"job_{uuid.uuid4().hex[:10]}", "username": username, "kind": "inpaint", "status": "queued", "prompt_id": prompt_id, "image_path": image_path, "mask_path": mask_path, "reference_path": reference_path, "params": {**form, "strength": strength}, "created": datetime.utcnow().isoformat()}
     _save("job", job)
     _ensure_worker()
@@ -586,55 +581,93 @@ async def _run_job(job):
     job["started"] = datetime.utcnow().isoformat()
     _save("job", job)
     await _push_job(job)
+    
+    cfg = _cfg()
+    mock = cfg.get("mock_mode")
     conn = _conn("image_gen_conn_id")
-    if not conn:
+    
+    if not conn and not mock:
         job["status"] = "error"
         job["error"] = "No image-gen connection"
         job["finished"] = datetime.utcnow().isoformat()
         _save("job", job)
         await _push_job(job)
         return
-    cfg = _cfg()
+        
     p = job["params"]
-    prompt_doc = _load("prompt", job.get("prompt_id", ""))
-    payload = {"prompt": (prompt_doc or {}).get("text", ""),
-               "embed_job_id": job.get("prompt_id", ""),"width": p["width"], "height": p["height"],
-               "steps": p["steps"], "guidance_scale": p["cfg"],
-               "shift": p["shift"], "seed": p["seed"],
-               "model_path": cfg.get("model_name", "flux-2-klein-9b-Q6_K.gguf"),
-               "vae_path": cfg.get("vae_name", "flux2"),
-               "vae_tiling": cfg.get("vae_tiling", True),
-               "offload_mode": p.get("offload_mode", cfg.get("offload_mode", "none")),
-               "loras": [{"path": l["path"], "scale": l["scale"], "name": Path(l["path"]).stem} for l in p.get("loras", []) if l.get("path")]}
-    if job["kind"] == "inpaint":
-        payload["image_path"] = job.get("image_path", "")
-        payload["mask_image"] = job.get("mask_path", "")  # file path, not inline data
-        payload["strength"] = p.get("strength", 0.75)
-        if job.get("reference_path"):
-            with open(_output_dir() / job["reference_path"], "rb") as rf:
-                payload["reference_image"] = "data:image/png;base64," + base64.b64encode(rf.read()).decode()
-    # Start progress polling
-    stop_poll = asyncio.Event()
-    poll_task = asyncio.create_task(_poll_progress(job["username"], stop_poll))
-    try:
-        if job["kind"] == "sequence":
-            payload["num_frames"] = p.get("num_frames", 8)
-            payload["frame_strength"] = p.get("frame_strength", 0.35)
-            payload["loop"] = True
-            r = await AIM.connections.flux2_generate_sequence(conn, payload)
-        else:
-            r = await AIM.connections.flux2_generate(conn, payload)
-        if r.get("error"): raise RuntimeError(r["error"])
-        result_file = r["file_name"]
-        if not (_output_dir() / result_file).exists(): raise RuntimeError(f"Node reported '{result_file}' but file is not in outputs")
-        job["status"] = "done"
-        job["result_file"] = result_file
-    except Exception as e:
-        job["status"] = "error"
-        job["error"] = str(e)
-    finally:
-        stop_poll.set()
-        poll_task.cancel()
+    
+    if mock:
+        try:
+            steps = p.get("steps", 4)
+            for i in range(1, steps + 1):
+                await asyncio.sleep(0.5) # Fake render progress for UI validation
+                pct = int((i / steps) * 100)
+                filled = int(pct / 10)
+                bar = "&#x2588;" * filled + "&#x2591;" * (10 - filled)
+                await WS.send_personal_message(f'<div id="img-progress-bar" hx-swap-oob="innerHTML"><span style="color:#ffcc00">{bar}</span> mock rendering {i}/{steps} ({pct}%)</div>', job["username"])
+            
+            await WS.send_personal_message('<div id="img-progress-bar" hx-swap-oob="innerHTML"></div>', job["username"])
+            
+            # Generate placeholder PIL images to test Gallery & UI logic
+            w, h = p.get("width", 512), p.get("height", 512)
+            if job["kind"] == "sequence":
+                n_frames = p.get("num_frames", 8)
+                seq_dir_name = f"mock_{job['id']}"
+                seq_dir = _output_dir() / "_sequences" / seq_dir_name
+                seq_dir.mkdir(parents=True, exist_ok=True)
+                for f_idx in range(n_frames):
+                    PILImage.new('RGB', (w, h), color=(max(0, 255 - f_idx*20), 100 + f_idx*10, 150)).save(seq_dir / f"frame_{f_idx:03d}.png")
+                job["result_file"] = f"_sequences/{seq_dir_name}/frame_000.png"
+            else:
+                out_name = f"mock_{job['id']}.png"
+                PILImage.new('RGB', (w, h), color=(73, 109, 137)).save(_output_dir() / out_name)
+                job["result_file"] = out_name
+                
+            job["status"] = "done"
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = f"Mock rendering failure: {str(e)}"
+    else:
+        prompt_doc = _load("prompt", job.get("prompt_id", ""))
+        payload = {"prompt": (prompt_doc or {}).get("text", ""),
+                   "embed_job_id": job.get("prompt_id", ""),"width": p["width"], "height": p["height"],
+                   "steps": p["steps"], "guidance_scale": p["cfg"],
+                   "shift": p["shift"], "seed": p["seed"],
+                   "model_path": cfg.get("model_name", "flux-2-klein-9b-Q6_K.gguf"),
+                   "vae_path": cfg.get("vae_name", "flux2"),
+                   "vae_tiling": cfg.get("vae_tiling", True),
+                   "offload_mode": p.get("offload_mode", cfg.get("offload_mode", "none")),
+                   "loras": [{"path": l["path"], "scale": l["scale"], "name": Path(l["path"]).stem} for l in p.get("loras", []) if l.get("path")]}
+        if job["kind"] == "inpaint":
+            payload["image_path"] = job.get("image_path", "")
+            payload["mask_image"] = job.get("mask_path", "")
+            payload["strength"] = p.get("strength", 0.75)
+            if job.get("reference_path"):
+                with open(_output_dir() / job["reference_path"], "rb") as rf:
+                    payload["reference_image"] = "data:image/png;base64," + base64.b64encode(rf.read()).decode()
+
+        stop_poll = asyncio.Event()
+        poll_task = asyncio.create_task(_poll_progress(job["username"], stop_poll))
+        try:
+            if job["kind"] == "sequence":
+                payload["num_frames"] = p.get("num_frames", 8)
+                payload["frame_strength"] = p.get("frame_strength", 0.35)
+                payload["loop"] = True
+                r = await AIM.connections.flux2_generate_sequence(conn, payload)
+            else:
+                r = await AIM.connections.flux2_generate(conn, payload)
+            if r.get("error"): raise RuntimeError(r["error"])
+            result_file = r["file_name"]
+            if not (_output_dir() / result_file).exists(): raise RuntimeError(f"Node reported '{result_file}' but file is not in outputs")
+            job["status"] = "done"
+            job["result_file"] = result_file
+        except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
+        finally:
+            stop_poll.set()
+            poll_task.cancel()
+
     job["finished"] = datetime.utcnow().isoformat()
     _save("job", job)
     await _push_job(job)
@@ -655,18 +688,25 @@ def _recent_jobs_html():
     return rows or '<div style="color:var(--text_muted);font-size:.7rem">No jobs yet.</div>'
 
 async def _right_panel_html():
+    cfg = _cfg()
+    mock = cfg.get("mock_mode")
     conn = _conn("image_gen_conn_id")
-    status = await AIM.connections.flux2_system_status(conn) if conn else {}
+
+    if mock:
+        status = {"loaded": True, "active_loras": ["mock_offline_lora"], "last_error": "", "log_tail": "--- Offline Mock Mode Active ---\nNo network calls will be made.\nJobs generate placeholder test images.", "progress": {}}
+        no_conn = False
+    else:
+        status = await AIM.connections.flux2_system_status(conn) if conn else {}
+        no_conn = not bool(conn)
+
     loaded = status.get("loaded", False)
     active_loras = status.get("active_loras", [])
     last_error = status.get("last_error", "")
     log_tail = status.get("log_tail", "")
     prog = status.get("progress", {})
-    no_conn = not bool(conn)
     lora_html = (f'<div style="font-size:.7rem; color:#ffcc00; margin-top:.2rem">LoRAs: {", ".join(active_loras)}</div>' if active_loras else "")
     err_html = (f'<div style="font-size:.7rem; color:#ff5f5f; margin-top:.2rem">&#x26A0; {_esc(last_error[:120])}</div>' if last_error else "")
     no_conn_html = ('<div style="font-size:.7rem; color:#ffaa44; margin-top:.2rem">&#x26A0; No connection — set one in Settings.</div>' if no_conn else "")
-    # Progress bar from last status call
     prog_step = prog.get("step", 0)
     prog_total = max(prog.get("total", 1), 1)
     prog_pct = prog.get("pct", int(prog_step * 100 / prog_total))
@@ -703,6 +743,7 @@ async def _right_panel_html():
 
 @router.post("/system/{action}")
 async def system_action(action: str):
+    if _cfg().get("mock_mode"): return HTMLResponse(await _right_panel_html())
     conn = _conn("image_gen_conn_id")
     if conn:
         cfg = _cfg()
@@ -809,8 +850,11 @@ async def _render_panel(request, state):
     if active == "inpaint": return state, _inpaint_panel_html(_list("prompt"), s["selected_prompt_id"])
     if active == "gallery": return state, f'<div style="height:100%">{_gallery_tool.render_shell()}</div>'
     if active == "settings": return state, _settings_html()
-    conn = _conn("image_gen_conn_id")
-    status = (await AIM.connections.flux2_system_status(conn)) if conn else {"_no_conn": True}
+    if _cfg().get("mock_mode"):
+        status = {"loaded": True, "active_loras": ["mock"], "last_error": ""}
+    else:
+        conn = _conn("image_gen_conn_id")
+        status = (await AIM.connections.flux2_system_status(conn)) if conn else {"_no_conn": True}
     return state, f'<div id="img-gen-panel" style="height:100%">{_generate_form_html(s["form"], _list("prompt"), s["selected_prompt_id"], status)}</div>'
 
 @router.get("")
