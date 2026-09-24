@@ -3,11 +3,8 @@ main.py — Flux2 Klein image generation server (FastAPI).
 
 Changes vs previous version:
   - _progress dict + /system/progress endpoint (issue 8)
-  - offload_mode field: "none" | "vae_cpu" (VAE offloaded to CPU during
-    denoising, back for decode, saves ~1 GB VRAM for larger images) (issue 1)
-  - mask_image field now accepts a file-relative path as well as data URIs,
-    so the frontend can save masks to the shared volume and reference them
-    by path (issue 2)
+  - offload_mode field: "none" | "vae_cpu" (VAE offloaded to CPU during denoising, back for decode, saves ~1 GB VRAM for larger images) (issue 1)
+  - mask_image field now accepts a file-relative path as well as data URIs, so the frontend can save masks to the shared volume and reference them by path (issue 2)
   - Aggressive cache clearing between steps when offload_mode is active
 """
 

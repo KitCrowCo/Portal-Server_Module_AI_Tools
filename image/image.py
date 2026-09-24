@@ -282,7 +282,6 @@ async def prompts_save(pid: str, request: Request, title: str = Form(""), text: 
 async def _encode_prompt(request: Request, prompt_id: str):
     p = _load("prompt", prompt_id)
     if not p: return HTMLResponse("Not found", status_code=404)
-    
     conn = _conn("text_encoder_conn_id")
     mock = _cfg().get("mock_mode")
     if not conn and not mock:
@@ -290,7 +289,6 @@ async def _encode_prompt(request: Request, prompt_id: str):
         _save("prompt", p)
         await _push_prompts(request.state.user.username, prompt_id)
         return HTMLResponse(_prompt_editor_html(p))
-        
     p["status"] = "encoding"
     _save("prompt", p)
     asyncio.create_task(_do_encode(request.state.user.username, prompt_id))
@@ -300,7 +298,6 @@ async def _do_encode(username: str, pid: str):
     p = _load("prompt", pid)
     if not p: return
     cfg = _cfg()
-    
     if cfg.get("mock_mode"):
         await asyncio.sleep(0.8) # Simulate encode delay
         r = {"meta": {"tokenized_len": max(1, len(p["text"]) // 4)}}
@@ -308,7 +305,6 @@ async def _do_encode(username: str, pid: str):
         conn = _conn("text_encoder_conn_id")
         max_len = int(cfg.get("max_sequence_length", 1024))
         r = await AIM.connections.flux2_encode(conn, p["text"], job_id=pid, max_sequence_length=max_len, hard_truncate=True, force_recompute=True)
-    
     p = _load("prompt", pid)
     if r.get("error"):
         p["status"], p["error"] = "error", r["error"]
@@ -581,11 +577,9 @@ async def _run_job(job):
     job["started"] = datetime.utcnow().isoformat()
     _save("job", job)
     await _push_job(job)
-    
     cfg = _cfg()
     mock = cfg.get("mock_mode")
     conn = _conn("image_gen_conn_id")
-    
     if not conn and not mock:
         job["status"] = "error"
         job["error"] = "No image-gen connection"
@@ -593,9 +587,7 @@ async def _run_job(job):
         _save("job", job)
         await _push_job(job)
         return
-        
     p = job["params"]
-    
     if mock:
         try:
             steps = p.get("steps", 4)
@@ -605,9 +597,7 @@ async def _run_job(job):
                 filled = int(pct / 10)
                 bar = "&#x2588;" * filled + "&#x2591;" * (10 - filled)
                 await WS.send_personal_message(f'<div id="img-progress-bar" hx-swap-oob="innerHTML"><span style="color:#ffcc00">{bar}</span> mock rendering {i}/{steps} ({pct}%)</div>', job["username"])
-            
             await WS.send_personal_message('<div id="img-progress-bar" hx-swap-oob="innerHTML"></div>', job["username"])
-            
             # Generate placeholder PIL images to test Gallery & UI logic
             w, h = p.get("width", 512), p.get("height", 512)
             if job["kind"] == "sequence":
@@ -622,7 +612,6 @@ async def _run_job(job):
                 out_name = f"mock_{job['id']}.png"
                 PILImage.new('RGB', (w, h), color=(73, 109, 137)).save(_output_dir() / out_name)
                 job["result_file"] = out_name
-                
             job["status"] = "done"
         except Exception as e:
             job["status"] = "error"
@@ -645,7 +634,6 @@ async def _run_job(job):
             if job.get("reference_path"):
                 with open(_output_dir() / job["reference_path"], "rb") as rf:
                     payload["reference_image"] = "data:image/png;base64," + base64.b64encode(rf.read()).decode()
-
         stop_poll = asyncio.Event()
         poll_task = asyncio.create_task(_poll_progress(job["username"], stop_poll))
         try:
@@ -667,7 +655,6 @@ async def _run_job(job):
         finally:
             stop_poll.set()
             poll_task.cancel()
-
     job["finished"] = datetime.utcnow().isoformat()
     _save("job", job)
     await _push_job(job)
@@ -729,7 +716,7 @@ async def _right_panel_html():
                             <button class="cm-qbtn" hx-post="{_u("system/load")}" hx-target="#img-right-panel" hx-swap="innerHTML">Load</button>
                             <button class="cm-qbtn" hx-post="{_u("system/unload")}" hx-target="#img-right-panel" hx-swap="innerHTML">Unload</button>
                             <button class="cm-qbtn" style="color:#ff5f5f" hx-post="{_u("system/stop")}" hx-target="#img-right-panel" hx-swap="innerHTML">Stop</button>
-                            <button class="cm-qbtn" hx-get="{_u("system/status_check")}" hx-target="#img-right-panel" hx-swap="innerHTML" title="Refresh">&#x21BA;</button>
+                            <button class="cm-qbtn" hx-post="/module/ai_tools/image/system/status_check" hx-target="#img-right-panel" hx-swap="innerHTML" title="Refresh">&#x21BA;</button>
                             <button class="cm-qbtn" hx-post="{_u("system/clear_error")}" hx-target="#img-right-panel" hx-swap="innerHTML" title="Clear error">Clr</button>
                         </div>
                     </div>
