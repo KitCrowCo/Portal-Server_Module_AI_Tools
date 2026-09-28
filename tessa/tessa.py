@@ -57,9 +57,9 @@ def _new_project(user):
     cfg = _SETTINGS.get_group("defaults").load() if _SETTINGS else {}
     return {"id": f"stu_{uuid.uuid4().hex[:8]}", "username": user.username, "title": "New Project", "content": "", "conn_id": cfg.get("conn_id",""), "model": cfg.get("model",""), "model_ctx": int(cfg.get("model_ctx", 32768)), "system_prompt": cfg.get("system_prompt",""), "temperature": float(cfg.get("temperature", 0.7)), "conversation": [], "selected_files": [], "context_summary": "", "settings": {"view":"edit","font":"mono","wrap":True}, "created": datetime.utcnow().isoformat(), "modified": datetime.utcnow().isoformat()}
 
-async def _stream(conn, messages, model, num_ctx, think=False, temperature=0.7):
+async def _stream(conn, messages, model, num_ctx, think=False, temperature=0.7, cache_session=""):
     try:
-        async for text, thinking in AIM.connections.stream_llm(conn, messages, model, think=think, num_ctx=num_ctx, num_predict=4096, temperature=temperature):
+        async for text, thinking in AIM.connections.stream_llm(conn, messages, model, think=think, num_ctx=num_ctx, num_predict=4096, temperature=temperature, cache_session=cache_session or None):
             yield text, thinking, False, None
         yield "", "", True, None
     except asyncio.CancelledError: yield "", "", True, None
@@ -81,7 +81,11 @@ def _build_messages(doc, user_msg, files_txt=""):
         sys_parts.append(f"[PRIOR CONTEXT]\n{summary}"); used += _tok(summary)
     if sys_parts: msgs.append({"role":"system","content":"\n\n---\n\n".join(sys_parts)})
     recent = []
-    for m in reversed([x for x in doc.get("conversation",[]) if not x.get("deleted")]):
+    
+    history = [x for x in doc.get("conversation",[]) if not x.get("deleted")]
+    if history and history[-1].get("role") == "user": history = history[:-1]  # the message being sent is appended below as user_msg
+    recent = []
+    for m in reversed(history):
         t = _tok(m.get("content",""))
         if used + t + _tok(user_msg) + 300 > budget: break
         recent.insert(0, {"role":m["role"],"content":m["content"]}); used += t
@@ -193,7 +197,7 @@ async def _do_stream(username, payload, pid, skip_user_append=False):
         if _tok(content) > int(num_ctx * 0.65): await _err(f"Input too long (~{_tok(content)}t, limit ~{int(num_ctx*0.65)}t for {num_ctx} context). Edit the message above and retry.", retry_mid=user_msg["id"] if user_msg else None); return
         files_txt = _files_content(doc.get("selected_files",[])); _ACTIVE.add(pid)
         try:
-            async for text, thinking, done, err in _stream(conn, _build_messages(doc, content, files_txt), model, num_ctx, think, doc.get("temperature", 0.7)):
+            async for text, thinking, done, err in _stream(conn, _build_messages(doc, content, files_txt), model, num_ctx, think, doc.get("temperature", 0.7), cache_session=pid):
                 if _STOP.pop(pid, False): break
                 if err: await _err(err, retry_mid=user_msg["id"] if user_msg else None); return
                 if text: full += text

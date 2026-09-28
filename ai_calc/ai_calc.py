@@ -85,12 +85,38 @@ def usable_ram(hw): return max(hw["sys_ram_gb"] - hw["shared_gb"] - hw.get("os_o
 def total_mem(hw): return total_vram(hw) + usable_ram(hw)
 def model_gb(params_b, quant): return params_b * 1e9 * QUANTS.get(quant, QUANTS["Q4_K_M"])["bpp"] / 1e9
 
-def kv_bytes_per_token(params_b, kv_bits=8):
+def kv_bytes_per_token(params_b, kv_type=None):
     layers, hidden, attn, kv_heads = arch_for(params_b)
-    return 2 * layers * kv_heads * (hidden // attn) * (kv_bits // 8)
+    return 2 * layers * kv_heads * (hidden // attn) * KV_TYPES[kv_type or DEFAULT_KV]
 
-def kv_cache_gb_for_ctx(params_b, ctx, kv_bits=8): return kv_bytes_per_token(params_b, kv_bits) * ctx / (1024**3)
-def max_ctx_tokens(params_b, avail_gb, kv_bits=8): return int(avail_gb * 1024**3 / max(kv_bytes_per_token(params_b, kv_bits), 1))
+def kv_cache_gb_for_ctx(params_b, ctx, kv_type=None): return kv_bytes_per_token(params_b, kv_type) * ctx / (1024**3)
+def max_ctx_tokens(params_b, avail_gb, kv_type=None): return int(avail_gb * 1024**3 / max(kv_bytes_per_token(params_b, kv_type), 1))
+
+def prefill_time_s(params_b, n_tokens, hw):
+    """Seconds to ingest n_tokens from an empty context: linear weight FLOPs plus attention FLOPs that grow with depth (token i attends to i predecessors, so the sum is quadratic in n)."""
+    layers, hidden, _, _ = arch_for(params_b)
+    return (2 * params_b * 1e9 * n_tokens + 2 * layers * hidden * n_tokens ** 2) / (hw.get("gpu_tflops_fp16", 8.9) * 1e12 * hw["gpu_eff"])
+
+def decode_tps_at(params_b, quant, depth, hw, kv_type=None):
+    """Decode speed at a given context depth: every generated token streams the weights AND the whole KV cache at that depth."""
+    p = estimate_tps(params_b, quant, hw)
+    return round(p["eff_bw"] / (p["model_gb"] * 1.10 + kv_cache_gb_for_ctx(params_b, depth, kv_type)), 3) if p["fits_total"] and p["eff_bw"] > 0 else 0.0
+
+def full_perf(params_b, quant, ctx, hw, kv_type=None):
+    p = estimate_tps(params_b, quant, hw)
+    kv, vt, tm = kv_cache_gb_for_ctx(params_b, ctx, kv_type), total_vram(hw), total_mem(hw)
+    kv_in_vram = min(kv, max(vt - p["model_gb"], 0.0)); kv_in_ram = max(kv - kv_in_vram, 0.0)
+    total_used = p["model_gb"] + kv
+    fits = p["fits_total"] and total_used <= tm
+    tps_at = lambda kv_gb: round(p["eff_bw"] / (p["model_gb"] * 1.10 + kv_gb), 2) if fits and p["eff_bw"] > 0 else 0.0
+    tps, tps_mid, mode = tps_at(kv), tps_at(kv / 2), p["mode"]
+    if fits and kv_in_ram > 0 and tps > 0:
+        pen = 1.0 - (kv_in_ram / total_used) * 0.20
+        tps, tps_mid, mode = round(tps * pen, 2), round(tps_mid * pen, 2), mode + f" +KV({kv_in_ram:.1f}->RAM)"
+    qi, pf_s = QUANTS.get(quant, QUANTS["Q4_K_M"]), prefill_time_s(params_b, ctx, hw)
+    return {**p, "tps": tps, "tps_start": p["tps"] if fits else 0.0, "tps_mid": tps_mid, "mode": mode, "kv_gb": round(kv, 3), "kv_in_vram": round(kv_in_vram, 3), "kv_in_ram": round(kv_in_ram, 3),
+            "total_mem_gb": round(total_used, 2), "mem_ok": fits, "time_10k_s": round(10000 / tps, 0) if tps > 0 and fits else None, "prefill_s_full": round(pf_s, 1), "prefill_tps_avg": round(ctx / pf_s, 1) if pf_s > 0 else 0.0,
+            "quality_idx": qi["quality"], "creative_ok": qi["creative_ok"], "quant": quant, "params_b": params_b, "kv_type": kv_type or DEFAULT_KV}
 
 def estimate_tps(params_b: float, quant: str, hw: dict) -> dict:
     """Weights each half of the model separately by whichever bus it actually sits on - dedicated/iGPU bandwidth for the VRAM-resident portion, system-RAM bandwidth for anything spilled - rather than one blended figure."""
@@ -101,19 +127,6 @@ def estimate_tps(params_b: float, quant: str, hw: dict) -> dict:
     vram_used = min(mgb, vt); ram_used = max(mgb - vt, 0.0)
     eff_bw = eff * (vram_used*vram_bw + ram_used*ram_bw) / mgb if mgb > 0 else 0.0
     return {"tps":round((eff_bw*1e9)/(mgb*1e9*1.10),2), "prefill_tps":round(hw.get("gpu_tflops_fp16",8.9)*1e12*eff/(2*params_b*1e9),1), "mode":f"VRAM+RAM ({ram_used:.1f}GB spill)" if ram_used > 0 else "VRAM", "model_gb":round(mgb,2), "fits_vram":mgb<=vt, "fits_total":True, "eff_bw":round(eff_bw,1), "vram_used":round(vram_used,2), "ram_used":round(ram_used,2)}
-
-def full_perf(params_b, quant, ctx, hw, kv_bits=8):
-    p = estimate_tps(params_b, quant, hw)
-    kv, vt, tm = kv_cache_gb_for_ctx(params_b, ctx, kv_bits), total_vram(hw), total_mem(hw)
-    kv_in_vram = min(kv, max(vt - p["model_gb"], 0.0)); kv_in_ram = max(kv - kv_in_vram, 0.0)
-    total_used = p["model_gb"] + kv
-    fits = p["fits_total"] and total_used <= tm
-    tps, mode = p["tps"], p["mode"]
-    if fits and kv_in_ram > 0 and tps > 0: tps, mode = round(tps * (1.0 - (kv_in_ram / total_used) * 0.20), 2), mode + f" +KV({kv_in_ram:.1f}->RAM)"
-    qi = QUANTS.get(quant, QUANTS["Q4_K_M"])
-    return {**p, "tps": tps, "mode": mode, "kv_gb": round(kv, 3), "kv_in_vram": round(kv_in_vram, 3), "kv_in_ram": round(kv_in_ram, 3),
-            "total_mem_gb": round(total_used, 2), "mem_ok": fits, "time_10k_s": round(10000 / tps, 0) if tps > 0 and fits else None,
-            "quality_idx": qi["quality"], "creative_ok": qi["creative_ok"], "quant": quant, "params_b": params_b}
 
 def image_estimate(model_key, hw, steps=20):
     m = IMAGE_MODELS.get(model_key, next(iter(IMAGE_MODELS.values()), {}))
@@ -152,12 +165,12 @@ def _total_score(sub, weights):
     tw = sum(weights.get(d, DEFAULT_WEIGHTS.get(d, 1)) for d in SCORE_DIMS)
     return round(sum(sub.get(d, 0) * weights.get(d, DEFAULT_WEIGHTS.get(d, 1)) for d in SCORE_DIMS) / max(tw, 0.001), 4)
 
-def _rank_filtered(filtered: list, hw: dict, ctx: int, target_tps: float, weights: dict, top_n: int = 40, kv_bits: int = 8) -> list:
+def _rank_filtered(filtered: list, hw: dict, ctx: int, target_tps: float, weights: dict, top_n: int = 40, kv_type: str = None) -> list:
     rows = []
     for m in filtered:
         for q in m.get("avail_quants",[]):
             if q not in QUANTS: continue
-            perf = full_perf(m["params_b"], q, ctx, hw, kv_bits)
+            perf = full_perf(m["params_b"], q, ctx, hw, kv_type)
             if not perf["mem_ok"]: continue
             sub = _sub_scores(perf, m, hw, target_tps)
             rows.append({**{k: m[k] for k in ("id","params_b","likes","downloads","tags","avail_quants","leaderboard_avg","lb_detail","bench_confidence","bench_source","bench_inferred")},
@@ -384,7 +397,7 @@ async def _pipeline(params):
         if not avail: counts["quant"] += 1; continue
         any_fits = any_fast = False
         for q in sorted(avail, key=lambda x: QUANTS[x]["bpp"]):
-            p = full_perf(pb, q, params["ctx_tokens"], hw, params.get("kv_bits", 8))
+            p = full_perf(pb, q, params["ctx_tokens"], hw, params["kv_type"])
             if p["mem_ok"]:
                 any_fits = True
                 if p["tps"] >= params["min_tps"]: any_fast = True; break
@@ -403,7 +416,7 @@ async def _pipeline(params):
     _job_up(step=f"Bench resolved: {lb_hits}/{len(filtered)} have scores")
     with _job_lock: _job["filtered"] = filtered
     _job_up(status="Scoring...", step=f"target_tps={params['target_tps']}")
-    rows = _rank_filtered(filtered, hw, params["ctx_tokens"], params["target_tps"], params["weights"], params["top_n"], params.get("kv_bits", 8))
+    rows = _rank_filtered(filtered, hw, params["ctx_tokens"], params["target_tps"], params["weights"], params["top_n"], params["kv_type"])
     _write_csv(rows, key)
     top = rows[0] if rows else None
     _job_up(step=f"Done. Top: {top['id']} [{top['quant']}] score={top['total_score']}" if top else "Done - no results")
@@ -429,7 +442,7 @@ def _session_card_html(m, hw):
     name = m.get("name", "")
     vram_gb = m.get("size_vram", m.get("size", 0)) / 1e9
     pb, q = _parse_loaded(name)
-    tps = full_perf(pb, q, 32768, hw)["tps"] if pb else 0
+    tps = full_perf(pb, q, int(m.get("context_length") or 32768), hw, m.get("kv_cache_type") or None)["tps"] if pb else 0
     pct = min(vram_gb / max(total_vram(hw), 0.001) * 100, 100)
     qlabel = f'{q} ({QUANTS.get(q, QUANTS["Q4_K_M"]).get("quality",0)*100:.0f}% quality)' if pb else ""
     return f"""<div class="glass" style="padding:.6rem .8rem;margin-bottom:.4rem">
@@ -487,6 +500,10 @@ def _svg_line_chart(series: list, width=680, height=320, title="") -> str:
 
 # --- UI: Calculator ---
 
+def _kv_select_html(name="kv_type", selected=None):
+    sel = selected or DEFAULT_KV
+    return f"""<select class="fin" name="{name}">{"".join(f'<option value="{k}" {"selected" if k == sel else ""}>{k} ({b} B/elem)</option>' for k, b in KV_TYPES.items())}</select>"""
+
 def _quant_opts(selected="Q4_K_M"): return "".join(f'<option value="{q}" {"selected" if q==selected else ""}>{q} ({round(QUANTS[q]["quality"]*100)}% quality, {QUANTS[q]["bpp"]:.3f} bpp)</option>' for q in QUANTS)
 
 def _panel_calc():
@@ -500,7 +517,7 @@ def _panel_calc():
                 <label>Params (B)<input class="fin" name="params_b" type="number" step="any" value="7"></label>
                 <label>Quant<select class="fin" name="quant">{_quant_opts()}</select></label>
                 <label>Context (tokens)<input class="fin" name="ctx_tokens" type="number" value="20992"></label>
-                <label>KV Quant<select class="fin" name="kv_bits"><option value="16">FP16</option><option value="8" selected>INT8</option><option value="4">INT4</option></select></label>
+                <label>KV Cache Type{_kv_select_html()}</label>
                 <button class="rbtn" type="submit">Calculate</button>
             </div>
         </form>
@@ -520,36 +537,45 @@ def _panel_calc():
         </details>
     </div>"""
 
-def _calc_result_html(pb, quant, ctx, hw, kv_bits, cnode_id=""):
-    p = full_perf(pb, quant, ctx, hw, kv_bits)
+def _calc_result_html(pb, quant, ctx, hw, kv_type, cnode_id=""):
+    p = full_perf(pb, quant, ctx, hw, kv_type)
     tm = total_mem(hw)
     layers, hidden, attn, kv_heads = arch_for(pb)
     avail = max(tm - p["model_gb"], 0)
-    max_ctx = max_ctx_tokens(pb, avail, kv_bits)
+    max_ctx = max_ctx_tokens(pb, avail, kv_type)
     t10 = f"{p['time_10k_s']:.0f}s ({p['time_10k_s']/60:.1f}m)" if p.get("time_10k_s") else "N/A"
     okc = "#00ffa2" if p["mem_ok"] else "#ff5f5f"
     stats = f"""<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:.5rem;margin-bottom:.6rem">
-        <div class="stat" style="--sc:{_tcolor(p['tps'])}"><div class="sl">Generation</div><div class="sv">{p['tps']}<span class="su"> t/s</span></div><div class="ss">{p['mode']}</div></div>
-        <div class="stat" style="--sc:#3d9aff"><div class="sl">Prefill</div><div class="sv">{p['prefill_tps']:.0f}<span class="su"> t/s</span></div></div>
+        <div class="stat" style="--sc:{_tcolor(p['tps'])}"><div class="sl">Generation (full window)</div><div class="sv">{p['tps']}<span class="su"> t/s</span></div><div class="ss">start {p['tps_start']} / mid {p['tps_mid']} - {p['mode']}</div></div>
+        <div class="stat" style="--sc:#3d9aff"><div class="sl">Prefill</div><div class="sv">{p['prefill_tps']:.0f}<span class="su"> t/s</span></div><div class="ss">filling {ctx//1000}K: {p['prefill_s_full']/60:.1f} min ({p['prefill_tps_avg']:.0f} t/s avg)</div></div>
         <div class="stat" style="--sc:#b06aff"><div class="sl">Model Size</div><div class="sv">{p['model_gb']}<span class="su"> GB</span></div></div>
-        <div class="stat" style="--sc:#ff9a3c"><div class="sl">KV Cache</div><div class="sv">{p['kv_gb']:.3f}<span class="su"> GB</span></div></div>
+        <div class="stat" style="--sc:#ff9a3c"><div class="sl">KV Cache ({kv_type or DEFAULT_KV})</div><div class="sv">{p['kv_gb']:.3f}<span class="su"> GB</span></div></div>
         <div class="stat" style="--sc:{okc}"><div class="sl">Memory</div><div class="sv" style="font-size:1rem;padding-top:.2rem">{"Fits" if p["mem_ok"] else "OOM"}</div><div class="ss">{p['total_mem_gb']:.1f} / {tm:.1f} GB</div></div>
-        <div class="stat" style="--sc:#00ffa2"><div class="sl">{ctx//1000}K Token Run</div><div class="sv" style="font-size:1rem;padding-top:.2rem">{t10}</div></div>
+        <div class="stat" style="--sc:#00ffa2"><div class="sl">10K tokens written (full window)</div><div class="sv" style="font-size:1rem;padding-top:.2rem">{t10}</div></div>
     </div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;font-size:.78rem;margin-bottom:.7rem">
         <div class="glass" style="padding:.5rem .7rem"><div style="color:var(--text_muted);font-size:.63rem;text-transform:uppercase;margin-bottom:.2rem">Architecture (estimated)</div>
-            <div style="font-family:var(--font-mono);line-height:1.7;font-size:.7rem">Layers {layers} | Hidden {hidden} | Attn {attn} | KV-heads {kv_heads}<br>{kv_bytes_per_token(pb,kv_bits)//1024:.1f} KB/token</div></div>
+            <div style="font-family:var(--font-mono);line-height:1.7;font-size:.7rem">Layers {layers} | Hidden {hidden} | Attn {attn} | KV-heads {kv_heads}<br>{kv_bytes_per_token(pb,kv_type)/1024:.1f} KB/token</div></div>
         <div class="glass" style="padding:.5rem .7rem"><div style="color:var(--text_muted);font-size:.63rem;text-transform:uppercase;margin-bottom:.2rem">Context Limits</div>
             <div style="font-family:var(--font-mono);line-height:1.7;font-size:.7rem">Free after model: {avail:.1f} GB<br>Max context: <span style="color:var(--accent)">{max_ctx//1000:.0f}K tokens</span></div></div>
     </div>
-    <div style="display:flex;gap:.5rem;align-items:center;margin-bottom:.5rem">
-        <input type="text" id="calc-actual-tps" placeholder="Actual observed t/s (optional)" class="fin" style="max-width:14rem">
-        <button class="rbtn" type="button" onclick="calcLogActual('{cnode_id}',{pb},'{quant}',{ctx})">Log for calibration</button>
-        <span id="calc-log-msg" style="font-size:.7rem;color:var(--text_muted)"></span>
-    </div>"""
+    <details style="margin-bottom:.6rem"><summary class="dim tiny" style="cursor:pointer">Log a real run for calibration</summary>
+        <form hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="this" class="frow wrap" style="margin-top:.4rem">
+            <input type="hidden" name="type" value="ai_calc_log_actual"><input type="hidden" name="branch" value="ai_calc"><input type="hidden" name="lvl" value="2">
+            <input type="hidden" name="cnode_id" value="{cnode_id}"><input type="hidden" name="params_b" value="{pb}"><input type="hidden" name="quant" value="{quant}"><input type="hidden" name="kv_type" value="{kv_type or DEFAULT_KV}">
+            <label>Read tokens (processed)<input class="fin" name="read_n" type="number" step="any"></label>
+            <label>Cached tokens reused<input class="fin" name="cached_n" type="number" step="any" value="0"></label>
+            <label>Read t/s<input class="fin" name="read_tps" type="number" step="any"></label>
+            <label>Written tokens (with thinking)<input class="fin" name="write_n" type="number" step="any"></label>
+            <label>Write t/s<input class="fin" name="write_tps" type="number" step="any"></label>
+            <label>Actual file GB<input class="fin" name="file_gb" type="number" step="any"></label>
+            <button class="rbtn" type="submit">Log</button>
+        </form>
+        <div id="calc-log-summary" style="margin-top:.4rem">{_calib_summary_html(cnode_id or "unspecified")}</div>
+    </details>"""
     rows = "".join(f"""<tr class="{'oom' if not pq['fits_total'] else ''}"><td class="qn">{q}</td><td>{pq["model_gb"]} GB</td><td style="color:{'#555' if not pq['fits_total'] else _tcolor(pq['tps'])};font-weight:700">{pq["tps"]}</td><td>{pq.get("kv_gb",0):.3f}</td><td>{pq.get("total_mem_gb",0):.1f}</td><td style="color:#3d9aff">{round(QUANTS[q]["quality"]*100)}%</td></tr>"""
-                     for q, pq in ((q, full_perf(pb, q, ctx, hw)) for q in QUANTS))
-    return stats + f"""<div style="font-size:.68rem;color:var(--text_muted);margin:.3rem 0">All quantizations at this size/context:</div>
+                     for q, pq in ((q, full_perf(pb, q, ctx, hw, kv_type)) for q in QUANTS))
+    return stats + f"""<div style="font-size:.68rem;color:var(--text_muted);margin:.3rem 0">All quantizations at this size/context (t/s = full window):</div>
     <div class="tbl-scroll"><table class="cmp-table"><thead><tr><th>Quant</th><th>Size</th><th>T/s</th><th>KV GB</th><th>Total GB</th><th>Quality</th></tr></thead><tbody>{rows}</tbody></table></div>"""
 
 # --- UI: Model Finder ---
@@ -596,7 +622,7 @@ def _panel_search():
             <div class="frow wrap">
                 <label>Min T/s (hard floor)<input class="fin" name="min_tps" type="number" step="any" value="1.0"></label>
                 <label>Target T/s (score ref)<input class="fin" name="target_tps" type="number" step="any" value="5.0"></label>
-                <label>KV Cache Quant<select class="fin" name="kv_bits"><option value="16">FP16</option><option value="8" selected>INT8</option><option value="4">INT4</option></select></label>
+                <label>KV Cache Type{_kv_select_html()}</label>
                 <label>Minimum Model Quant<select class="fin" name="min_quant">{"".join(f'<option value="{q}" {"selected" if q=="Q3_K_M" else ""}>{q}</option>' for q in QUANTS)}</select><span class="dim tiny">excludes anything below this quality floor regardless of score</span></label>
             </div>
             <div class="frow wrap">
@@ -646,8 +672,9 @@ def _search_html(res):
                 <div class="lb-row">{_lb_pills(r.get("lb_detail",{}), r.get("bench_source","none"), r.get("bench_confidence",0), r.get("bench_inferred",False))}</div>
                 <div class="mqts" style="margin-top:.3rem">{avail_qt}</div>
                 <div class="mpop" style="margin-top:.3rem"><span>&#9829; {r.get("likes",0):,}</span><span>&#8659; {r.get("downloads",0):,}</span><a href="{hfu}" target="_blank" class="hfl">HuggingFace &#8594;</a></div>
+                {_pull_row_html(r)}
             </div></details></div></div>"""
-    return f'{sbar}{frontier_html}{wleg}<div class="clist">{cards}</div>'
+    return f'{sbar}<div id="pull-status" class="dim tiny"></div>{frontier_html}{wleg}<div class="clist">{cards}</div>'
 
 def _search_status_html():
     with _job_lock: running, status, progress, result, error = _job["running"], _job["status"], list(_job["progress"]), _job["result"], _job["error"]
@@ -656,6 +683,94 @@ def _search_status_html():
     log = "".join(f'<div class="log-line">{l}</div>' for l in progress[-25:])
     return f"""<div hx-post="/im/in" hx-vals='{{"type":"ai_calc_search_status","branch":"ai_calc","lvl":2}}' hx-trigger="every 2s" hx-target="#srch-out" hx-swap="innerHTML">
                    <div class="status-bar"><span class="spin-anim">[..]</span> {status}</div><div class="log-wrap">{log}</div></div>"""
+
+def _pull_row_html(r):
+    conns = AIM.connections.conns_matching("model_pull_hf")
+    if not conns: return '<div class="dim tiny" style="margin-top:.3rem">No connection declares model_pull_hf.</div>'
+    c_opts = "".join(f'<option value="{c["_id"]}">{UI.escape(c.get("display_name", c["_id"]))}</option>' for c in conns)
+    q_opts = "".join(f'<option value="{q}" {"selected" if q == r["quant"] else ""}>{q}</option>' for q in r.get("avail_quants", []))
+    return f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="this" style="display:flex;gap:.3rem;align-items:center;margin-top:.4rem;flex-wrap:wrap">
+        <input type="hidden" name="type" value="ai_calc_pull"><input type="hidden" name="branch" value="ai_calc"><input type="hidden" name="lvl" value="2"><input type="hidden" name="repo" value="{UI.escape(r['id'])}"><input type="hidden" name="cap" value="model_pull_hf">
+        <select name="conn_id" class="fin" style="width:auto">{c_opts}</select><select name="quant" class="fin" style="width:auto">{q_opts}</select>
+        <button class="rbtn" type="submit">Pull to node</button></form>"""
+
+async def _panel_models(request):
+    conns = AIM.connections.conns_matching("model_list")
+    cid = await ENV["get_state"](request, scope="user", namespace="ai_calc", key="models_conn") or (conns[0]["_id"] if conns else "")
+    opts = "".join(f"""<option value="{c['_id']}" {'selected' if c['_id'] == cid else ''}>{UI.escape(c.get('display_name', c['_id']))}</option>""" for c in conns)
+    return f"""<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box">
+        <div class="fsect-hd">Models on a node</div>
+        <select class="fin" name="conn_id" style="width:auto" hx-post="/im/in" hx-trigger="change" hx-target="body" hx-swap="none" hx-include="this" hx-vals='{{"type":"ai_calc_models_show","branch":"ai_calc","lvl":2}}'>{opts or '<option value="">(no connection declares model_list)</option>'}</select>
+        <div id="pull-status" class="dim tiny" style="min-height:1rem;margin:.3rem 0"></div>
+        <div id="models-body" hx-post="/im/in" hx-trigger="load" hx-target="body" hx-swap="none" hx-vals='{{"type":"ai_calc_models_show","branch":"ai_calc","lvl":2,"conn_id":"{cid}"}}'></div>
+        <div id="models-modal"></div>
+    </div>"""
+
+async def _models_body_html(conn) -> str:
+    if not conn: return '<div class="dim tiny">No connection selected.</div>'
+    r = await AIM.connections.call_capability(conn, "model_list", {}, timeout_s=15)
+    if r.get("error"): return f'<div class="err-box">{UI.escape(str(r["error"]))}</div>'
+    rows = ""
+    for m in sorted(r.get("models", []), key=lambda m: m.get("size", 0), reverse=True):
+        d, size, name = m.get("details") or {}, m.get("size", 0), m.get("name", "")
+        tag_q, bpw = d.get("quantization_level", ""), d.get("bpw_est")
+        exp = QUANTS.get(tag_q.upper(), {}).get("bpp", 0) * 8
+        warn = f""" <span style="color:#ffaa44" title="Name says {tag_q} (~{exp:.1f} bits/weight) but file size implies ~{bpw} bits/weight">&#x26A0; size mismatch</span>""" if (tag_q and bpw and exp and abs(bpw - exp) / exp > 0.15) else ""
+        loaded = ' <span class="status-badge">loaded</span>' if m.get("loaded") else ""
+        info_v = json.dumps({"type": "ai_calc_model_info", "branch": "ai_calc", "lvl": 2, "conn_id": conn["_id"], "name": name})
+        del_v = json.dumps({"type": "ai_calc_model_delete", "branch": "ai_calc", "lvl": 2, "conn_id": conn["_id"], "name": name})
+        rows += f"""<tr><td class="qn">{UI.escape(name)}{loaded}</td><td>{size/1e9:.1f} GB</td><td>{UI.escape(tag_q)}{warn}</td><td>{UI.escape(str(d.get("parameter_size", "")))}</td><td>{bpw or "-"}</td><td class="dim tiny">{UI.escape(str(m.get("source", "")))}</td>
+            <td><button class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{info_v}'>Info</button>
+            <button class="cm-qbtn" style="color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-confirm="Permanently delete {UI.escape(name)} ({size/1e9:.1f} GB) from this node? This cannot be undone." hx-vals='{del_v}'>&#x2715;</button></td></tr>"""
+    def pull_form(cap, label, ph_a, ph_b=None):
+        return f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="this" style="display:flex;gap:.3rem;flex-wrap:wrap;margin-top:.4rem">
+            <input type="hidden" name="type" value="ai_calc_pull"><input type="hidden" name="branch" value="ai_calc"><input type="hidden" name="lvl" value="2"><input type="hidden" name="conn_id" value="{conn['_id']}"><input type="hidden" name="cap" value="{cap}">
+            <input class="fin" name="{'repo' if ph_b else 'name'}" placeholder="{ph_a}" style="flex:2;min-width:12rem" required>{f'<input class="fin" name="quant" placeholder="{ph_b}" style="flex:1;min-width:6rem" required>' if ph_b else ''}
+            <button class="rbtn" type="submit">{label}</button></form>"""
+    pulls = (pull_form("model_pull_hf", "Pull from HuggingFace", "user/repo-GGUF", "Q4_K_M") if AIM.connections.has_capability(conn, "model_pull_hf") else "") + (pull_form("model_pull", "Pull by name", "qwen3:8b") if AIM.connections.has_capability(conn, "model_pull") else "")
+    cache_html = ""
+    if AIM.connections.has_capability(conn, "context_cache_list"):
+        cr = await AIM.connections.call_capability(conn, "context_cache_list", {}, timeout_s=10)
+        crow = "".join(f"""<tr><td class="qn">{UI.escape(e['file'])}</td><td>{e['size']/1e9:.2f} GB</td><td><button class="cm-qbtn" style="color:#ff5f5f" hx-post="/im/in" hx-target="body" hx-swap="none" hx-confirm="Delete this saved context?" hx-vals='{json.dumps({"type": "ai_calc_cache_purge", "branch": "ai_calc", "lvl": 2, "conn_id": conn["_id"], "file": e["file"]})}'>&#x2715;</button></td></tr>""" for e in cr.get("entries", []))
+        cache_html = f"""<div class="fsect-hd" style="margin-top:1rem">Saved contexts (keeps {cr.get('ring_size', '?')}, {cr.get('free_gb', '?')} GB free)</div><table class="data-table"><tbody>{crow or '<tr><td class="dim">None saved yet.</td></tr>'}</tbody></table>"""
+    return f"""<table class="data-table"><thead><tr><th>Model</th><th>Size</th><th>Quant (tag)</th><th>Params</th><th>Bits/wt</th><th>Source</th><th></th></tr></thead><tbody>{rows or '<tr><td class="dim" colspan="7">No models.</td></tr>'}</tbody></table>{pulls}{cache_html}"""
+
+async def _h_models_show(request, payload, imr):
+    cid = payload.get("conn_id", "")
+    await ENV["set_state"](request, cid, scope="user", namespace="ai_calc", key="models_conn")
+    return imr.oob(await _models_body_html(AIM.connections.get_conn(cid) if cid else None), "models-body")
+
+async def _h_model_info(request, payload, imr):
+    r = await AIM.connections.call_capability(AIM.connections.get_conn(payload.get("conn_id", "")), "model_info", {"name": payload.get("name", "")}, timeout_s=30)
+    return imr.oob(UI.modal("ai-model-info", payload.get("name", ""), f"""<pre style="font-size:.7rem;white-space:pre-wrap;max-height:60vh;overflow:auto">{UI.escape(json.dumps(r, indent=2)[:6000])}</pre>""", width="90%", max_width="42rem"), "models-modal")
+
+async def _h_model_delete(request, payload, imr):
+    conn = AIM.connections.get_conn(payload.get("conn_id", ""))
+    r = await AIM.connections.call_capability(conn, "model_delete", {"name": payload.get("name", ""), "confirm": True}, timeout_s=60)
+    if r.get("error"): imr.oob(f"""<span style="color:#ff5f5f">{UI.escape(str(r["error"])[:200])}</span>""", "pull-status")
+    return imr.oob(await _models_body_html(conn), "models-body")
+
+async def _h_cache_purge(request, payload, imr):
+    conn = AIM.connections.get_conn(payload.get("conn_id", ""))
+    await AIM.connections.call_capability(conn, "context_cache_purge", {"file": payload.get("file", "")}, timeout_s=15)
+    return imr.oob(await _models_body_html(conn), "models-body")
+
+async def _h_pull(request, payload, imr):
+    conn = AIM.connections.get_conn(payload.get("conn_id", ""))
+    if not conn: return imr.oob("No connection selected.", "pull-status")
+    asyncio.create_task(_run_pull(request.state.user.username, conn, {k: payload[k] for k in ("repo", "quant", "name", "filename", "filenames") if payload.get(k)}, payload.get("cap") or "model_pull_hf"))
+    return imr.oob(f"Pull started on {UI.escape(conn.get('display_name', conn['_id']))}...", "pull-status")
+
+async def _run_pull(username, conn, payload, capability):
+    async def show(html): await ENV["push_fragment"](username, "pull-status", html)
+    try:
+        async for chunk in AIM.connections.stream_capability(conn, capability, payload):
+            status = str(chunk.get("error") or chunk.get("status", ""))
+            if chunk.get("error") or status.startswith("error"): await show(f"""<span style="color:#ff5f5f">{UI.escape(status[:200])}</span>"""); return
+            tot, done = chunk.get("total") or 0, chunk.get("completed") or 0
+            await show(f"{UI.escape(status)}" + (f" {done/tot*100:.0f}% ({done/1e9:.1f}/{tot/1e9:.1f} GB)" if tot else ""))
+        await show("""<span style="color:#00ffa2">Pull finished - reselect the connection to refresh the list.</span>""")
+    except Exception as e: await show(f"""<span style="color:#ff5f5f">Pull failed: {UI.escape(str(e)[:200])}</span>""")
 
 # --- UI: Hardware ---
 
@@ -715,7 +830,7 @@ def _panel_compare():
                 <label>Hardware{_hw_select_html()}</label>
                 <label>Ctx range min-max (tokens)<input class="fin" name="ctx_range" value="4096-65536"></label>
                 <label>Steps<input class="fin" name="ctx_steps" type="number" value="8"></label>
-                <label>KV Quant<select class="fin" name="kv_bits"><option value="16">FP16</option><option value="8" selected>INT8</option><option value="4">INT4</option></select></label>
+                <label>KV Cache Type{_kv_select_html()}</label>
             </div>
             {"".join(f'''<div class="frow wrap"><label>Series {i+1} Params (B){(" - required" if i==0 else " - optional")}<input class="fin" name="s{i}_params" type="number" step="any" value="{"7" if i==0 else ""}"></label><label>Quant<select class="fin" name="s{i}_quant">{_quant_opts()}</select></label></div>''' for i in range(3))}
             <button class="rbtn" type="submit">Run Sweep</button>
@@ -731,6 +846,7 @@ async def _render_panel(request, state):
     if active == "session": return state, '<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box" hx-post="/im/in" hx-vals=\'{"type":"ai_calc_session_poll","branch":"ai_calc","lvl":2}\' hx-trigger="load, every 5s" hx-target="this" hx-swap="innerHTML">Loading...</div>'
     if active == "hardware": return state, _panel_hardware()
     if active == "compare": return state, _panel_compare()
+    if active == "models": return state, await _panel_models(request)
     return state, _panel_calc()
 
 async def _h_calc_run(request, payload, imr):
@@ -738,8 +854,8 @@ async def _h_calc_run(request, payload, imr):
     pb = max(0.1, min(float(payload.get("params_b", 7) or 7), 500))
     quant = payload.get("quant", "Q4_K_M") if payload.get("quant") in QUANTS else "Q4_K_M"
     ctx = max(512, int(payload.get("ctx_tokens", 20992) or 20992))
-    kv_bits = int(payload.get("kv_bits", 8) or 8)
-    return imr.raw(_calc_result_html(pb, quant, ctx, hw, kv_bits, payload.get("cnode_id","")))
+    kv_type = payload.get("kv_type") if payload.get("kv_type") in KV_TYPES else DEFAULT_KV
+    return imr.raw(_calc_result_html(pb, quant, ctx, hw, kv_type, payload.get("cnode_id","")))
 
 async def _h_image_calc(request, payload, imr):
     hw = get_hw(payload.get("cnode_id",""))
@@ -752,9 +868,37 @@ async def _h_image_calc(request, payload, imr):
     </div><div style="font-size:.72rem;color:var(--text_muted);margin-top:.3rem">{r['note']}</div>""")
 
 async def _h_log_actual(request, payload, imr):
-    AIM.resources.log_usage(payload.get("cnode_id","") or "unspecified", "calc_estimate_check", 0,
-                             extra={"params_b": float(payload.get("params_b",0) or 0), "quant": payload.get("quant",""), "ctx_tokens": int(payload.get("ctx_tokens",0) or 0), "actual_tps": float(payload.get("actual_tps",0) or 0)})
+    cid, pb, q = payload.get("cnode_id", "") or "unspecified", float(payload.get("params_b", 0) or 0), payload.get("quant", "Q4_K_M")
+    kv = payload.get("kv_type") if payload.get("kv_type") in KV_TYPES else DEFAULT_KV
+    hw, f = get_hw(payload.get("cnode_id", "")), (lambda k: float(payload.get(k) or 0))  # blank = 0 = "not measured", intentional here
+    n, cached, gen = f("read_n"), f("cached_n"), f("write_n")
+    extra = {"params_b": pb, "quant": q, "kv_type": kv, "read_n": n, "cached_n": cached, "write_n": gen, "file_gb": f("file_gb") or None}
+    if n and f("read_tps"):
+        est = n / (prefill_time_s(pb, cached + n, hw) - prefill_time_s(pb, cached, hw))
+        extra.update(read_tps=f("read_tps"), est_read_tps=round(est, 2), ratio_read=round(f("read_tps") / est, 3))
+    if gen and f("write_tps"):
+        depth = cached + n + gen / 2
+        est = decode_tps_at(pb, q, depth, hw, kv)
+        extra.update(write_tps=f("write_tps"), est_write_tps=est, depth_mid=int(depth), ratio_write=round(f("write_tps") / est, 3) if est else None)
+    AIM.resources.log_usage(cid, "calc_estimate_check", 0, extra=extra)
+    imr.oob(_calib_summary_html(cid), "calc-log-summary")
     return imr
+
+def _calib_summary_html(cid: str) -> str:
+    try: lines = AIM.resources.USAGE_LOG.read_text().splitlines()
+    except FileNotFoundError: lines = []
+    rows = []
+    for l in lines:
+        try: d = json.loads(l)
+        except Exception: continue
+        if d.get("node_type") == "calc_estimate_check" and d.get("cnode_id") == cid and (d.get("ratio_read") or d.get("ratio_write")): rows.append(d)
+    if not rows: return '<div class="dim tiny">No calibration entries yet for this hardware profile.</div>'
+    mean = lambda k: (lambda v: sum(v) / len(v) if v else None)([d[k] for d in rows if d.get(k)])
+    mw, mr = mean("ratio_write"), mean("ratio_read")
+    fmt = lambda v: "-" if v is None else f"{v:.2f}"
+    body = "".join(f"""<tr><td>{d.get('depth_mid', '-')}</td><td>{d.get('write_tps', '-')}</td><td>{d.get('est_write_tps', '-')}</td><td>{d.get('ratio_write', '-')}</td><td>{d.get('read_n', '-')}</td><td>{d.get('read_tps', '-')}</td><td>{d.get('ratio_read', '-')}</td></tr>""" for d in sorted(rows, key=lambda d: d.get("depth_mid") or 0)[-12:])
+    return f"""<table class="cmp-table"><thead><tr><th>Depth</th><th>Write t/s</th><th>Est</th><th>Ratio</th><th>Read n</th><th>Read t/s</th><th>Ratio</th></tr></thead><tbody>{body}</tbody></table>
+        <div class="dim tiny" style="margin-top:.3rem">Mean actual/estimate: decode {fmt(mw)} (implies gpu_eff ~{fmt(mw and GPU_EFF * mw)}), read {fmt(mr)} (implies ~{fmt(mr and GPU_EFF * mr)}). A ratio that stays flat as depth grows means the context model is right; a ratio that falls with depth means the KV/attention term is off.</div>"""
 
 async def _h_search(request, payload, imr):
     with _job_lock:
@@ -765,7 +909,7 @@ async def _h_search(request, payload, imr):
               "min_tps": max(0.0, float(payload.get("min_tps",1.0) or 0)), "target_tps": max(0.1, float(payload.get("target_tps",5.0) or 0.1)),
               "extra_query": payload.get("extra_query",""), "must_contain": payload.get("must_contain",""), "any_contain": payload.get("any_contain",""), "exclude": payload.get("exclude",""),
               "hw": hw, "weights": _parse_weights(payload), "force_refresh": payload.get("force_refresh") == "1", "deep_scan": payload.get("deep_scan") == "1",
-              "kv_bits": int(payload.get("kv_bits", 8) or 8), "min_quant": payload.get("min_quant","Q2_K") if payload.get("min_quant","Q2_K") in QUANTS else "Q2_K",
+              "kv_type": payload.get("kv_type") if payload.get("kv_type") in KV_TYPES else DEFAULT_KV
               "top_n": max(5, min(int(payload.get("top_n",40) or 40), 200)), "fetched": 0}
     _job_reset(); _job_up(running=True, status="Starting...", params=params)
     threading.Thread(target=_run_thread, args=(params,), daemon=True).start()
@@ -778,7 +922,7 @@ async def _h_rerank(request, payload, imr):
     with _job_lock: filtered, params = _job.get("filtered"), _job.get("params")
     if not filtered: return imr.raw('<div class="err-box">No cached search results to re-rank - run a search first.</div>')
     weights = _parse_weights(payload)
-    rows = _rank_filtered(filtered, params["hw"], params["ctx_tokens"], params["target_tps"], weights, params["top_n"], params.get("kv_bits", 8))
+    rows = _rank_filtered(filtered, params["hw"], params["ctx_tokens"], params["target_tps"], weights, params["top_n"], params["kv_type"])
     _write_csv(rows, "rerank")
     with _job_lock:
         prior_stats = (_job.get("result") or {}).get("stats", {})
@@ -800,7 +944,7 @@ async def _h_hw_save(request, payload, imr):
     return imr.oob(_panel_hardware(), TM.content_id)
 
 async def _h_session_poll(request, payload, imr):
-    conns = AIM.connections.list_conns(conn_type="ollama")
+    conns = AIM.connections.list_conns(conn_type="ollama") + AIM.connections.list_conns(conn_type="llama_direct")
     if not conns: return imr.raw('<div class="placeholder">No Ollama connection configured - add one in AI Manager.</div>')
     hw = get_hw("")
     cards = ""
@@ -812,7 +956,7 @@ async def _h_session_poll(request, payload, imr):
 
 async def _h_sweep(request, payload, imr):
     hw = get_hw(payload.get("cnode_id",""))
-    kv_bits = int(payload.get("kv_bits", 8) or 8)
+    kv_type = payload.get("kv_type") if payload.get("kv_type") in KV_TYPES else DEFAULT_KV
     try: lo, hi = (float(x) for x in payload.get("ctx_range","4096-65536").split("-"))
     except Exception: lo, hi = 4096.0, 65536.0
     steps = max(2, min(int(payload.get("ctx_steps",8) or 8), 30))
@@ -825,7 +969,7 @@ async def _h_sweep(request, payload, imr):
         except Exception: continue
         quant = payload.get(f"s{i}_quant","Q4_K_M")
         if quant not in QUANTS: continue
-        pts = [(c, full_perf(pb, quant, int(c), hw, kv_bits)["tps"]) for c in ctx_vals]
+        pts = [(c, full_perf(pb, quant, int(c), hw, kv_type)["tps"]) for c in ctx_vals]
         series.append({"label": f"{pb}B {quant}", "points": pts})
     if not series: return imr.raw('<div class="err-box">Enter at least one series (Params + Quant) to sweep.</div>')
     return imr.raw(_svg_line_chart(series, title="Tokens/sec vs context window"))
@@ -837,8 +981,7 @@ def _hw_from_form(f) -> dict:
     hw["gpu_eff"] = GPU_EFF
     return hw
 
-def estimate_for_pipeline(cnode_id: str, params_b: float, quant: str, ctx: int, kv_bits: int = 8) -> dict: return full_perf(params_b, quant, ctx, get_hw(cnode_id), kv_bits) #Stable entry point for other modules (engine.py's future sDAG optimizer, PipelineBuilderUI's preflight) to get a speed/memory estimate without importing ai_calc's UI internals.
-    
+def estimate_for_pipeline(cnode_id: str, params_b: float, quant: str, ctx: int, kv_type=None) -> dict: return full_perf(params_b, quant, ctx, get_hw(cnode_id), kv_type) #Stable entry point for other modules (engine.py's future sDAG optimizer, PipelineBuilderUI's preflight) to get a speed/memory estimate without importing ai_calc's UI internals.
 
 # --- Routes / Init ---
 
@@ -855,11 +998,7 @@ def _script():
         }};
         window.syncHW = function(){{}};  // hooked so _hw_ref_html's inline onclick has a stable target even before any hw form field listens; individual .hwin values are read generically on form submit, no per-field JS needed
     }})();
-    function calcLogActual(cnodeId, paramsB, quant, ctx) {{
-        var v = document.getElementById('calc-actual-tps').value; if (!v) return;
-        htmx.ajax('POST', '/im/in', {{values:{{type:'ai_calc_log_actual', branch:'ai_calc', lvl:2, cnode_id:cnodeId, params_b:paramsB, quant:quant, ctx_tokens:ctx, actual_tps:v}}, swap:'none'}})
-            .then(function(){{ var m=document.getElementById('calc-log-msg'); if(m) m.textContent = 'Logged.'; }});
-    }}"""
+    """
 
 def init_tool(env, prefix):
     global ENV, UI, BI, AIM, IM, TM, _P
@@ -871,17 +1010,19 @@ def init_tool(env, prefix):
     load_config()
     IM = env["InterfaceManager"](nesting_level=2, db_path="ai_tools/ai_calc_im.db")
     TM = BI.TabManager(namespace="ai_calc", tab_bar_id="calc-tab-bar", content_id="calc-panel", render_content_fn=_render_panel, intent_prefix="ai_calc", IM=IM, scope="user", nesting_level=2, allow_new=False, closable=False,
-                        empty={"tabs": {"calc":{"id":"calc","order":0,"label":"Calculator","icon":"&#x223C;"}, "search":{"id":"search","order":1,"label":"Model Finder","icon":"&#x1F50D;"},
-                                        "compare":{"id":"compare","order":2,"label":"Compare","icon":"&#x1F4CA;"}, "session":{"id":"session","order":3,"label":"Session","icon":"&#x25CF;"}, "hardware":{"id":"hardware","order":4,"label":"Hardware","icon":"&#x1F5A5;"}}, "active":"calc"})
+                        empty={"tabs": {"calc":{"id":"calc","order":0,"label":"Calculator","icon":"&#x223C;"}, "search":{"id":"search","order":1,"label":"Model Finder","icon":"&#x1F50D;"}, "compare":{"id":"compare","order":2,"label":"Compare","icon":"&#x1F4CA;"}, "session":{"id":"session","order":3,"label":"Session","icon":"&#x25CF;"}, "hardware":{"id":"hardware","order":4,"label":"Hardware","icon":"&#x1F5A5;"}, "models":{"id":"models","order":5,"label":"Models","icon":"&#x1F4E6;"}}, "active":"calc"})
     IM.scripts.update({"ai_calc_run": [_h_calc_run], "ai_calc_image": [_h_image_calc], "ai_calc_log_actual": [_h_log_actual], "ai_calc_search": [_h_search],
-                        "ai_calc_search_status": [_h_search_status], "ai_calc_rerank": [_h_rerank], "ai_calc_sweep": [_h_sweep],
-                        "ai_calc_hw_form": [_h_hw_form], "ai_calc_hw_save": [_h_hw_save], "ai_calc_session_poll": [_h_session_poll]})
+                       "ai_calc_search_status": [_h_search_status], "ai_calc_rerank": [_h_rerank], "ai_calc_sweep": [_h_sweep],
+                       "ai_calc_models_show": [_h_models_show], "ai_calc_model_info": [_h_model_info], "ai_calc_model_delete": [_h_model_delete], "ai_calc_cache_purge": [_h_cache_purge], "ai_calc_pull": [_h_pull],
+                       "ai_calc_hw_form": [_h_hw_form], "ai_calc_hw_save": [_h_hw_save], "ai_calc_session_poll": [_h_session_poll]})
     print("[ai_calc] ready")
 
 @router.get("")
 @router.get("/")
 async def root(request: Request):
     state = await TM._load(request)
+    state["tabs"].setdefault("models", {"id":"models","order":5,"label":"Models","icon":"&#x1F4E6;"})
+    await TM._save(request, state)
     state, panel_html = await _render_panel(request, state)
     tab_bar = await TM.tab_bar_fn(state, "calc-tab-bar", "ai_calc", 2, allow_new=False, closable=False)
     return ENV["templates"].TemplateResponse(name="base.html", request=request, context={

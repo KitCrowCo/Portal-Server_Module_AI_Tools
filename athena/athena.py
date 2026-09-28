@@ -56,7 +56,8 @@ def init_tool(env:dict, prefix:str):
                 BI.SettingField("temperature", "Temperature", "number", 0.3),
                 BI.SettingField("num_predict", "Max Response Tokens", "number", 8192),
                 BI.SettingField("allow_files", "Allow File Attachments", "checkbox", True),
-                BI.SettingField("user_overrides", "Per-User Default Capability", "json", default={}, hint='{"username": "capability_id"} - overrides default_capability_id for specific people.')
+                BI.SettingField("user_overrides", "Per-User Default Capability", "json", default={}, hint='{"username": "capability_id"} - overrides default_capability_id for specific people.'),
+                BI.SettingField("consent_prefix", "System Prompt Prefix (prepended to every capability)", "textarea", "", hint="Injected before this capability's own system prompt on every request. Edit once here rather than per-capability."),
             ], json_path="data/settings/athena.json")])
     CM=ENV["tools"]["built_ins"].ChatManager(namespace="athena", base_url=_u(), view_style="bubble", stream_toggle=True, think_toggle=False, stop_enabled=True, show_export=False, pin_enabled=True, allow_edit=True, allow_delete=True, allow_copy=True, show_info=True, markdown_mode="standard", branch_id=IM.branch_id, nesting_level=2, action_intent_prefix="athena")
     IM.scripts.update({"submit": [_handle_submit],
@@ -181,19 +182,20 @@ def _attach_content(conv):
 
 def _uploads_dir(cid): d=DATA_DIR/"uploads"/cid; d.mkdir(parents=True,exist_ok=True); return d
 
-# --- Ollama streaming ---
+# --- streaming ---
 
-async def _stream_ollama(conn, msgs, model, ctx, think="", images=None, temperature=0.7, num_predict=8192, top_k=40, top_p=0.8):
+async def _stream_llm(conn, msgs, model, ctx, think="", images=None, temperature=0.7, num_predict=8192, top_k=40, top_p=0.8, cache_session=""):
     if images and msgs: msgs[-1]["images"] = images
-    async for text, thinking in AIM.connections.stream_llm(conn, msgs, model, think, temperature=temperature, num_ctx=ctx, num_predict=num_predict, top_k=top_k, top_p=top_p): yield text, thinking, False, None
-    # async for text, thinking, done, err in _stream_ollama(conn, msgs, model, ctx, think, images, temperature, num_predict, top_k, top_p): yield text, thinking, False, None
+    async for text, thinking in AIM.connections.stream_llm(conn, msgs, model, think, temperature=temperature, num_ctx=ctx, num_predict=num_predict, top_k=top_k, top_p=top_p, cache_session=cache_session or None): yield text, thinking, False, None
     yield "", "", True, None
 
-def _build_msgs(conv, user_msg, knowledge_context=""):
+def _build_msgs(conv, user_msg, knowledge_context="", drop_last_user=False):
     cap = _resolve_capability(conv)
     ctx = conv.get("model_ctx_override") or cap.get("model_ctx", 16384)
     budget = int(ctx * 0.82)
     sys_p = conv.get("system_prompt_override") or cap.get("system_prompt", "")
+    prefix = cfg.get("consent_prefix", "").strip()
+    if prefix: sys_p = f"{prefix}\n\n{sys_p}" if sys_p else prefix
     summary = conv.get("context_summary","").strip()
     out = []
     sys_parts = [sys_p] if sys_p else []
@@ -203,18 +205,16 @@ def _build_msgs(conv, user_msg, knowledge_context=""):
     sys_tok = sum(_tok(m["content"]) for m in out)
     available = budget - sys_tok - _tok(user_msg) - 256
     if available < 100: raise ValueError(f"System prompt + knowledge context fills context window ({sys_tok}t sys, {_tok(user_msg)}t input, {budget}t budget)")
-    history = [m for m in conv.get("messages",[]) if not m.get("deleted")]
-    recent = []
-    used = 0
-    truncated = 0
+    history = [m for m in conv.get("messages",[]) if not m.get("deleted") and not str(m.get("content","")).startswith("*(no visible reply")]
+    if drop_last_user and history and history[-1].get("role") == "user": history = history[:-1]
+    recent, used = [], 0
     for m in reversed(history):
         t = _tok(m.get("content",""))
-        if used + t > available: truncated += 1; continue
-        recent.insert(0, {"role":m["role"], "content":m["content"]})
-        used += t
+        if used + t > available: break
+        recent.insert(0, {"role":m["role"], "content":m["content"]}); used += t
     out.extend(recent)
     out.append({"role":"user", "content":user_msg})
-    return out, truncated
+    return out, len(history) - len(recent)
 
 # --- Submit + Stream ---
 
@@ -271,7 +271,7 @@ async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=Fa
                     kg_text = kg_result.get("response","").strip()
                     knowledge_context = f"[Company Knowledge]\n{kg_text}\n" if kg_text else ""
                     if not kg_text: await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="font-size:.65rem;color:var(--text_muted);padding:.1rem .4rem">(knowledge lookup returned no results for this question)</div></div>')
-        try: built_msgs, truncated = _build_msgs(conv, content, knowledge_context)
+        try: built_msgs, truncated = _build_msgs(conv, content, knowledge_context, drop_last_user=skip_user_append)
         except ValueError as e: await _err(f"Context error: {e}"); return
         if truncated: await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="font-size:.7rem;color:#ffcc00;padding:.2rem .4rem;border-left:var(--border-thick) solid #ffcc00">&#x26A0; {truncated} older message{"s" if truncated>1 else ""} shifted out of context window.</div></div>')
         user_msg = None
@@ -283,7 +283,7 @@ async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=Fa
         _,images = _attach_content(conv)
         _ACTIVE_STREAMS.add(sid)
         try:
-            async for text, thinking, done, err in _stream_ollama(conn, built_msgs, model, num_ctx, cap.get("think", False), images=images or None, temperature=float(cfg.get("temperature", 0.7)), num_predict = int(cap.get("num_predict") or cfg.get("num_predict", 8192))):
+            async for text, thinking, done, err in _stream_llm(conn, built_msgs, model, num_ctx, cap.get("think", False), images=images or None, temperature=float(cfg.get("temperature", 0.7)), num_predict = int(cap.get("num_predict") or cfg.get("num_predict", 8192))):
                 if _STOP_FLAGS.pop(sid, False): break
                 if err: _STREAM_BUFFERS[sid]["error"] = err; await _err(f"Model error: {err}"); return
                 if text: full += text
@@ -648,6 +648,7 @@ async def _h_msg_edit_form(request, payload, imr):
                                    <div style="display:flex;gap:.3rem">
                                        <button type="submit" class="button" style="font-size:.75rem;margin-top:0">Save</button>
                                        <button type="button" class="btn-icon" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{_iv("athena_msg_cancel_edit", id=mid)}'>Cancel</button>
+                                       <button type="button" class="button" style="font-size:.75rem;margin-top:0" hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="closest form" hx-vals='{_iv("athena_msg_retry_send")}'>&#x21BA; Save &amp; Retry</button>
                                    </div>
                                </form>
                             </div>
@@ -877,7 +878,7 @@ def _cap_by_id(caps, cap_id): return next((c for c in caps if c.get("id")==cap_i
 
 def _capability_card_html(cap):
     cid_field = cap.get("id","")
-    conn_opts = "".join(f'<option value="{c["_id"]}" {"selected" if c["_id"]==cap.get("conn_id") else ""}>{_esc(c.get("display_name",c["_id"]))}</option>' for c in AIM.connections.list_conns())
+    conn_opts = "".join(f'<option value="{c["_id"]}" {"selected" if c["_id"]==cap.get("conn_id") else ""}>{_esc(c.get("display_name",c["_id"]))}</option>' for c in AIM.connections.conns_matching("chat"))
     models = AIM.connections.list_models_sync(AIM.connections.get_conn(cap.get("conn_id",""))) if cap.get("conn_id") else []
     model_opts = "".join(f'<option value="{_esc(m)}" {"selected" if m==cap.get("model") else ""}>{_esc(m)}{" (embedding - not for chat)" if AIM.steps.looks_like_embedding(m) else ""}</option>' for m in models)
     kg_opts = "".join(f'<option value="{c["_id"]}" {"selected" if c["_id"]==cap.get("knowledge_conn_id") else ""}>{_esc(c.get("display_name",c["_id"]))}</option>' for c in AIM.connections.list_conns(conn_type="lightrag"))
