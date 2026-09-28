@@ -130,5 +130,5 @@
     "SCORE_DIM_LABELS": {"lb_avg": "Leaderboard Avg", "quant_qual": "Quant Quality", "speed": "Gen Speed", "mem_head": "Mem Headroom", "ctx_fit": "VRAM Ctx Fit", "popularity": "Popularity", "intel": "Intelligence"},
     "SCORE_DIM_COLORS": {"lb_avg": "#00ffa2", "quant_qual": "#3d9aff", "speed": "#ffcc00", "mem_head": "#ff9a3c", "ctx_fit": "#b06aff", "popularity": "#ff79c6", "intel": "#0000ff"},
     "KV_TYPES": {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 1.0625, "q5_1": 0.75, "q5_0": 0.6875, "q4_1": 0.625, "q4_0": 0.5625, "iq4_nl": 0.5625},
-    "DEFAULT_KV_TYPE": "q8_0",
+    "DEFAULT_KV_TYPE": "q8_0"
 }

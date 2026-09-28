@@ -22,6 +22,8 @@ DATA_DIR = Path("./data/ai_tools/ai_calc")
 QUANTS, IMAGE_MODELS, TASK_PRESETS, KNOWN_BENCHMARKS, DEFAULT_WEIGHTS, SCORE_DIM_LABELS, SCORE_DIM_COLORS, _KNOWN_SHORT = {}, {}, {}, {}, {}, {}, {}, {}
 ARCH_TABLE, REFERENCE_LINES, PROPRIETARY_REFS, SCORE_DIMS = [], [], [], []
 STANDARD_SIZES = [1, 3, 7, 8, 9, 11, 12, 13, 14, 20, 27, 30, 32, 34, 70, 72]
+DEFAULT_KV = "q8_0"
+KV_TYPES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 1.0625, "q5_1": 0.75, "q5_0": 0.6875, "q4_1": 0.625, "q4_0": 0.5625, "iq4_nl": 0.5625}
 
 def load_config():
     global ARCH_TABLE, PROPRIETARY_REFS, REFERENCE_LINES, SCORE_DIMS
@@ -909,8 +911,9 @@ async def _h_search(request, payload, imr):
               "min_tps": max(0.0, float(payload.get("min_tps",1.0) or 0)), "target_tps": max(0.1, float(payload.get("target_tps",5.0) or 0.1)),
               "extra_query": payload.get("extra_query",""), "must_contain": payload.get("must_contain",""), "any_contain": payload.get("any_contain",""), "exclude": payload.get("exclude",""),
               "hw": hw, "weights": _parse_weights(payload), "force_refresh": payload.get("force_refresh") == "1", "deep_scan": payload.get("deep_scan") == "1",
-              "kv_type": payload.get("kv_type") if payload.get("kv_type") in KV_TYPES else DEFAULT_KV
-              "top_n": max(5, min(int(payload.get("top_n",40) or 40), 200)), "fetched": 0}
+              "kv_type": payload.get("kv_type") if payload.get("kv_type") in KV_TYPES else DEFAULT_KV,
+              "top_n": max(5, min(int(payload.get("top_n",40) or 40), 200)),
+              "fetched": 0}
     _job_reset(); _job_up(running=True, status="Starting...", params=params)
     threading.Thread(target=_run_thread, args=(params,), daemon=True).start()
     return imr.raw(_search_status_html())
