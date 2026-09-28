@@ -271,6 +271,8 @@ async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=Fa
                     kg_text = kg_result.get("response","").strip()
                     knowledge_context = f"[Company Knowledge]\n{kg_text}\n" if kg_text else ""
                     if not kg_text: await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="font-size:.65rem;color:var(--text_muted);padding:.1rem .4rem">(knowledge lookup returned no results for this question)</div></div>')
+        text_parts, images = _attach_content(conv)
+        if text_parts: knowledge_context = (knowledge_context + "\n\n" if knowledge_context else "") + "[Attached Files]\n" + "\n\n".join(text_parts)
         try: built_msgs, truncated = _build_msgs(conv, content, knowledge_context, drop_last_user=skip_user_append)
         except ValueError as e: await _err(f"Context error: {e}"); return
         if truncated: await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="font-size:.7rem;color:#ffcc00;padding:.2rem .4rem;border-left:var(--border-thick) solid #ffcc00">&#x26A0; {truncated} older message{"s" if truncated>1 else ""} shifted out of context window.</div></div>')
@@ -280,7 +282,6 @@ async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=Fa
             conv["messages"].append(user_msg)
             _save_conv(conv)
             await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend">{CM.render_message(user_msg, is_me=True, can_delete=True, can_edit=True)}</div>')
-        _,images = _attach_content(conv)
         _ACTIVE_STREAMS.add(sid)
         try:
             async for text, thinking, done, err in _stream_llm(conn, built_msgs, model, num_ctx, cap.get("think", False), images=images or None, temperature=float(cfg.get("temperature", 0.7)), num_predict = int(cap.get("num_predict") or cfg.get("num_predict", 8192))):

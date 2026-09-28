@@ -376,8 +376,7 @@ async def test_conn(cid: str):
     sc, msg, models_html = "#ff5f5f", "unreachable", ""
     try:
         async with httpx.AsyncClient(timeout=5.0, trust_env=False, follow_redirects=True) as cl:
-            r = await cl.request(ep.get("method", "GET"), AIM.connections._base(c))
-            print("TESTING2", r)
+            r = await cl.request(ep.get("method", "GET"), AIM.connections._base(c) + ep.get("path", "/"))
             if r.status_code == 200:
                 sc, msg = "#00ffa2", f"Connected - HTTP {r.status_code}"
                 try:
