@@ -184,9 +184,9 @@ def _uploads_dir(cid): d=DATA_DIR/"uploads"/cid; d.mkdir(parents=True,exist_ok=T
 
 # --- streaming ---
 
-async def _stream_llm(conn, msgs, model, ctx, think="", images=None, temperature=0.7, num_predict=8192, top_k=40, top_p=0.8, cache_session=""):
+async def _stream_llm(conn, msgs, model, ctx, think="", images=None, temperature=0.7, num_predict=8192, top_k=40, top_p=0.8, cache_session="", kv_type="Q8_0"):
     if images and msgs: msgs[-1]["images"] = images
-    async for text, thinking in AIM.connections.stream_llm(conn, msgs, model, think, temperature=temperature, num_ctx=ctx, num_predict=num_predict, top_k=top_k, top_p=top_p, cache_session=cache_session or None): yield text, thinking, False, None
+    async for text, thinking in AIM.connections.stream_llm(conn, msgs, model, think, temperature=temperature, num_ctx=ctx, num_predict=num_predict, top_k=top_k, top_p=top_p, cache_session=cache_session or None, kv_cache_type=kv_type): yield text, thinking, False, None
     yield "", "", True, None
 
 def _build_msgs(conv, user_msg, knowledge_context="", drop_last_user=False):
@@ -253,6 +253,7 @@ async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=Fa
         cap = _resolve_capability(conv)
         conn = AIM.connections.get_conn(cap.get("conn_id",""))
         num_ctx = conv.get("model_ctx_override") or cap.get("model_ctx", 16384)
+        kv_type = conv.get("kv_cache_override") or cap.get("kv_cache_type") or None
         if not conn: await _err(f"No connection configured for capability '{cap.get('label','')}'. Contact your admin."); return
         model = cap.get("model","")
         if not model: await _err(f"No model configured for capability '{cap.get('label','')}'. Contact your admin."); return
@@ -275,6 +276,11 @@ async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=Fa
         if text_parts: knowledge_context = (knowledge_context + "\n\n" if knowledge_context else "") + "[Attached Files]\n" + "\n\n".join(text_parts)
         try: built_msgs, truncated = _build_msgs(conv, content, knowledge_context, drop_last_user=skip_user_append)
         except ValueError as e: await _err(f"Context error: {e}"); return
+        if len(conv.get("messages", [])) > 1:  # not the conversation's first turn - a cold cache here means continuity broke
+            try:
+                lr = await AIM.connections.call_capability(conn, "context_cache_last_restore", {"session": sid}, timeout_s=5)
+                if lr.get("restored") is False: await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="font-size:.65rem;color:#ffaa44;padding:.15rem .4rem">&#x26A0; Prior context was not restored ({lr.get("reason","")}) - this reply reprocesses from scratch.</div></div>')
+            except Exception: pass  # best-effort - never block a reply over a diagnostic check
         if truncated: await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend"><div style="font-size:.7rem;color:#ffcc00;padding:.2rem .4rem;border-left:var(--border-thick) solid #ffcc00">&#x26A0; {truncated} older message{"s" if truncated>1 else ""} shifted out of context window.</div></div>')
         user_msg = None
         if not skip_user_append:
@@ -790,6 +796,9 @@ async def _h_conv_settings_open(request, payload, imr):
                                <label style="font-size:.8rem;color:var(--text_muted)">Context Tokens Override (blank = use capability default: {cap.get("model_ctx",16384)})
                                    <input type="number" name="model_ctx_override" value="{conv.get("model_ctx_override") or ""}" class="module-select">
                                </label>
+                               <label style="font-size:.8rem;color:var(--text_muted)">KV Cache Override (blank = use capability default: {cap.get("kv_cache_type") or "connection default"})
+                                   <select name="kv_cache_override" class="module-select"><option value="">(default)</option>{"".join(f'<option value="{k}" {"selected" if k==conv.get("kv_cache_override") else ""}>{k}</option>' for k in ("f16","q8_0","q5_1","q5_0","q4_1","q4_0","iq4_nl"))}</select>
+                               </label>
                                <button type="submit" class="button">Save</button>
                            </form>
                        </div>""")
@@ -801,6 +810,7 @@ async def _h_conv_settings_save(request, payload, imr):
     conv["system_prompt_override"] = payload.get("system_prompt_override","")
     ctx_raw = payload.get("model_ctx_override","")
     conv["model_ctx_override"] = int(ctx_raw) if str(ctx_raw).strip().isdigit() else None
+    conv["kv_cache_override"] = payload.get("kv_cache_override","") or ""
     _save_conv(conv)
     return imr.raw(_chat_html(conv, request))
 
@@ -904,6 +914,7 @@ def _capability_card_html(cap):
                            </label>
                            <label style="flex:1;min-width:8rem;font-size:.7rem;color:var(--text_muted)">Context Tokens<input type="number" name="model_ctx" value="{cap.get('model_ctx',16384)}" class="module-select"></label>
                            <label style="flex:1;min-width:8rem;font-size:.7rem;color:var(--text_muted)">Max Response Tokens<input type="number" name="num_predict" value="{cap.get('num_predict', cfg.get('num_predict',8192))}" class="module-select" title="Raise this for thinking-heavy models - thinking tokens count against this budget too."></label>
+                           <label style="flex:1;min-width:8rem;font-size:.7rem;color:var(--text_muted)">KV Cache Type<select name="kv_cache_type" class="module-select"><option value="">(connection default)</option>{"".join(f'<option value="{k}" {"selected" if k==cap.get("kv_cache_type") else ""}>{k}</option>' for k in ("f16","q8_0","q5_1","q5_0","q4_1","q4_0","iq4_nl"))}</select></label>
                        </div>
                        <label style="font-size:.7rem;color:var(--text_muted)">
                            Thinking Effort
@@ -970,9 +981,10 @@ async def _h_cap_save(request, payload, imr):
                "conn_id": payload.get("conn_id",""),
                "model": payload.get("model",""),
                "system_prompt": payload.get("system_prompt",""),
-                "think": payload.get("think","") or "",
+               "think": payload.get("think","") or "",
                "model_ctx": int(payload.get("model_ctx", 16384) or 16384),
                "num_predict": int(payload.get("num_predict", 8192) or 8192),
+               "kv_cache_type": payload.get("kv_cache_type","") or "",
                "knowledge_enabled": payload.get("knowledge_enabled")=="1",
                "knowledge_conn_id": payload.get("knowledge_conn_id",""),
                "allowed_roles": [r.strip() for r in payload.get("allowed_roles","").split(",") if r.strip()],
