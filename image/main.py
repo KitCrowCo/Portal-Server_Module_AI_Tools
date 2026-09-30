@@ -1,5 +1,5 @@
 """
-main.py — Flux2 Klein image generation server (FastAPI).
+main.py — AI Image Gen with Flux2 Klein and cogvideox (FastAPI).
 
 Changes vs previous version:
   - _progress dict + /system/progress endpoint (issue 8)
@@ -114,7 +114,7 @@ print(f"DEBUG: Using utils from {utils.__file__}", flush=True)
 
 from accelerate.hooks import remove_hook_from_submodules
 from pipeline_flux2_klein_inpaint import Flux2KleinInpaintPipeline
-from diffusers import Flux2Transformer2DModel, AutoencoderKLFlux2, FlowMatchEulerDiscreteScheduler, GGUFQuantizationConfig
+from diffusers import Flux2Transformer2DModel, AutoencoderKLFlux2, FlowMatchEulerDiscreteScheduler, GGUFQuantizationConfig, CogVideoXImageToVideoPipeline, CogVideoXTransformer3DModel, AutoencoderKLCogVideoX, CogVideoXDDIMScheduler
 import peft  # noqa: F401
 
 # ---------------------------------------------------------------------------
@@ -186,6 +186,64 @@ class APUEngine:
         self._base_scheduler_config = None
         self._lora_hooks: list = []
         self._last_lora_config: list = []
+        self.pipeline_type: str = "flux" # "flux" or "cogvideo"
+        self.expected_text_dim: int = int(os.getenv("EXPECTED_TEXT_DIM", str(4096 * 3))) # Defaults to Flux
+
+    def load(self, model_path: str, vae_path: str = "flux2"):
+        if self.is_loaded: return
+        cuda_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        full_model_path = os.path.join(TRANSFORMER_DIR, model_path)
+        # --- Polymorphic Routing based on file extension/type ---
+        if model_path.endswith(".gguf"):
+            self.pipeline_type = "flux"
+            self.expected_text_dim = int(os.getenv("EXPECTED_TEXT_DIM", str(4096 * 3)))
+            self._load_flux(full_model_path, vae_path, cuda_dev)
+        else:
+            self.pipeline_type = "cogvideo"
+            self.expected_text_dim = 4096 # CogVideoX / T5-XXL strictly expects 4096
+            self._load_cogvideo(full_model_path, cuda_dev)
+
+        logger.info("Stripping accelerate hooks from transformer...")
+        remove_hook_from_submodules(self.pipe.transformer)
+        logger.info(f"Pinning transformer and VAE to {cuda_dev}...")
+        self.pipe.transformer.to(cuda_dev)
+        self.pipe.vae.to(cuda_dev)
+        logger.info(f"Pipeline execution device: {self.pipe._execution_device}")
+        self.pipe._original_state_dict = SilentlyEmptyDict()
+        self.pipe.transformer._original_state_dict = SilentlyEmptyDict()
+        self.pipe.vae._original_state_dict = SilentlyEmptyDict()
+        self.set_vae_tiling(True)
+        self.is_loaded = True
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(f"Engine load complete. Type: {self.pipeline_type}")
+
+    def _load_flux(self, model_path, vae_path, cuda_dev):
+        vae_path_dir = os.path.join(VAE_PATH, vae_path)
+        logger.info(f"Loading Flux VAE from {vae_path_dir}, transformer from {model_path}")
+        with open(os.path.join(vae_path_dir, "config.json")) as f:
+            vae_config = json.load(f)
+        vae = AutoencoderKLFlux2.from_config(vae_config)
+        vae.load_state_dict(load_file(os.path.join(vae_path_dir, "flux2-vae.safetensors")))
+        vae.to(torch.bfloat16)
+        transformer = Flux2Transformer2DModel.from_single_file(model_path, config=os.path.join(os.path.dirname(model_path), "config.json"), quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16), torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, local_files_only=True)
+
+        class GGUFPatchedTransformer(transformer.__class__):
+            @property
+            def dtype(self): return torch.bfloat16
+        transformer.__class__ = GGUFPatchedTransformer
+
+        scheduler_config = {"num_train_timesteps": 1000, "shift": 1.0}
+        self._base_scheduler_config = scheduler_config
+        self.pipe = Flux2KleinInpaintPipeline(transformer=transformer, vae=vae, text_encoder=None, tokenizer=None, scheduler=FlowMatchEulerDiscreteScheduler.from_config(scheduler_config), is_distilled=True)
+
+    def _load_cogvideo(self, model_path, cuda_dev):
+        logger.info(f"Loading CogVideoX from {model_path}")
+        # Assuming standard diffusers layout for CogVideoX in the folder
+        transformer = CogVideoXTransformer3DModel.from_pretrained(model_path, subfolder="transformer", torch_dtype=torch.bfloat16, local_files_only=True)
+        vae = AutoencoderKLCogVideoX.from_pretrained(model_path, subfolder="vae", torch_dtype=torch.bfloat16, local_files_only=True)
+        scheduler = CogVideoXDDIMScheduler.from_pretrained(model_path, subfolder="scheduler", local_files_only=True)
+        self.pipe = CogVideoXImageToVideoPipeline(transformer=transformer, vae=vae, scheduler=scheduler, text_encoder=None, tokenizer=None)
 
     def execution_device(self) -> torch.device:
         if self.pipe is None: return torch.device("cpu")
@@ -210,7 +268,7 @@ class APUEngine:
         np_arr = np.load(embeds_path)
         logger.info(f"Loaded array shape={np_arr.shape} dtype={np_arr.dtype}")
         if np_arr.ndim != 3 or np_arr.shape[0] != 1: raise ValueError(f"Expected (1, seq_len, dim), got {np_arr.shape}")
-        if np_arr.shape[-1] != EXPECTED_TEXT_DIM: raise ValueError(f"Embeds last dim {np_arr.shape[-1]} != expected {EXPECTED_TEXT_DIM}.")
+        if np_arr.shape[-1] != self.expected_text_dim:  raise ValueError(f"Embeds last dim {np_arr.shape[-1]} != expected {self.expected_text_dim} for {self.pipeline_type}.")
         if not np.isfinite(np_arr).all(): raise ValueError("Embeds contain NaN/Inf — re-encode this prompt.")
         if meta and meta.get("stats", {}).get("std", 1.0) < 1e-6: logger.warning(f"Near-zero std in embeddings: {meta.get('stats')}")
         return torch.from_numpy(np_arr).to(device=self.execution_device(), dtype=torch.bfloat16)
@@ -456,55 +514,6 @@ class APUEngine:
         except Exception as e:
             logger.warning(f"Failed to override scheduler shift={shift}: {e}")
 
-    def load(self, model_path: str, vae_path: str = "flux2"):
-        if self.is_loaded: return
-        cuda_dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model_path = os.path.join(TRANSFORMER_DIR, model_path)
-        vae_path_dir = os.path.join(VAE_PATH, vae_path)
-        logger.info(f"Loading VAE from {vae_path_dir}, transformer from {model_path}")
-
-        with open(os.path.join(vae_path_dir, "config.json")) as f:
-            vae_config = json.load(f)
-        vae = AutoencoderKLFlux2.from_config(vae_config)
-        vae_state_dict = load_file(os.path.join(vae_path_dir, "flux2-vae.safetensors"))
-        vae.load_state_dict(vae_state_dict)
-        vae.to(torch.bfloat16).to(cuda_dev)
-        logger.info(f"VAE on {cuda_dev} dtype={next(vae.parameters()).dtype}")
-
-        logger.info(f"Loading GGUF transformer from {model_path}")
-        transformer = Flux2Transformer2DModel.from_single_file(model_path, config=os.path.join(os.path.dirname(model_path), "config.json"), quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16), torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, local_files_only=True)
-
-        # PATCH 3: GGUF dtype inference bypass
-        class GGUFPatchedTransformer(transformer.__class__):
-            @property
-            def dtype(self): return torch.bfloat16
-        transformer.__class__ = GGUFPatchedTransformer
-
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        scheduler_config = {"num_train_timesteps": 1000, "shift": 1.0}
-        self._base_scheduler_config = scheduler_config
-        self.pipe = Flux2KleinInpaintPipeline(transformer=transformer, vae=vae, text_encoder=None, tokenizer=None, scheduler=FlowMatchEulerDiscreteScheduler.from_config(scheduler_config), is_distilled=True)
-
-        logger.info("Stripping accelerate hooks from transformer...")
-        remove_hook_from_submodules(self.pipe.transformer)
-
-        logger.info(f"Pinning transformer and VAE to {cuda_dev}...")
-        self.pipe.transformer.to(cuda_dev)
-        self.pipe.vae.to(cuda_dev)
-        logger.info(f"Pipeline execution device: {self.pipe._execution_device}")
-
-        self.pipe._original_state_dict = SilentlyEmptyDict()
-        self.pipe.transformer._original_state_dict = SilentlyEmptyDict()
-        self.pipe.vae._original_state_dict = SilentlyEmptyDict()
-
-        self.set_vae_tiling(True)
-        self.is_loaded = True
-        gc.collect()
-        torch.cuda.empty_cache()
-        logger.info("Engine load complete.")
-
     def interrupt(self):
         logger.info("Interrupt signal sent...")
         self.interrupt_flag.set()
@@ -726,66 +735,48 @@ async def process_unified_generation(request: GenerationRequest):
 
     generator = torch.Generator(device=engine.execution_device()).manual_seed(execution_seed)
     engine.set_vae_tiling(request.vae_tiling)
-    engine.maybe_override_scheduler_shift(request.shift)
-    engine.apply_lora_weights(request.loras)
 
-    pipe_kwargs = {
-        "prompt_embeds": prompt_embeds,
-        "negative_prompt_embeds": negative_prompt_embeds,
-        "num_inference_steps": request.steps,
-        "guidance_scale": request.guidance_scale,
-        "height": request.height,
-        "width": request.width,
-        "output_type": "pil",
-        "generator": generator,
-        "callback_on_step_end": _make_step_callback(request.embed_job_id or "gen", request.steps),
-        "callback_on_step_end_tensor_inputs": ["latents"],
-    }
+    # Only apply LoRAs and Scheduler overrides if we are in Flux mode
+    if engine.pipeline_type == "flux":
+        engine.maybe_override_scheduler_shift(request.shift)
+        engine.apply_lora_weights(request.loras)
 
-    if request.reference_image: pipe_kwargs["image_reference"] = decode_b64_image(request.reference_image).resize((request.width, request.height))
+    # Base kwargs shared by both models
+    pipe_kwargs = {"prompt_embeds": prompt_embeds,
+                   "num_inference_steps": request.steps,
+                   "guidance_scale": request.guidance_scale,
+                   "generator": generator}
 
-    # Mode routing
-    if request.image and request.mask_image:
-        pipe_kwargs["image"] = decode_b64_image(request.image).resize((request.width, request.height))
-        pipe_kwargs["mask_image"] = _load_mask_image(request.mask_image, request.width, request.height)
-        mask_arr = np.array(pipe_kwargs["mask_image"])
-        logger.info(f"[mask-debug] shape={mask_arr.shape} unique_vals={np.unique(mask_arr)[:10]} min={mask_arr.min()} max={mask_arr.max()}")
-        pipe_kwargs["strength"] = request.strength
-    elif request.image:
-        pipe_kwargs["image"] = decode_b64_image(request.image).resize((request.width, request.height))
-        pipe_kwargs["mask_image"] = Image.new("L", (request.width, request.height), 255)
-        pipe_kwargs["strength"] = request.strength
-    else:
-        pipe_kwargs["image"] = Image.new("RGB", (request.width, request.height), (0, 0, 0))
-        pipe_kwargs["mask_image"] = Image.new("L", (request.width, request.height), 255)
-        pipe_kwargs["strength"] = 1.0
+    # Pipeline-specific routing
+    if engine.pipeline_type == "flux":
+        pipe_kwargs.update({"negative_prompt_embeds": negative_prompt_embeds,
+                            "height": request.height,
+                            "width": request.width,
+                            "output_type": "pil",
+                            "callback_on_step_end": _make_step_callback(request.embed_job_id or "gen", request.steps),
+                            "callback_on_step_end_tensor_inputs": ["latents"]})
 
-    if os.getenv("DEBUG_INPAINT", "1") == "1" and request.mask_image:
-        _mask_arr = np.array(pipe_kwargs["mask_image"])
-        logger.info(f"[inpaint-debug] mask_mean={_mask_arr.mean():.2f} white_pct={(_mask_arr > 127).mean() * 100:.1f}% strength={pipe_kwargs.get('strength')}")
+        if request.image and request.mask_image:
+            pipe_kwargs["image"] = decode_b64_image(request.image).resize((request.width, request.height))
+            pipe_kwargs["mask_image"] = _load_mask_image(request.mask_image, request.width, request.height)
+            pipe_kwargs["strength"] = request.strength
+        elif request.image:
+            pipe_kwargs["image"] = decode_b64_image(request.image).resize((request.width, request.height))
+            pipe_kwargs["mask_image"] = Image.new("L", (request.width, request.height), 255)
+            pipe_kwargs["strength"] = request.strength
+        else:
+            pipe_kwargs["image"] = Image.new("RGB", (request.width, request.height), (0, 0, 0))
+            pipe_kwargs["mask_image"] = Image.new("L", (request.width, request.height), 255)
+            pipe_kwargs["strength"] = 1.0
 
-    offload_mode = request.offload_mode
-    cuda_dev = engine.execution_device()
-    vae_guard = None
-    block_offload = None
-
-    if offload_mode in ("vae_cpu", "sequential") and engine.pipe is not None:
-        vae_guard = _VaeDeviceGuard(engine.pipe.vae, cuda_dev)
-        vae_guard.__enter__()
-
-    if offload_mode == "sequential" and engine.pipe is not None:
-        block_offload = _SequentialBlockOffload(engine.pipe.transformer, cuda_dev)
-        block_offload.__enter__()
-
-    logger.info(f"[generate] offload_mode={offload_mode} — {_mem_info_str()}")
-
-    _progress.update({"status": "running", "step": 0, "total": request.steps, "pct": 0, "job_id": request.embed_job_id or "gen"})
+    elif engine.pipeline_type == "cogvideo":
+        if not request.image: raise HTTPException(status_code=400, detail="CogVideoX I2V requires an input image.")
+        pipe_kwargs.update({"image": decode_b64_image(request.image).resize((request.width, request.height))}) # CogVideoX doesn't use the standard callback format in diffusers yet, so we omit it for stability
 
     try:
-        print("--- TRACE: PIPELINE INFERENCE START ---", flush=True)
+        print(f"--- TRACE: PIPELINE INFERENCE START ({engine.pipeline_type}) ---", flush=True)
         with torch.no_grad():
             output = engine.pipe(**pipe_kwargs)
-        generated_image = output.images[0]
         save_dir = OUTPUT_DIR
         rel_prefix = ""
         if request.sequence_dir:
@@ -794,16 +785,26 @@ async def process_unified_generation(request: GenerationRequest):
             os.makedirs(save_dir, exist_ok=True)
             rel_prefix = f"_sequences/{safe_dir}/"
 
-        filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{execution_seed}.png"
-        filepath = os.path.join(save_dir, filename)
         meta_values = {"prompt": request.prompt, "width": request.width, "height": request.height, "guidance_scale": request.guidance_scale, "steps": request.steps, "seed": execution_seed, "loras": json.dumps(request.loras), "embed_job_id": request.embed_job_id}
-        png_info = PngInfo()
-        for key in request.meta:
-            if key in meta_values: png_info.add_text(key, str(meta_values[key]))
-        for k in ("embed_job_id",):
-            if k not in request.meta and meta_values.get(k): png_info.add_text(k, str(meta_values[k]))
+        # Branch Output Saving
+        if engine.pipeline_type == "flux":
+            generated_image = output.images[0]
+            filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{execution_seed}.png"
+            filepath = os.path.join(save_dir, filename)
+            png_info = PngInfo()
+            for key in request.meta:
+                if key in meta_values: png_info.add_text(key, str(meta_values[key]))
+            for k in ("embed_job_id",):
+                if k not in request.meta and meta_values.get(k): png_info.add_text(k, str(meta_values[k]))
 
-        generated_image.save(filepath, format="PNG", pnginfo=png_info)
+            generated_image.save(filepath, format="PNG", pnginfo=png_info)
+        elif engine.pipeline_type == "cogvideo":
+            frames = output.frames[0] # Returns a list of lists. [0] is the batch.
+            filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{execution_seed}.gif"
+            filepath = os.path.join(save_dir, filename)
+            # Save raw frames directly to GIF natively
+            frames[0].save(filepath, format="GIF", save_all=True, append_images=frames[1:], duration=125, loop=0)
+
         elapsed = time.time() - t0
         logger.info(f"[generate] done in {elapsed:.1f}s → {filename}")
         _progress.update({"status": "idle", "pct": 100})

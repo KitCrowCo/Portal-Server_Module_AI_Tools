@@ -6,7 +6,7 @@ import re, sys, json, uuid, importlib, importlib.util, pkg_resources, subprocess
 from pathlib import Path
 from datetime import datetime
 from fastapi import APIRouter, Request, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 MODULE_META = {"label": "AI Tools", "icon": "&#x25B3;", "description": "AI Multi-Tool Dashboard", "persistence": "user"}
 
@@ -32,6 +32,7 @@ TOOL_GROUPS = {"model_tools": {"label": "Model Tools", "icon": "&#x25B3;"},
 # --- Access Policy ---
 
 POLICY_FILE = DATA_DIR / "access_policy.json"
+NODES_FILE = DATA_DIR / "nodes.json"
 
 def _get_policy() -> dict: return json.loads(POLICY_FILE.read_text()) if POLICY_FILE.exists() else {"auto_redirect": None, "user_groups": {}, "role_access": {}}
 def _save_policy(data: dict): POLICY_FILE.write_text(json.dumps(data, indent=2))
@@ -283,6 +284,17 @@ async def launcher():
                             <div><div class="ait-lc-label">{tv["label"]}</div><div class="ait-lc-desc">{tv["description"]}</div></div>
                         </div>"""for tk, tv in reg.items() if tk != "settings")
     return HTMLResponse(f'<div style="padding:2rem 2.5rem;height:100%;overflow:auto;box-sizing:border-box;"><h1 style="opacity:.08;font-size:3rem;margin:0 0 1.5rem;">AI&#x25B3;TOOLS</h1><div class="ait-launch-grid">{cards}</div></div>')
+
+@router.post("/node_hello")
+async def node_hello(request: Request):
+    """A node reports its probed hardware and model index; the reply is the operating constraints saved for that node_id (empty = no opinion)."""
+    body = await request.json()
+    nid = re.sub(r"[^\w.-]", "_", str(body.get("node_id", "")))[:64]
+    nodes = json.loads(NODES_FILE.read_text()) if NODES_FILE.exists() else {}
+    entry = nodes.setdefault(nid, {"constraints": {}})
+    entry.update(info=body.get("info", {}), models=body.get("models", []), seen=datetime.utcnow().isoformat())
+    NODES_FILE.write_text(json.dumps(nodes, indent=2))
+    return JSONResponse({"constraints": entry["constraints"]})
 
 @router.get("/right_panel/{tool_key}", response_class=HTMLResponse)
 async def right_panel_route(tool_key: str): return HTMLResponse(_right_panel(tool_key))
