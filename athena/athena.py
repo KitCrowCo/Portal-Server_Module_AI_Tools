@@ -714,7 +714,8 @@ async def _h_msg_retry_send(request, payload, imr):
     cap = _resolve_capability(conv)
     target = _do_stream_pipeline if cap.get("flow_pipeline_id") else _do_stream
     _ACTIVE_TASKS[sid] = asyncio.create_task(target(user.username,{"content":new_content},sid,skip_user_append=True))
-    return imr.oob(f'<div id="cm-msgs-{sid}" class="cm-msgs" data-pinned="true">{remaining}</div>', f"cm-msgs-{sid}", swap="outerHTML")
+    imr.raw(CM.working_html(sid, {"type":"athena_stop","cid":sid,"lvl":2}))
+    return imr.oob(remaining, f"cm-msgs-{sid}", swap="innerHTML")
 
 # --- Intent handlers: attachments ---
 

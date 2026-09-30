@@ -405,7 +405,7 @@ async def _h_files_toggle(request, payload, imr):
 
 async def _h_stop(request, payload, imr):
     sid = payload.get("cid","")
-    if sid: _STOP_FLAGS[sid] = True
+    if sid: _STOP[sid] = True
     return imr
 
 @router.post("/doc/toggle_task/{pid}")
