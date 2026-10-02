@@ -184,7 +184,7 @@ def _uploads_dir(cid): d=DATA_DIR/"uploads"/cid; d.mkdir(parents=True,exist_ok=T
 
 # --- streaming ---
 
-async def _stream_llm(conn, msgs, model, ctx, think="", images=None, temperature=0.7, num_predict=8192, top_k=40, top_p=0.8, cache_session="", kv_type="Q8_0"):
+async def _stream_llm(conn, msgs, model, ctx, think="", images=None, temperature=0.7, num_predict=8192, top_k=40, top_p=0.8, cache_session="", kv_type=None):
     if images and msgs: msgs[-1]["images"] = images
     async for text, thinking in AIM.connections.stream_llm(conn, msgs, model, think, temperature=temperature, num_ctx=ctx, num_predict=num_predict, top_k=top_k, top_p=top_p, cache_session=cache_session or None, kv_cache_type=kv_type): yield text, thinking, False, None
     yield "", "", True, None
@@ -248,6 +248,7 @@ async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=Fa
     full = ""
     tb = ""
     try:
+        await _ws(CM.working_html(sid, {"type":"athena_stop","cid":sid,"lvl":2}))
         conv = _load_conv(sid)
         if not conv: await _err("Conversation not found."); return
         cap = _resolve_capability(conv)
@@ -290,7 +291,7 @@ async def _do_stream(username: str, payload: dict, sid: str, skip_user_append=Fa
             await _ws(f'<div id="cm-msgs-{sid}" hx-swap-oob="beforeend">{CM.render_message(user_msg, is_me=True, can_delete=True, can_edit=True)}</div>')
         _ACTIVE_STREAMS.add(sid)
         try:
-            async for text, thinking, done, err in _stream_llm(conn, built_msgs, model, num_ctx, cap.get("think", False), images=images or None, temperature=float(cfg.get("temperature", 0.7)), num_predict = int(cap.get("num_predict") or cfg.get("num_predict", 8192))):
+            async for text, thinking, done, err in _stream_llm(conn, built_msgs, model, num_ctx, cap.get("think", False), images=images or None, temperature=float(cfg.get("temperature", 0.7)), num_predict = int(cap.get("num_predict") or cfg.get("num_predict", 8192)), kv_type=kv_type):
                 if _STOP_FLAGS.pop(sid, False): break
                 if err: _STREAM_BUFFERS[sid]["error"] = err; await _err(f"Model error: {err}"); return
                 if text: full += text
@@ -927,18 +928,23 @@ def _capability_card_html(cap):
                            </select>
                        </label>
                        <label style="font-size:.7rem;color:var(--text_muted)">System Prompt (not shown to users)<textarea name="system_prompt" class="cm-input" rows="3">{_esc(cap.get('system_prompt',''))}</textarea></label>
-                       <label style="font-size:.7rem;color:var(--text_muted)">Allowed Roles (comma-sep, blank = everyone)<input type="text" name="allowed_roles" value="{','.join(cap.get('allowed_roles',[]))}" class="module-select"></label>
-                       <label style="font-size:.7rem;color:var(--text_muted)">Allowed Usernames (comma-sep, blank = everyone)<input type="text" name="allowed_users" value="{','.join(cap.get('allowed_users',[]))}" class="module-select"></label>
-                       <div style="border-top:var(--border-thick) solid var(--border);padding-top:.5rem;display:flex;gap:.4rem;flex-wrap:wrap;align-items:flex-end">
-                           <label style="display:flex;align-items:center;gap:.3rem;font-size:.8rem"><input type="checkbox" name="knowledge_enabled" value="1" {"checked" if cap.get("knowledge_enabled") else ""}> Knowledge Base</label>
-                           <label style="flex:1;min-width:10rem;font-size:.7rem;color:var(--text_muted)">Knowledge Connection<select name="knowledge_conn_id" class="module-select"><option value="">-- none --</option>{kg_opts}</select></label>
+                       <details style="border-top:var(--border-thick) solid var(--border);padding-top:.3rem"><summary style="cursor:pointer;font-size:.7rem;color:var(--text_muted)">Advanced (access, knowledge, pipeline)</summary>
+                           <label style="font-size:.7rem;color:var(--text_muted)">Allowed Roles (comma-sep, blank = everyone)<input type="text" name="allowed_roles" value="{','.join(cap.get('allowed_roles',[]))}" class="module-select"></label>
+                           <label style="font-size:.7rem;color:var(--text_muted)">Allowed Usernames (comma-sep, blank = everyone)<input type="text" name="allowed_users" value="{','.join(cap.get('allowed_users',[]))}" class="module-select"></label>
+                           <div style="border-top:var(--border-thick) solid var(--border);padding-top:.5rem;display:flex;gap:.4rem;flex-wrap:wrap;align-items:flex-end">
+                               <label style="display:flex;align-items:center;gap:.3rem;font-size:.8rem"><input type="checkbox" name="knowledge_enabled" value="1" {"checked" if cap.get("knowledge_enabled") else ""}> Knowledge Base</label>
+                               <label style="flex:1;min-width:10rem;font-size:.7rem;color:var(--text_muted)">Knowledge Connection<select name="knowledge_conn_id" class="module-select"><option value="">-- none --</option>{kg_opts}</select></label>
+                           </div>
+                           <div style="border-top:var(--border-thick) solid var(--border);padding-top:.5rem;display:flex;gap:.4rem;flex-wrap:wrap;align-items:flex-end">
+                               <label style="flex:1;min-width:10rem;font-size:.7rem;color:var(--text_muted)">Run via Pipeline instead of plain chat<select name="flow_pipeline_id" class="module-select"><option value="">-- none --</option>{pl_opts}</select></label>
+                               <button type="button" class="ui-btn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"athena_cap_to_pipeline","cap_id":cid_field,"lvl":2})}' title="Generate a starter knowledge+generate pipeline from this capability's current fields, and point this capability at it">&#x2699; Build pipeline from this capability</button>
+                               <label style="flex:1;min-width:8rem;font-size:.7rem;color:var(--text_muted)">Result Key<input type="text" name="flow_result_key" value="{_esc(cap.get('flow_result_key','text'))}" class="module-select" placeholder="text"></label>
+                           </div>
+                       </details>
+                       <div style="display:flex;align-items:center;gap:.5rem">
+                           <button type="submit" class="button" style="align-self:flex-start">Save Capability</button>
+                           <span id="cap-saved-{cid_field}" style="font-size:.7rem"></span>
                        </div>
-                       <div style="border-top:var(--border-thick) solid var(--border);padding-top:.5rem;display:flex;gap:.4rem;flex-wrap:wrap;align-items:flex-end">
-                           <label style="flex:1;min-width:10rem;font-size:.7rem;color:var(--text_muted)">Run via Pipeline instead of plain chat<select name="flow_pipeline_id" class="module-select"><option value="">-- none --</option>{pl_opts}</select></label>
-                           <button type="button" class="cm-qbtn" hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type":"athena_cap_to_pipeline","cap_id":cid_field,"lvl":2})}' title="Generate a starter knowledge+generate pipeline from this capability's current fields, and point this capability at it">&#x2699; Build pipeline from this capability</button>
-                           <label style="flex:1;min-width:8rem;font-size:.7rem;color:var(--text_muted)">Result Key<input type="text" name="flow_result_key" value="{_esc(cap.get('flow_result_key','text'))}" class="module-select" placeholder="text"></label>
-                       </div>
-                       <button type="submit" class="button" style="align-self:flex-start">Save Capability</button>
                    </form>
                </div>"""
 
@@ -995,6 +1001,7 @@ async def _h_cap_save(request, payload, imr):
     if existing: caps[caps.index(existing)] = updated
     else: caps.append(updated)
     _save_capabilities(caps)
+    imr.oob("""<span style="color:var(--accent)">&#x2713; Saved</span>""", f"cap-saved-{cap_id}", swap="innerHTML")
     return imr.oob(_capability_card_html(updated), f"cap-card-{cap_id}", swap="outerHTML")
 
 async def _h_cap_to_pipeline(request, payload, imr):
