@@ -21,19 +21,21 @@ DATA_DIR = Path("./data/ai_tools/ai_calc")
 
 QUANTS, IMAGE_MODELS, TASK_PRESETS, KNOWN_BENCHMARKS, DEFAULT_WEIGHTS, SCORE_DIM_LABELS, SCORE_DIM_COLORS, _KNOWN_SHORT = {}, {}, {}, {}, {}, {}, {}, {}
 ARCH_TABLE, REFERENCE_LINES, PROPRIETARY_REFS, SCORE_DIMS = [], [], [], []
+KV_LAYER_FRACTION, MTP_PATTERNS = {}, []   # hybrid architectures: share of layers that keep a KV cache (the rest hold a fixed-size recurrent state); names marking MTP (nextn) heads
 STANDARD_SIZES = [1, 3, 7, 8, 9, 11, 12, 13, 14, 20, 27, 30, 32, 34, 70, 72]
 DEFAULT_KV = "q8_0"
 KV_TYPES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 1.0625, "q5_1": 0.75, "q5_0": 0.6875, "q4_1": 0.625, "q4_0": 0.5625, "iq4_nl": 0.5625}
 
 def load_config():
-    global ARCH_TABLE, PROPRIETARY_REFS, REFERENCE_LINES, SCORE_DIMS
+    global ARCH_TABLE, PROPRIETARY_REFS, REFERENCE_LINES, SCORE_DIMS, MTP_PATTERNS
     cfg = json.loads((Path(__file__).parent / "ai_calc_config.json").read_text())
     QUANTS.update(cfg.get("QUANTS", {})); IMAGE_MODELS.update(cfg.get("IMAGE_MODELS", {})); TASK_PRESETS.update(cfg.get("TASK_PRESETS", {}))
     KNOWN_BENCHMARKS.update(cfg.get("KNOWN_BENCHMARKS", {})); DEFAULT_WEIGHTS.update(cfg.get("DEFAULT_WEIGHTS", {}))
     SCORE_DIM_LABELS.update(cfg.get("SCORE_DIM_LABELS", {})); SCORE_DIM_COLORS.update(cfg.get("SCORE_DIM_COLORS", {}))
     ARCH_TABLE = cfg.get("ARCH_TABLE", []); REFERENCE_LINES = cfg.get("REFERENCE_LINES", []); PROPRIETARY_REFS = cfg.get("PROPRIETARY_REFS", []); SCORE_DIMS = cfg.get("SCORE_DIMS", [])
     _KNOWN_SHORT.update({k.split("/")[-1].lower(): k for k in KNOWN_BENCHMARKS})
-
+    KV_LAYER_FRACTION.update({k: v for k, v in cfg.get("KV_LAYER_FRACTION", {}).items() if not k.startswith("_")}); MTP_PATTERNS = cfg.get("MTP_PATTERNS", ["mtp", "nextn"])
+    
 # --- Hardware (CNode-backed) ---
 
 _HW_FIELDS = ("vram_gb", "shared_gb", "sys_ram_gb", "os_overhead_gb", "mem_bw_gbps", "sys_ram_bw_gbps", "gpu_tflops_fp16")
@@ -91,7 +93,7 @@ def kv_bytes_per_token(params_b, kv_type=None):
     layers, hidden, attn, kv_heads = arch_for(params_b)
     return 2 * layers * kv_heads * (hidden // attn) * KV_TYPES[kv_type or DEFAULT_KV]
 
-def kv_cache_gb_for_ctx(params_b, ctx, kv_type=None): return kv_bytes_per_token(params_b, kv_type) * ctx / (1024**3)
+def kv_cache_gb_for_ctx(params_b, ctx, kv_type=None, kv_frac=1.0): return kv_bytes_per_token(params_b, kv_type) * kv_frac * ctx / (1024**3)   # kv_frac < 1 for hybrid models: only that share of layers keeps a KV cache
 def max_ctx_tokens(params_b, avail_gb, kv_type=None): return int(avail_gb * 1024**3 / max(kv_bytes_per_token(params_b, kv_type), 1))
 
 def prefill_time_s(params_b, n_tokens, hw):
@@ -104,18 +106,26 @@ def decode_tps_at(params_b, quant, depth, hw, kv_type=None):
     p = estimate_tps(params_b, quant, hw)
     return round(p["eff_bw"] / (p["model_gb"] * 1.10 + kv_cache_gb_for_ctx(params_b, depth, kv_type)), 3) if p["fits_total"] and p["eff_bw"] > 0 else 0.0
 
-def full_perf(params_b, quant, ctx, hw, kv_type=None):
+def model_traits(m: dict) -> dict:
+    """kv_frac (share of layers with a KV cache) and mtp (has MTP / nextn heads) for a HF model record, from its GGUF architecture, id and tags. Unknown = a plain transformer."""
+    arch = str((m.get("gguf") or {}).get("architecture") or (m.get("config") or {}).get("model_type") or "").lower()
+    blob = f"""{m.get("id", "")} {" ".join(m.get("tags") or [])} {arch}""".lower()
+    return {"kv_frac": next((f for k, f in KV_LAYER_FRACTION.items() if k in arch or k in blob), 1.0), "mtp": any(p in blob for p in MTP_PATTERNS)}
+
+def full_perf(params_b, quant, ctx, hw, kv_type=None, kv_frac=1.0, mtp_gain=1.0):
+    """mtp_gain != 1: the model runs with MTP self-speculation - decode speed times mtp_gain (measured on the node: speculative tokens accepted per pass), memory plus one layer of head weights and the draft context's KV for one layer."""
     p = estimate_tps(params_b, quant, hw)
-    kv, vt, tm = kv_cache_gb_for_ctx(params_b, ctx, kv_type), total_vram(hw), total_mem(hw)
+    layers = arch_for(params_b)[0]
+    mtp_gb = (p["model_gb"] / layers + kv_cache_gb_for_ctx(params_b, ctx, kv_type) / layers) if mtp_gain != 1.0 else 0.0
+    kv, vt, tm = kv_cache_gb_for_ctx(params_b, ctx, kv_type, kv_frac) + mtp_gb, total_vram(hw), total_mem(hw)
     kv_in_vram = min(kv, max(vt - p["model_gb"], 0.0)); kv_in_ram = max(kv - kv_in_vram, 0.0)
     total_used = p["model_gb"] + kv
     fits = p["fits_total"] and total_used <= tm
     tps_at = lambda kv_gb: round(p["eff_bw"] / (p["model_gb"] * 1.10 + kv_gb), 2) if fits and p["eff_bw"] > 0 else 0.0
-    tps, tps_mid, mode = tps_at(kv), tps_at(kv / 2), p["mode"]
+    tps, tps_mid, mode = round(tps_at(kv) * mtp_gain, 2), round(tps_at(kv / 2) * mtp_gain, 2), p["mode"] + (f" +MTP x{mtp_gain:g}" if mtp_gain != 1.0 else "") + (f" hybrid KV x{kv_frac:g}" if kv_frac != 1.0 else "")
     if fits and kv_in_ram > 0 and tps > 0:
         pen = 1.0 - (kv_in_ram / total_used) * 0.20
         tps, tps_mid, mode = round(tps * pen, 2), round(tps_mid * pen, 2), mode + f" +KV({kv_in_ram:.1f}->RAM)"
-    qi, pf_s = QUANTS.get(quant, QUANTS["Q4_K_M"]), prefill_time_s(params_b, ctx, hw)
     return {**p, "tps": tps, "tps_start": p["tps"] if fits else 0.0, "tps_mid": tps_mid, "mode": mode, "kv_gb": round(kv, 3), "kv_in_vram": round(kv_in_vram, 3), "kv_in_ram": round(kv_in_ram, 3),
             "total_mem_gb": round(total_used, 2), "mem_ok": fits, "time_10k_s": round(10000 / tps, 0) if tps > 0 and fits else None, "prefill_s_full": round(pf_s, 1), "prefill_tps_avg": round(ctx / pf_s, 1) if pf_s > 0 else 0.0,
             "quality_idx": qi["quality"], "creative_ok": qi["creative_ok"], "quant": quant, "params_b": params_b, "kv_type": kv_type or DEFAULT_KV}
@@ -148,33 +158,35 @@ def _compute_intelligence(scores):
         if bench in scores: total += float(scores[bench]) * w; weight += w
     return round(total / max(weight, 0.001), 2)
 
-def _sub_scores(perf, model, hw, target_tps):
+SPEED_CURVES = {"cap": "credit rises to 2x target, then flat (faster gains nothing more)", "open": "keeps rising past target: tps/(tps+target), 0.5 at target", "peak": "best at target, overshoot scores down (prefers the biggest model that just meets it)"}
+
+def _speed_score(tps: float, target: float, curve: str = "cap") -> float:
+    if tps <= 0: return 0.0
+    if curve == "open": return tps / (tps + target)
+    if curve == "peak": return min(tps / target, target / tps)
+    return min(tps / max(target * 2.0, 1.0), 1.0)
+
+def _sub_scores(perf, model, hw, target_tps, speed_curve="cap"):
     raw_avg = (model.get("leaderboard_avg") or 0.0) / 100.0
     lb_avg = min(raw_avg * model.get("bench_confidence", 0.0), 1.0) if model.get("bench_confidence", 0) > 0 else 0.0
     tps, tm, used, vt = perf.get("tps", 0.0), total_mem(hw), perf.get("total_mem_gb", 0), total_vram(hw)
-    needed = perf.get("model_gb", 0.0) + perf.get("kv_gb", 0.0)
-    pop_raw = math.log1p(model.get("likes", 0) or 0) * 0.4 + math.log1p(model.get("downloads", 0) or 0) * 0.6
+    needed = perf.get("total_mem_gb", 0)
+    pop_raw = max(model.get("likes", 0) / 50.0, (model.get("downloads", 0) or 0) / 5000.0)
     intel_raw = _compute_intelligence(model.get("lb_detail", {}))  # 0-100 scale, or 0 if no fine-grained benchmarks matched
     intel = intel_raw / 100.0 if intel_raw > 0 else raw_avg  # FIX: was stored un-normalized (0-100) against every other 0-1 dim, and fell to 0 with no fallback when lb_detail was empty even though leaderboard_avg had already been resolved
-    return {"lb_avg": round(lb_avg, 4), "quant_qual": round(perf.get("quality_idx", 0.0), 4),
-            "speed": round(min(tps / max(target_tps * 2.0, 1.0), 1.0) if tps > 0 else 0.0, 4),
-            "mem_head": round(max(0.0, (tm - used) / max(tm, 1.0)), 4),
-            "ctx_fit": round(min(needed, vt) / max(needed, 0.001) if needed > 0 else 1.0, 4),
-            "popularity": round(min(pop_raw / 16.0, 1.0), 4),
-            "intel": round(intel, 4)}
+    return {"lb_avg": round(lb_avg, 4), "quant_qual": round(perf.get("quality_idx", 0.0), 4), "speed": round(_speed_score(tps, target_tps, speed_curve), 4),
 
-def _total_score(sub, weights):
-    tw = sum(weights.get(d, DEFAULT_WEIGHTS.get(d, 1)) for d in SCORE_DIMS)
-    return round(sum(sub.get(d, 0) * weights.get(d, DEFAULT_WEIGHTS.get(d, 1)) for d in SCORE_DIMS) / max(tw, 0.001), 4)
+def _total_score(sub, weights): return round(sum(sub.get(d, 0) * weights.get(d, DEFAULT_WEIGHTS.get(d, 1)) for d in SCORE_DIMS) / max(sum(weights.get(d, DEFAULT_WEIGHTS.get(d, 1)) for d in SCORE_DIMS), 0.001), 4)
 
-def _rank_filtered(filtered: list, hw: dict, ctx: int, target_tps: float, weights: dict, top_n: int = 40, kv_type: str = None) -> list:
+def _rank_filtered(filtered: list, hw: dict, ctx: int, target_tps: float, weights: dict, top_n: int = 40, kv_type: str = None, speed_curve: str = "cap", mtp_gain: float = 1.0) -> list:
     rows = []
     for m in filtered:
+        t = model_traits(m)
         for q in m.get("avail_quants",[]):
             if q not in QUANTS: continue
-            perf = full_perf(m["params_b"], q, ctx, hw, kv_type)
+            perf = full_perf(m["params_b"], q, ctx, hw, kv_type, t["kv_frac"], mtp_gain if t["mtp"] else 1.0)
             if not perf["mem_ok"]: continue
-            sub = _sub_scores(perf, m, hw, target_tps)
+            sub = _sub_scores(perf, m, hw, target_tps, speed_curve)
             rows.append({**{k: m[k] for k in ("id","params_b","likes","downloads","tags","avail_quants","leaderboard_avg","lb_detail","bench_confidence","bench_source","bench_inferred")},
                          "author": m["id"].split("/")[-1] if "/" in m["id"] else "", "name": m["id"].split("/")[-1], "quant": q, "perf": perf, "sub_scores": sub,
                          "total_score": _total_score(sub, weights), "below_floor": perf["tps"] < target_tps})
@@ -267,8 +279,7 @@ async def _resolve_bench(client, model, deep=False):
         if avg > 0: return {**cs, "average": avg, "confidence": 0.9, "source": "card-metadata", "inferred": False}
     for base_id in _base_chain(model):
         bs = _scores_from_static(base_id)
-        if bs and bs.get("average", 0) > 0:
-            return {**{k: v for k, v in bs.items() if k not in ("confidence","source","inferred")}, "confidence": bs.get("confidence",1.0)*0.8, "source": f"base-inherit:{base_id.split('/')[-1]}", "inferred": True, "average": bs.get("average",0)}
+        if bs and bs.get("average", 0) > 0: return {**{k: v for k, v in bs.items() if k not in ("confidence","source","inferred")}, "confidence": bs.get("confidence",1.0)*0.8, "source": f"base-inherit:{base_id.split('/')[-1]}", "inferred": True, "average": bs.get("average",0)}
     if not deep: return {}
     readme = await _fetch_readme(client, mid)
     if readme:
@@ -398,8 +409,9 @@ async def _pipeline(params):
         avail = {q for q in gguf_quants_from_siblings(m.get("siblings") or []) if q in QUANTS and QUANTS[q]["quality"] >= min_quality}  # quality floor applied before a model is even kept, so a high-scoring Q2 can't win a search where it's below the acceptable floor (e.g. creative writing)
         if not avail: counts["quant"] += 1; continue
         any_fits = any_fast = False
+        t = model_traits(m)
         for q in sorted(avail, key=lambda x: QUANTS[x]["bpp"]):
-            p = full_perf(pb, q, params["ctx_tokens"], hw, params["kv_type"])
+            p = full_perf(pb, q, params["ctx_tokens"], hw, params["kv_type"], t["kv_frac"], params.get("mtp_gain", 1.0) if t["mtp"] else 1.0)
             if p["mem_ok"]:
                 any_fits = True
                 if p["tps"] >= params["min_tps"]: any_fast = True; break
@@ -412,13 +424,12 @@ async def _pipeline(params):
     lb_hits = 0
     for m in filtered:
         bs = bench_res.get(m.get("id", ""), {}); avg = bs.get("average", 0.0) or 0.0
-        m.update(leaderboard_avg=round(float(avg), 2) if avg else 0.0, lb_detail={k: v for k, v in bs.items() if k not in ("confidence","source","inferred","average")},
-                  bench_confidence=float(bs.get("confidence", 0.0)), bench_source=str(bs.get("source", "none")), bench_inferred=bool(bs.get("inferred", False)))
+        m.update(leaderboard_avg=round(float(avg), 2) if avg else 0.0, lb_detail={k: v for k, v in bs.items() if k not in ("confidence","source","inferred","average")}, bench_confidence=float(bs.get("confidence", 0.0)), bench_source=str(bs.get("source", "none")), bench_inferred=bool(bs.get("inferred", False)))
         if avg > 0: lb_hits += 1
     _job_up(step=f"Bench resolved: {lb_hits}/{len(filtered)} have scores")
     with _job_lock: _job["filtered"] = filtered
     _job_up(status="Scoring...", step=f"target_tps={params['target_tps']}")
-    rows = _rank_filtered(filtered, hw, params["ctx_tokens"], params["target_tps"], params["weights"], params["top_n"], params["kv_type"])
+    rows = _rank_filtered(filtered, hw, params["ctx_tokens"], params["target_tps"], params["weights"], params["top_n"], params["kv_type"], params.get("speed_curve", "cap"), params.get("mtp_gain", 1.0))
     _write_csv(rows, key)
     top = rows[0] if rows else None
     _job_up(step=f"Done. Top: {top['id']} [{top['quant']}] score={top['total_score']}" if top else "Done - no results")
@@ -520,6 +531,8 @@ def _panel_calc():
                 <label>Quant<select class="fin" name="quant">{_quant_opts()}</select></label>
                 <label>Context (tokens)<input class="fin" name="ctx_tokens" type="number" value="20992"></label>
                 <label>KV Cache Type{_kv_select_html()}</label>
+                <label title="Hybrid models (e.g. Qwen3-Next style) keep a KV cache in only part of their layers: 0.25 = one layer in four. 1 = every layer">KV layer share<input class="fin" name="kv_frac" type="number" step="0.01" value="1"></label>
+                <label title="Decode speed multiplier with MTP self-speculation, measured on your node. 1 = MTP off">MTP gain (x)<input class="fin" name="mtp_gain" type="number" step="0.01" value="1.0"></label>
                 <button class="rbtn" type="submit">Calculate</button>
             </div>
         </form>
@@ -539,12 +552,12 @@ def _panel_calc():
         </details>
     </div>"""
 
-def _calc_result_html(pb, quant, ctx, hw, kv_type, cnode_id=""):
-    p = full_perf(pb, quant, ctx, hw, kv_type)
+def _calc_result_html(pb, quant, ctx, hw, kv_type, cnode_id="", kv_frac=1.0, mtp_gain=1.0):
+    p = full_perf(pb, quant, ctx, hw, kv_type, kv_frac, mtp_gain)
     tm = total_mem(hw)
     layers, hidden, attn, kv_heads = arch_for(pb)
     avail = max(tm - p["model_gb"], 0)
-    max_ctx = max_ctx_tokens(pb, avail, kv_type)
+    max_ctx = int(max_ctx_tokens(pb, avail, kv_type) / kv_frac)
     t10 = f"{p['time_10k_s']:.0f}s ({p['time_10k_s']/60:.1f}m)" if p.get("time_10k_s") else "N/A"
     okc = "#00ffa2" if p["mem_ok"] else "#ff5f5f"
     stats = f"""<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:.5rem;margin-bottom:.6rem">
@@ -575,8 +588,7 @@ def _calc_result_html(pb, quant, ctx, hw, kv_type, cnode_id=""):
         </form>
         <div id="calc-log-summary" style="margin-top:.4rem">{_calib_summary_html(cnode_id or "unspecified")}</div>
     </details>"""
-    rows = "".join(f"""<tr class="{'oom' if not pq['fits_total'] else ''}"><td class="qn">{q}</td><td>{pq["model_gb"]} GB</td><td style="color:{'#555' if not pq['fits_total'] else _tcolor(pq['tps'])};font-weight:700">{pq["tps"]}</td><td>{pq.get("kv_gb",0):.3f}</td><td>{pq.get("total_mem_gb",0):.1f}</td><td style="color:#3d9aff">{round(QUANTS[q]["quality"]*100)}%</td></tr>"""
-                     for q, pq in ((q, full_perf(pb, q, ctx, hw, kv_type)) for q in QUANTS))
+    rows = "".join(f"""<tr class="{'oom' if not pq['fits_total'] else ''}"><td class="qn">{q}</td><td>{pq["model_gb"]} GB</td><td style="color:{'#555' if not pq['fits_total'] else _tcolor(pq['tps'])};font-weight:700">{pq["tps"]}</td><td>{pq.get("kv_gb",0):.3f}</td><td>{pq.get("total_mem_gb",0):.1f}</td><td style="color:#3d9aff">{round(QUANTS[q]["quality"]*100)}%</td></tr>""" for q, pq in ((q, full_perf(pb, q, ctx, hw, kv_type)) for q in QUANTS))
     return stats + f"""<div style="font-size:.68rem;color:var(--text_muted);margin:.3rem 0">All quantizations at this size/context (t/s = full window):</div>
     <div class="tbl-scroll"><table class="cmp-table"><thead><tr><th>Quant</th><th>Size</th><th>T/s</th><th>KV GB</th><th>Total GB</th><th>Quality</th></tr></thead><tbody>{rows}</tbody></table></div>"""
 
@@ -584,8 +596,10 @@ def _calc_result_html(pb, quant, ctx, hw, kv_type, cnode_id=""):
 
 def _weight_slider(dim, weights):
     val = weights.get(dim, DEFAULT_WEIGHTS.get(dim, 1))
-    return (f'<label class="wsl" style="--wc:{SCORE_DIM_COLORS.get(dim,"#888")}"><span class="wsln">{SCORE_DIM_LABELS.get(dim,dim)}</span>'
-            f'<input class="wslider" type="range" name="w_{dim}" min="0" max="10" step="1" value="{val}" oninput="this.parentElement.querySelector(\'.wsv\').textContent=this.value"><span class="wsv">{val}</span></label>')
+    return f"""<label class="wsl" style="--wc:{SCORE_DIM_COLORS.get(dim,"#888")}">
+    			   <span class="wsln">{SCORE_DIM_LABELS.get(dim,dim)}</span>
+                   <input class="wslider" type="range" name="w_{dim}" min="0" max="10" step="0.1" value="{val}" oninput="this.parentElement.querySelector('.wsv').textContent=this.value"><span class="wsv">{val}</span>
+               </label>"""
 
 def _score_bar(dim, raw, w, total_w):
     color, contrib = SCORE_DIM_COLORS.get(dim, "#888"), raw * w / max(total_w, 0.001)
@@ -610,49 +624,51 @@ def _lb_pills(lb, source="", confidence=0, inferred=False):
 def _panel_search():
     task_opts = "".join(f'<option value="{k}">{v["label"]}</option>' for k, v in TASK_PRESETS.items())
     wsliders = "".join(_weight_slider(d, DEFAULT_WEIGHTS) for d in SCORE_DIMS)
+    curve_opts = "".join(f"""<option value="{k}">{k} - {v}</option>""" for k, v in SPEED_CURVES.items())
     return f"""<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box">
-        <div class="fsect-hd">Model Finder</div>
-        <form class="pform" hx-post="/im/in" hx-target="#srch-out" hx-swap="innerHTML">
-            <input type="hidden" name="type" value="ai_calc_search"><input type="hidden" name="branch" value="ai_calc"><input type="hidden" name="lvl" value="2">
-            <div class="frow wrap">
-                <label>Hardware{_hw_select_html()}</label>
-                <label>Task<select class="fin" name="task_preset" onchange="applyPreset(this.value)">{task_opts}</select></label>
-                <label>Min params (B)<input class="fin" name="min_params" type="number" step="any" value="1"></label>
-                <label>Max params (B)<input class="fin" name="max_params" type="number" step="any" value="35"></label>
-                <label>Context tokens<input class="fin" name="ctx_tokens" type="number" value="20992"></label>
-            </div>
-            <div class="frow wrap">
-                <label>Min T/s (hard floor)<input class="fin" name="min_tps" type="number" step="any" value="1.0"></label>
-                <label>Target T/s (score ref)<input class="fin" name="target_tps" type="number" step="any" value="5.0"></label>
-                <label>KV Cache Type{_kv_select_html()}</label>
-                <label>Minimum Model Quant<select class="fin" name="min_quant">{"".join(f'<option value="{q}" {"selected" if q=="Q3_K_M" else ""}>{q}</option>' for q in QUANTS)}</select><span class="dim tiny">excludes anything below this quality floor regardless of score</span></label>
-            </div>
-            <div class="frow wrap">
-                <label style="flex:2">Must contain ALL<input class="fin" name="must_contain" type="text" placeholder="instruct, chat"></label>
-                <label style="flex:2">Must contain ANY<input class="fin" name="any_contain" type="text" placeholder="creative, roleplay"></label>
-                <label style="flex:2">Exclude terms<input class="fin" name="exclude" type="text" placeholder="vision, embed, base"></label>
-            </div>
-            <div class="frow wrap">
-                <label style="flex:2">Extra HF query<input class="fin" name="extra_query" type="text"></label>
-                <label>Results cap<input class="fin" name="top_n" type="number" value="40"></label>
-            </div>
-            <div class="fsect-hd" style="margin-top:.7rem">Scoring Weights</div>
-            <div class="wsblock">{wsliders}</div>
-            <div class="frow" style="align-items:center;gap:1rem;margin-top:.5rem;flex-wrap:wrap">
-                <label style="flex-direction:row;align-items:center;gap:.4rem;flex:0"><input type="checkbox" name="force_refresh" value="1"> Force HF refresh</label>
-                <label style="flex-direction:row;align-items:center;gap:.4rem;flex:0" title="Also scrapes each candidate's README.md - slower, higher hit rate"><input type="checkbox" name="deep_scan" value="1"> Deep bench scan</label>
-                <button class="rbtn" type="submit">Search &amp; Rank</button>
-                <button type="button" class="rbtn" style="background:var(--bg_panel)" hx-post="/im/in" hx-target="#srch-out" hx-swap="innerHTML" hx-include="closest form" hx-vals='{{"type":"ai_calc_rerank","branch":"ai_calc","lvl":2}}' title="Re-scores the last fetched result set with the current weights above, without re-querying HuggingFace">&#x21BB; Re-rank cached results</button>
-            </div>
-        </form>
-        <div id="srch-out" class="rzone"><div class="placeholder">Configure and run search above</div></div>
-    </div>"""
+                    <div class="fsect-hd">Model Finder</div>
+                    <form class="pform" hx-post="/im/in" hx-target="#srch-out" hx-swap="innerHTML">
+                        <input type="hidden" name="type" value="ai_calc_search"><input type="hidden" name="branch" value="ai_calc"><input type="hidden" name="lvl" value="2">
+                        <div class="frow wrap">
+                            <label>Hardware{_hw_select_html()}</label>
+                            <label>Task<select class="fin" name="task_preset" onchange="applyPreset(this.value)">{task_opts}</select></label>
+                            <label>Min params (B)<input class="fin" name="min_params" type="number" step="any" value="1"></label>
+                            <label>Max params (B)<input class="fin" name="max_params" type="number" step="any" value="35"></label>
+                            <label>Context tokens<input class="fin" name="ctx_tokens" type="number" value="20992"></label>
+                        </div>
+                        <div class="frow wrap">
+                            <label>Min T/s (hard floor)<input class="fin" name="min_tps" type="number" step="any" value="1.0"></label>
+                            <label>Target T/s (score ref)<input class="fin" name="target_tps" type="number" step="any" value="5.0"></label>
+                            <label title="How the speed score treats models faster than the target">Speed past target<select class="fin" name="speed_curve">{curve_opts}</select></label>
+                            <label title="Decode speed multiplier for models with MTP heads (name or tags contain mtp / nextn), measured on your node: MTP on t/s divided by MTP off t/s. 1 = MTP not used">MTP gain (x)<input class="fin" name="mtp_gain" type="number" step="0.01" value="1.0"></label>
+                            <label>KV Cache Type{_kv_select_html()}</label>
+                            <label>Minimum Model Quant<select class="fin" name="min_quant">{"".join(f'<option value="{q}" {"selected" if q=="Q3_K_M" else ""}>{q}</option>' for q in QUANTS)}</select><span class="dim tiny">excludes anything below this quality floor regardless of score</span></label>
+                        </div>
+                        <div class="frow wrap">
+                            <label style="flex:2">Must contain ALL<input class="fin" name="must_contain" type="text" placeholder="instruct, chat"></label>
+                            <label style="flex:2">Must contain ANY<input class="fin" name="any_contain" type="text" placeholder="creative, roleplay"></label>
+                            <label style="flex:2">Exclude terms<input class="fin" name="exclude" type="text" placeholder="vision, embed, base"></label>
+                        </div>
+                        <div class="frow wrap">
+                            <label style="flex:2">Extra HF query<input class="fin" name="extra_query" type="text"></label>
+                            <label>Results cap<input class="fin" name="top_n" type="number" value="40"></label>
+                        </div>
+                        <div class="fsect-hd" style="margin-top:.7rem">Scoring Weights</div>
+                        <div class="wsblock">{wsliders}</div>
+                        <div class="frow" style="align-items:center;gap:1rem;margin-top:.5rem;flex-wrap:wrap">
+                            <label style="flex-direction:row;align-items:center;gap:.4rem;flex:0"><input type="checkbox" name="force_refresh" value="1"> Force HF refresh</label>
+                            <label style="flex-direction:row;align-items:center;gap:.4rem;flex:0" title="Also scrapes each candidate's README.md - slower, higher hit rate"><input type="checkbox" name="deep_scan" value="1"> Deep bench scan</label>
+                            <button class="rbtn" type="submit">Search &amp; Rank</button>
+                            <button type="button" class="rbtn" style="background:var(--bg_panel)" hx-post="/im/in" hx-target="#srch-out" hx-swap="innerHTML" hx-include="closest form" hx-vals='{{"type":"ai_calc_rerank","branch":"ai_calc","lvl":2}}' title="Re-scores the last fetched result set with the current weights above, without re-querying HuggingFace">&#x21BB; Re-rank cached results</button>
+                        </div>
+                    </form>
+                    <div id="srch-out" class="rzone"><div class="placeholder">Configure and run search above</div></div>
+                </div>"""
 
 def _search_html(res):
     rows, s, weights = res["rows"], res["stats"], res.get("weights", DEFAULT_WEIGHTS)
     total_w = sum(weights.get(d, 0) for d in SCORE_DIMS)
-    sbar = (f'<div class="info-bar">Fetched <b>{s.get("fetched","?")}</b> | Filtered <b>{s.get("passed","?")}</b> | Ranked <b>{s.get("ranked",len(rows))}</b> | '
-            f'OOM <b>{s.get("oom","?")}</b> | Slow <b>{s.get("speed","?")}</b> | Bench <b>{s.get("lb_hits","?")}</b> hits{" [deep]" if s.get("deep") else ""} <span class="dim">&#8594; {Path(s.get("csv","")).name}</span></div>')
+    sbar = f"""<div class="info-bar">Fetched <b>{s.get("fetched","?")}</b> | Filtered <b>{s.get("passed","?")}</b> | Ranked <b>{s.get("ranked",len(rows))}</b> | OOM <b>{s.get("oom","?")}</b> | Slow <b>{s.get("speed","?")}</b> | Bench <b>{s.get("lb_hits","?")}</b> hits{" [deep]" if s.get("deep") else ""} <span class="dim">&#8594; {Path(s.get("csv","")).name}</span></div>"""
     if not rows: return sbar + '<div class="placeholder">No results. Try a wider param range, lower min T/s, a lower minimum quant floor, or fewer filters.</div>'
     frontier_html = _frontier_overlay_chart(rows)
     wleg = '<div class="wleg">' + "".join(f'<span class="wli"><span class="wld" style="background:{SCORE_DIM_COLORS.get(d,"#888")}"></span>{SCORE_DIM_LABELS.get(d,d)} <b>w={weights.get(d,0):.0f}</b></span>' for d in SCORE_DIMS) + '</div>'
@@ -665,17 +681,22 @@ def _search_html(res):
         lb_bdg = f'<span class="bdg bl">LB {"~" if r.get("bench_inferred") else ""}{lb_v:.1f}</span>' if lb_v > 0 else '<span class="bdg" style="opacity:.35">No bench</span>'
         score_bars = "".join(_score_bar(d, ss[d], weights.get(d, 0), total_w) for d in SCORE_DIMS)
         avail_qt = "".join(f'<span class="qt" style="border-color:{"var(--accent)" if q==r["quant"] else "var(--border)"};color:{"var(--accent)" if q==r["quant"] else "var(--text_muted)"}">{q}</span>' for q in r.get("avail_quants", []))
-        cards += f"""<div class="mcard" style="--rc:{RC[i] if i<3 else 'var(--border)'}"><div class="mrank">#{i+1}</div><div class="mbody">
-            <div class="mhead"><a class="mname" href="{hfu}" target="_blank" rel="noopener">{r['name']}</a><span class="mauthor">{r['author']}</span>{lb_bdg}
-            <span class="bdg" style="background:var(--accent_dim);color:var(--accent)">{r['quant']}</span><span class="tscore">{r['total_score']:.4f}</span></div>
-            <div class="mstats"><span class="ms" style="color:{_tcolor(p['tps'])}">~{p['tps']} t/s</span><span class="ms">{r['params_b']}B</span><span class="ms">{p['model_gb']} GB</span></div>
-            <div class="sb-block">{score_bars}</div>
-            <details class="mdet"><summary class="mdet-sum">&#9656; Benchmarks + quants</summary><div class="mdet-body">
-                <div class="lb-row">{_lb_pills(r.get("lb_detail",{}), r.get("bench_source","none"), r.get("bench_confidence",0), r.get("bench_inferred",False))}</div>
-                <div class="mqts" style="margin-top:.3rem">{avail_qt}</div>
-                <div class="mpop" style="margin-top:.3rem"><span>&#9829; {r.get("likes",0):,}</span><span>&#8659; {r.get("downloads",0):,}</span><a href="{hfu}" target="_blank" class="hfl">HuggingFace &#8594;</a></div>
-                {_pull_row_html(r)}
-            </div></details></div></div>"""
+        cards += f"""<div class="mcard" style="--rc:{RC[i] if i<3 else 'var(--border)'}">
+        			     <div class="mrank">#{i+1}</div>
+                             <div class="mbody">
+                                 <div class="mhead"><a class="mname" href="{hfu}" target="_blank" rel="noopener">{r['name']}</a><span class="mauthor">{r['author']}</span>{lb_bdg}
+                                 <span class="bdg" style="background:var(--accent_dim);color:var(--accent)">{r['quant']}</span><span class="tscore">{r['total_score']:.4f}</span></div>
+                                 <div class="mstats"><span class="ms" style="color:{_tcolor(p['tps'])}">~{p['tps']} t/s</span><span class="ms">{r['params_b']}B</span><span class="ms">{p['model_gb']} GB</span></div>
+                                 <div class="sb-block">{score_bars}</div>
+                                 <details class="mdet"><summary class="mdet-sum">&#9656; Benchmarks + quants</summary><div class="mdet-body">
+                                     <div class="lb-row">{_lb_pills(r.get("lb_detail",{}), r.get("bench_source","none"), r.get("bench_confidence",0), r.get("bench_inferred",False))}</div>
+                                     <div class="mqts" style="margin-top:.3rem">{avail_qt}</div>
+                                     <div class="mpop" style="margin-top:.3rem"><span>&#9829; {r.get("likes",0):,}</span><span>&#8659; {r.get("downloads",0):,}</span><a href="{hfu}" target="_blank" class="hfl">HuggingFace &#8594;</a></div>
+                                         {_pull_row_html(r)}
+                                     </div>
+                                 </details>
+                             </div>
+                         </div>"""
     return f'{sbar}<div id="pull-status" class="dim tiny"></div>{frontier_html}{wleg}<div class="clist">{cards}</div>'
 
 def _search_status_html():
@@ -683,8 +704,7 @@ def _search_status_html():
     if error: return f'<div class="err-box">Pipeline failed:<br><pre style="font-size:.68rem;white-space:pre-wrap;margin-top:.4rem">{error[:1500]}</pre></div>'
     if result is not None and not running: return _search_html(result)
     log = "".join(f'<div class="log-line">{l}</div>' for l in progress[-25:])
-    return f"""<div hx-post="/im/in" hx-vals='{{"type":"ai_calc_search_status","branch":"ai_calc","lvl":2}}' hx-trigger="every 2s" hx-target="#srch-out" hx-swap="innerHTML">
-                   <div class="status-bar"><span class="spin-anim">[..]</span> {status}</div><div class="log-wrap">{log}</div></div>"""
+    return f"""<div hx-post="/im/in" hx-vals='{{"type":"ai_calc_search_status","branch":"ai_calc","lvl":2}}' hx-trigger="every 2s" hx-target="#srch-out" hx-swap="innerHTML"><div class="status-bar"><span class="spin-anim">[..]</span> {status}</div><div class="log-wrap">{log}</div></div>"""
 
 def _pull_row_html(r):
     conns = AIM.connections.conns_matching("model_pull_hf")
@@ -692,21 +712,21 @@ def _pull_row_html(r):
     c_opts = "".join(f'<option value="{c["_id"]}">{UI.escape(c.get("display_name", c["_id"]))}</option>' for c in conns)
     q_opts = "".join(f'<option value="{q}" {"selected" if q == r["quant"] else ""}>{q}</option>' for q in r.get("avail_quants", []))
     return f"""<form hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="this" style="display:flex;gap:.3rem;align-items:center;margin-top:.4rem;flex-wrap:wrap">
-        <input type="hidden" name="type" value="ai_calc_pull"><input type="hidden" name="branch" value="ai_calc"><input type="hidden" name="lvl" value="2"><input type="hidden" name="repo" value="{UI.escape(r['id'])}"><input type="hidden" name="cap" value="model_pull_hf">
-        <select name="conn_id" class="fin" style="width:auto">{c_opts}</select><select name="quant" class="fin" style="width:auto">{q_opts}</select>
-        <button class="rbtn" type="submit">Pull to node</button></form>"""
+                <input type="hidden" name="type" value="ai_calc_pull"><input type="hidden" name="branch" value="ai_calc"><input type="hidden" name="lvl" value="2"><input type="hidden" name="repo" value="{UI.escape(r['id'])}"><input type="hidden" name="cap" value="model_pull_hf">
+                <select name="conn_id" class="fin" style="width:auto">{c_opts}</select><select name="quant" class="fin" style="width:auto">{q_opts}</select>
+                <button class="rbtn" type="submit">Pull to node</button></form>"""
 
 async def _panel_models(request):
     conns = AIM.connections.conns_matching("model_list")
     cid = await ENV["get_state"](request, scope="user", namespace="ai_calc", key="models_conn") or (conns[0]["_id"] if conns else "")
     opts = "".join(f"""<option value="{c['_id']}" {'selected' if c['_id'] == cid else ''}>{UI.escape(c.get('display_name', c['_id']))}</option>""" for c in conns)
     return f"""<div style="padding:.9rem;height:100%;overflow-y:auto;box-sizing:border-box">
-        <div class="fsect-hd">Models on a node</div>
-        <select class="fin" name="conn_id" style="width:auto" hx-post="/im/in" hx-trigger="change" hx-target="body" hx-swap="none" hx-include="this" hx-vals='{{"type":"ai_calc_models_show","branch":"ai_calc","lvl":2}}'>{opts or '<option value="">(no connection declares model_list)</option>'}</select>
-        <div id="pull-status" class="dim tiny" style="min-height:1rem;margin:.3rem 0"></div>
-        <div id="models-body" hx-post="/im/in" hx-trigger="load" hx-target="body" hx-swap="none" hx-vals='{{"type":"ai_calc_models_show","branch":"ai_calc","lvl":2,"conn_id":"{cid}"}}'></div>
-        <div id="models-modal"></div>
-    </div>"""
+                    <div class="fsect-hd">Models on a node</div>
+                    <select class="fin" name="conn_id" style="width:auto" hx-post="/im/in" hx-trigger="change" hx-target="body" hx-swap="none" hx-include="this" hx-vals='{{"type":"ai_calc_models_show","branch":"ai_calc","lvl":2}}'>{opts or '<option value="">(no connection declares model_list)</option>'}</select>
+                    <div id="pull-status" class="dim tiny" style="min-height:1rem;margin:.3rem 0"></div>
+                    <div id="models-body" hx-post="/im/in" hx-trigger="load" hx-target="body" hx-swap="none" hx-vals='{{"type":"ai_calc_models_show","branch":"ai_calc","lvl":2,"conn_id":"{cid}"}}'></div>
+                    <div id="models-modal"></div>
+                </div>"""
 
 async def _models_body_html(conn) -> str:
     if not conn: return '<div class="dim tiny">No connection selected.</div>'
@@ -857,7 +877,8 @@ async def _h_calc_run(request, payload, imr):
     quant = payload.get("quant", "Q4_K_M") if payload.get("quant") in QUANTS else "Q4_K_M"
     ctx = max(512, int(payload.get("ctx_tokens", 20992) or 20992))
     kv_type = payload.get("kv_type") if payload.get("kv_type") in KV_TYPES else DEFAULT_KV
-    return imr.raw(_calc_result_html(pb, quant, ctx, hw, kv_type, payload.get("cnode_id","")))
+    kv_frac, mtp_gain = max(0.01, min(float(payload.get("kv_frac", 1) or 1), 1.0)), max(0.5, min(float(payload.get("mtp_gain", 1) or 1), 4.0))
+    return imr.raw(_calc_result_html(pb, quant, ctx, hw, kv_type, payload.get("cnode_id",""), kv_frac, mtp_gain))
 
 async def _h_image_calc(request, payload, imr):
     hw = get_hw(payload.get("cnode_id",""))
@@ -913,6 +934,7 @@ async def _h_search(request, payload, imr):
               "hw": hw, "weights": _parse_weights(payload), "force_refresh": payload.get("force_refresh") == "1", "deep_scan": payload.get("deep_scan") == "1",
               "kv_type": payload.get("kv_type") if payload.get("kv_type") in KV_TYPES else DEFAULT_KV,
               "top_n": max(5, min(int(payload.get("top_n",40) or 40), 200)),
+              "speed_curve": payload.get("speed_curve") if payload.get("speed_curve") in SPEED_CURVES else "cap", "mtp_gain": max(0.5, min(float(payload.get("mtp_gain", 1.0) or 1.0), 4.0)),
               "fetched": 0}
     _job_reset(); _job_up(running=True, status="Starting...", params=params)
     threading.Thread(target=_run_thread, args=(params,), daemon=True).start()
@@ -925,7 +947,8 @@ async def _h_rerank(request, payload, imr):
     with _job_lock: filtered, params = _job.get("filtered"), _job.get("params")
     if not filtered: return imr.raw('<div class="err-box">No cached search results to re-rank - run a search first.</div>')
     weights = _parse_weights(payload)
-    rows = _rank_filtered(filtered, params["hw"], params["ctx_tokens"], params["target_tps"], weights, params["top_n"], params["kv_type"])
+    curve = payload.get("speed_curve") if payload.get("speed_curve") in SPEED_CURVES else params.get("speed_curve", "cap")
+    rows = _rank_filtered(filtered, params["hw"], params["ctx_tokens"], params["target_tps"], weights, params["top_n"], params["kv_type"], curve, params.get("mtp_gain", 1.0))
     _write_csv(rows, "rerank")
     with _job_lock:
         prior_stats = (_job.get("result") or {}).get("stats", {})
@@ -1038,21 +1061,21 @@ def right_panel(): return '<div class="ait-rp"><div class="ait-rp-hd">AI Calc</d
 # --- CSS ---
 
 CSS = """
-.pform{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:.8rem;margin-bottom:.5rem}
+.pform{background:var(--surface);border:var(--border-thick) solid var(--border);border-radius:0.6rem;padding:.8rem;margin-bottom:.5rem}
 .frow{display:flex;gap:.5rem;align-items:flex-start;margin-bottom:.55rem}.frow.wrap{flex-wrap:wrap}
-.frow label{display:flex;flex-direction:column;gap:.15rem;font-size:.73rem;color:var(--text_muted);flex:1;min-width:100px}
+.frow label{display:flex;flex-direction:column;gap:.1rem;font-size:.7rem;color:var(--text_muted);flex:1;min-width:10rem}
 .frow label:has(input[type=checkbox]){flex-direction:row;flex:0;align-items:center}
-.fin{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:.32rem .48rem;font-family:var(--font-mono);font-size:.8rem;width:100%;box-sizing:border-box}
-.rbtn{background:var(--accent_dim);color:var(--accent);border:1px solid var(--accent);border-radius:6px;padding:.4rem .85rem;font-size:.82rem;font-weight:700;cursor:pointer;white-space:nowrap}
+.fin{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:5px;padding:.3rem .4rem;font-family:var(--font-mono);font-size:.8rem;width:100%;box-sizing:border-box}
+.rbtn{background:var(--accent_dim);color:var(--accent);border:var(--border-thick) solid var(--accent);border-radius:6px;padding:.4rem .85rem;font-size:.8rem;font-weight:700;cursor:pointer;white-space:nowrap}
 .rbtn:hover{background:var(--accent);color:#000}
 .rzone{margin-top:.7rem}.placeholder{color:var(--text_muted);font-size:.84rem;padding:1.2rem 0;text-align:center}
-.fsect-hd{font-size:.73rem;font-weight:700;color:var(--text_muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.5rem}
+.fsect-hd{font-size:.7rem;font-weight:700;color:var(--text_muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:.5rem}
 .dim{color:var(--text_muted)}.tiny{font-size:.7rem}
 .qn{font-family:var(--font-mono);font-weight:700;color:var(--accent)}
 .tbl-scroll{overflow-x:auto}
 .wsblock{display:flex;flex-direction:column;gap:.28rem;padding:.3rem 0}
 .wsl{display:flex;align-items:center;gap:.55rem;font-size:.75rem;color:var(--text_muted)}
-.wsln{min-width:130px;color:var(--wc);font-weight:600;flex-shrink:0}.wslider{flex:1;accent-color:var(--wc)}.wsv{min-width:1.5rem;text-align:right;font-family:var(--font-mono);color:var(--wc);font-weight:700}
+.wsln{min-width:13rem;color:var(--wc);font-weight:600;flex-shrink:0}.wslider{flex:1;accent-color:var(--wc)}.wsv{min-width:1.5rem;text-align:right;font-family:var(--font-mono);color:var(--wc);font-weight:700}
 .wleg{display:flex;flex-wrap:wrap;gap:.3rem .65rem;margin:.45rem 0 .5rem;font-size:.7rem;color:var(--text_muted)}.wli{display:flex;align-items:center;gap:.22rem}.wld{width:7px;height:7px;border-radius:50%}
 .sb-block{display:flex;flex-direction:column;gap:.15rem;margin:.28rem 0}.sbrow{display:flex;align-items:center;gap:.4rem;font-size:.7rem}
 .sbl{min-width:110px;color:var(--text_muted);font-size:.67rem;flex-shrink:0}.sbbar{flex:1;height:6px;background:var(--bg);border-radius:3px;overflow:hidden;border:1px solid var(--border)}
@@ -1066,13 +1089,13 @@ CSS = """
 .mstats{display:flex;flex-wrap:wrap;gap:.25rem;font-size:.73rem;margin-bottom:.22rem}.ms{background:var(--surface);border:1px solid var(--border);padding:.1rem .35rem;border-radius:4px}
 .mqts{display:flex;flex-wrap:wrap;gap:.2rem}.qt{font-size:.65rem;padding:.08rem .32rem;border-radius:3px;border:1px solid;font-family:var(--font-mono)}
 .mpop{display:flex;align-items:center;gap:.6rem;font-size:.7rem;color:var(--text_muted);flex-wrap:wrap}.hfl{color:var(--accent);text-decoration:none;margin-left:auto}
-.bdg{font-size:.63rem;padding:.08rem .32rem;border-radius:3px;font-weight:700}.bl{color:#00ffa2}
+.bdg{font-size:.63rem;padding:.1rem .3rem;border-radius:3px;font-weight:700}.bl{color:#00ffa2}
 .mdet summary{cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none}.mdet-body{padding:.45rem 0 .15rem;border-top:1px solid var(--border);margin-top:.28rem}
-.lb-row{display:flex;flex-wrap:wrap;gap:.28rem}.lbp{font-size:.68rem;padding:.08rem .38rem;border-radius:3px;background:var(--surface);border:1px solid var(--border);font-family:var(--font-mono)}
+.lb-row{display:flex;flex-wrap:wrap;gap:.2rem}.lbp{font-size:.7rem;padding:.1rem .3rem;border-radius:3px;background:var(--surface);border:1px solid var(--border);font-family:var(--font-mono)}
 .sbar{display:flex;flex-wrap:wrap;gap:.3rem .7rem;font-size:.72rem;color:var(--text_muted);margin-bottom:.5rem;padding:.4rem .6rem;background:var(--bg);border:1px solid var(--border);border-radius:5px}
-.status-bar{display:flex;align-items:center;gap:.6rem;padding:.45rem .65rem;background:var(--surface);border:1px solid var(--accent);border-radius:5px;font-size:.8rem;margin-bottom:.4rem}
+.status-bar{display:flex;align-items:center;gap:.6rem;padding:.4rem .6rem;background:var(--surface);border:1px solid var(--accent);border-radius:5px;font-size:.8rem;margin-bottom:.4rem}
 .spin-anim{color:var(--accent);font-family:var(--font-mono)}
-.log-wrap{font-family:var(--font-mono);font-size:.7rem;color:var(--text_muted);max-height:170px;overflow-y:auto;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:.35rem .55rem}
+.log-wrap{font-family:var(--font-mono);font-size:.7rem;color:var(--text_muted);max-height:17rem;overflow-y:auto;background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:.35rem .55rem}
 .log-line{padding:.06rem 0;border-bottom:1px solid var(--border)}
 .hwg{display:flex;flex-wrap:wrap;gap:.5rem}.hwg label{display:flex;flex-direction:column;gap:.15rem;font-size:.73rem;color:var(--text_muted);min-width:120px;flex:1}
 .hwin{background:var(--bg);border:1px solid var(--border);color:var(--text);border-radius:4px;padding:.27rem .4rem;font-family:var(--font-mono);font-size:.8rem;width:100%;box-sizing:border-box}
