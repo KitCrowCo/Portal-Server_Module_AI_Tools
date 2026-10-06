@@ -107,7 +107,37 @@ def _lang_opts(values=None):
     r = _node_list(values, "stt_conn", "speech_to_text", "stt_languages")
     return _listed(values, "language", r.get("languages", []), "(auto-detect)", note=f"""speech node unreachable: {r["error"][:60]}""" if r.get("error") else "")
 
-_CALL_KEYS = ("threshold_db", "bargein_db", "start_ms", "end_ms", "preroll_ms")
+_CALL_KEYS = ("threshold_db", "bargein_db", "start_ms", "end_ms", "preroll_ms", "bargein_ms", "min_voiced_ms", "voicing")
+_NEW_DEFAULTS = {"max_reply_tokens": 300, "trim_unfinished": True, "call_bargein_ms": 400, "call_min_voiced_ms": 250, "call_voicing": 0.45, "ignore_phrases": "", "max_no_speech_prob": None}
+
+def _opt(s: dict, k: str):
+    """A conversation setting, or the shipped default when the conversation was saved before the setting existed (or left it blank)."""
+    return _NEW_DEFAULTS[k] if k in _NEW_DEFAULTS and s.get(k) in (None, "") else s.get(k)
+
+_TRIM_UNFINISHED = """input[:max(input.rfind(c) for c in ".!?\u2026") + 1] if len(input) >= {cut} and max(input.rfind(c) for c in ".!?\u2026") > 0 else input"""   # transform expr: a reply near the cap ends at its last . ! ? or ellipsis; shorter replies pass unchanged
+
+def _tune_flow(flow: dict, s: dict) -> dict:
+    """Applies one conversation's reply cap, unfinished-sentence trim and nothing-said filters to the flow _flow() built. Nodes are found by type, so ids and key names do not matter."""
+    nodes = flow["nodes"]
+    gen, tr, sp = (next((n for n in nodes if n["type"] == t), None) for t in ("generate", "transcribe", "speak"))
+    cap = int(_opt(s, "max_reply_tokens") or 0)
+    if gen and cap > 0: gen["config"]["num_predict"] = cap
+    if tr: tr["config"].update({"skip_empty": True, "ignore_phrases": _opt(s, "ignore_phrases") or "", "max_no_speech_prob": _opt(s, "max_no_speech_prob")})
+    if gen and sp and cap > 0 and _opt(s, "trim_unfinished"):
+        said = sp.setdefault("key_map", {}).get("text", "text")   # the key the speak node reads (the reply)
+        nodes.append({"id": "trim_unfinished", "type": "transform", "name": "end speech at the last full sentence", "config": {"mode": "expr", "expr": _TRIM_UNFINISHED.format(cut=int(cap * 3.6))}, "key_map": {"input": said, "value": f"{said}_spoken"}, "extra_in_keys": [], "extra_out_keys": [], "appearance": {}})
+        sp["key_map"]["text"] = f"{said}_spoken"   # the chat still shows the reply as written; only the voice stops at the sentence
+    return flow
+
+async def _heard(username: str, sid: str, job: dict) -> bool:
+    """For a finished turn: True when words were heard (or the turn was typed). Tells the browser either way with a `cm-voice` trigger {sid, heard};
+    heard=false resumes a reply that the utterance paused. Nothing heard = the transcribe node ended with 'dropped_text' and no 'text'."""
+    tr = next((n for n in job.get("flow", {}).get("nodes", []) if n.get("type") == "transcribe"), None)
+    if not tr: return True
+    heard = tr.get("key_map", {}).get("text", "text") in job.get("data", {})
+    await ENV["push_to_client"](username, {"t": "trigger", "event": "cm-voice", "detail": {"sid": sid, "heard": heard}})
+    return heard
+
 def _call_cfg(s: dict) -> dict: return {k: s.get(f"call_{k}") for k in _CALL_KEYS}   # blank values are dropped by ChatManager, so the browser script's defaults apply
 
 def _build_fields():
@@ -133,6 +163,13 @@ def _build_fields():
         F("call_bargein_db", "Call: Extra dB to Interrupt a Reply (default 6)", "number", None, advanced=True, hint="Added to the threshold while a reply is playing, so speaker leakage does not interrupt it."),
         F("call_start_ms", "Call: Speech Needed to Start (ms, default 180)", "number", None, step=1, advanced=True),
         F("call_end_ms", "Call: Silence That Ends a Turn (ms, default 800)", "number", None, step=1, advanced=True, hint="Raise it if you get cut off while pausing to think."),
+        BI.SettingField("max_reply_tokens", "Longest Reply (tokens)", "number", 300, step=1, hint="Hard cap sent to the model; 300 is about a minute of speech. 0 = no cap."),
+        BI.SettingField("trim_unfinished", "Drop an Unfinished Last Sentence", "checkbox", True, hint="When a reply reaches the cap, speech ends at its last complete sentence instead of a fragment."),
+        BI.SettingField("call_bargein_ms", "Call: Talk-Over Time Before a Reply Pauses (ms)", "number", 400, step=1, advanced=True, hint="Speaking over a reply this long pauses it; the reply resumes if nothing was said."),
+        BI.SettingField("call_min_voiced_ms", "Call: Voiced Speech Needed to Send (ms)", "number", 250, step=1, advanced=True, hint="An utterance with less voiced sound is dropped in the browser (coughs, knocks). Raise to 400 if noise still sends."),
+        BI.SettingField("call_voicing", "Call: Voice Detection Strictness (0-1)", "number", 0.45, advanced=True, hint="How periodic (voice-like) the speech band must be. Raise to 0.55 if noise still counts as speech."),
+        BI.SettingField("ignore_phrases", "Ignore These Transcripts (one per line)", "textarea", "", advanced=True, hint="Whole transcripts treated as nothing said - the recognizer's noise inventions, e.g. Thank you. / Thanks for watching!"),
+        BI.SettingField("max_no_speech_prob", "Drop Recognized Segments Rated Not-Speech Above (0-1)", "number", None, advanced=True, hint="Uses the recognizer's own per-segment score (speech_direct reports it). Blank = keep all; 0.6 is a reasonable start."),
         F("call_preroll_ms", "Call: Audio Kept From Before Speech Starts (ms, default 400)", "number", None, step=1, advanced=True)], json_path="")
 
 # --- Turn execution ---
@@ -145,6 +182,7 @@ def _flow(s: dict) -> dict:
              {"id": "prompt", "name": "Prompt", "type": "transform", "config": {"mode": "template", "template": "{history}{transcript}"}, "key_map": {"input": "transcript", "value": "prompt"}, "extra_in_keys": ["history"]},
              {"id": "llm", "name": "Reply", "type": "generate", "config": {"conn_id": s.get("chat_conn", ""), "model": s.get("model", ""), "system_prompt": _system(s), "user_template": "{prompt}", "num_ctx": s.get("num_ctx", 16384), "think": ""}, "key_map": {"input": "prompt", "text": "reply"}}]
     if s.get("speak_replies"): nodes.append({"id": "tts", "name": "Speak", "type": "speak", "config": {"conn_id": s.get("tts_conn", ""), "voice": s.get("voice", ""), "length_scale": s.get("length_scale")}, "key_map": {"text": "reply", "audio_b64": "reply_audio"}})
+    #return _tune_flow(<flow dict>, <this conversation's settings dict>)
     return {"nodes": [{**n, "status": "idle"} for n in nodes]}
 
 def _history(doc: dict) -> str:

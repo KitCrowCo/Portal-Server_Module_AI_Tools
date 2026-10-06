@@ -1,8 +1,8 @@
 """
-image.py — Flux2 Klein multi-stage image generation workspace.
+image.py - Flux2 Klein multi-stage image generation workspace, plus video clips and animatics (motion.py) on the same node.
 Sub-module of ai_tools. Mounted at /module/ai_tools/image.
 """
-import json, uuid, asyncio, base64, os, re, time, mimetypes, traceback
+import json, uuid, asyncio, base64, os, re, time, mimetypes, traceback, copy, importlib.util
 import httpx
 from pathlib import Path
 from typing import Optional
@@ -29,12 +29,21 @@ BI = UI = WS = IM = TM = AIM = _SETTINGS = _base_picker = _mask_picker = _ref_pi
 _WORKER_TASK = None
 thumb_data_uri = None
 
+_motion_spec = importlib.util.spec_from_file_location("modules.ai_tools.image_motion", Path(__file__).parent / "motion.py")   # helper file beside this one, loaded by path the way ai_tools loads this module
+motion = importlib.util.module_from_spec(_motion_spec)
+_motion_spec.loader.exec_module(motion)
+
+class _Self:
+    """A live view of this module's globals for motion.py (it reads settings, queue and helpers through it)."""
+    def __getattr__(self, k): return globals()[k]
+
 def _u(*p): return "/" + "/".join(s.strip("/") for s in [_P.strip("/"), *p] if s)
 def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
 
 # --- Init ---
 
 def _conn_options(values=None): return [("", "(none)")] + [(c["_id"], f'{c.get("display_name", c["_id"])} [{c.get("connection_type","?")}]') for c in AIM.connections.list_conns(get_all=True)]
+def _video_conn_options(values=None): return [("", "(the Image Generation Connection)")] + [(c["_id"], f"""{c.get("display_name", c["_id"])} [{c.get("connection_type", "?")}]""") for c in AIM.connections.list_conns(get_all=True) if any(AIM.connections.has_capability(c, k) for k in ("text_to_video", "image_to_video", "start_end_to_video"))]
 
 def init_tool(env: dict, prefix: str):
     global ENV, BI, UI, WS, IM, TM, AIM, _SETTINGS, _P, _gallery_tool, thumb_data_uri, _base_picker, _mask_picker, _ref_picker
@@ -49,7 +58,8 @@ def init_tool(env: dict, prefix: str):
         BI.SettingField("mock_mode", "Enable Offline Mock Mode", "checkbox", False, hint="Bypass real nodes and yield placeholder images (useful offline)"),
         BI.SettingField("text_encoder_conn_id", "Text Encoder Connection", "select", "", options=_conn_options),
         BI.SettingField("image_gen_conn_id", "Image Generation Connection", "select", "", options=_conn_options),
-        BI.SettingField("model_name", "Model Filename", "text", "flux-2-klein-9b-Q6_K.gguf", hint="Filename — relative to node's transformer dir"),
+        BI.SettingField("video_conn_id", "Video Connection", "select", "", options=_video_conn_options, hint="Blank = the Image Generation Connection (the image node renders both). Its profile must declare the video capabilities."),
+        BI.SettingField("model_name", "Model Filename", "text", "flux-2-klein-9b-Q6_K.gguf", hint="Filename - relative to node's transformer dir. The default when the Generate tab's Model is blank."),
         BI.SettingField("vae_name", "VAE Directory Name", "text", "flux2", hint="Directory name — relative to node's VAE dir"),
         BI.SettingField("output_dir", "Output Directory (local path)", "text", str(DATA_DIR / "outputs"), hint="Full path on THIS container — for gallery scanning"),
         BI.SettingField("lora_dir", "LoRA Directory (local path)", "text", str(DATA_DIR / "models/loras"), hint="Full path on THIS container — for dropdown scanning"),
@@ -61,8 +71,10 @@ def init_tool(env: dict, prefix: str):
     TM = BI.TabManager(namespace="image", tab_bar_id="img-tab-bar", content_id="img-panel", render_content_fn=_render_panel, intent_prefix="image", IM=IM, scope="user", nesting_level=2, allow_new=False, closable=False,
         empty={"tabs": {"generate": {"id":"generate","order":0,"label":"Generate","icon":"&#x25B6;"},
                         "inpaint":  {"id":"inpaint","order":1,"label":"Inpaint","icon":"&#x1F58C;"},
-                        "gallery":  {"id":"gallery","order":2,"label":"Gallery","icon":"&#x1F5BC;"},
-                        "settings": {"id":"settings","order":3,"label":"Settings","icon":"&#x2699;"}}, "active":"generate"})
+                        "video":    {"id":"video","order":2,"label":"Video","icon":"&#x1F3AC;"},
+                        "animatic": {"id":"animatic","order":3,"label":"Animatic","icon":"&#x1F39E;"},
+                        "gallery":  {"id":"gallery","order":4,"label":"Gallery","icon":"&#x1F5BC;"},
+                        "settings": {"id":"settings","order":5,"label":"Settings","icon":"&#x2699;"}}, "active":"generate"})
     thumb_data_uri = BI.thumb_data_uri
 
     # Tab-switch wrapper: update bottom toolbar on tab focus
@@ -119,10 +131,22 @@ def init_tool(env: dict, prefix: str):
     IM.scripts["image_select_mask"] = [_im_select_mask]
     IM.scripts["image_save_mask"] = [_im_save_mask]
     IM.scripts["image_assemble_gif"] = [_im_assemble_gif]
+    IM.scripts["image_assemble_gif_field"] = [_im_assemble_gif_field]
     _gallery_tool = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_gallery", nesting_level=2, file_manager=_fm(), full_url_fn=lambda rel: _u("full", rel), transfer_targets={"common": "./data/_common", "knowledge": "./data/ai_tools/_knowledge"})
     _base_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_base", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_base_image)
     _mask_picker = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_mask", nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_mask_image)
     _ref_picker  = BI.ImageGallery(root_dir=_output_dir(), IM=IM, intent_prefix="image_pick_ref",  nesting_level=2, file_manager=_fm(), select_mode=True, on_select=_pick_reference_image)
+    motion.init(_Self())
+    motion.register(IM)
+
+async def _load_tabs(request) -> dict:
+    """Saved tab state plus any shipped tab it lacks: a fixed-tab manager keeps a user's saved tabs forever, so a new tab would never appear. Missing tabs are added once, in the shipped order."""
+    state = await TM._load(request)
+    if all(k in state["tabs"] for k in TM.empty["tabs"]): return state
+    state["tabs"] = {**copy.deepcopy(TM.empty["tabs"]), **state["tabs"]}
+    for k, t in TM.empty["tabs"].items(): state["tabs"][k]["order"] = t["order"]
+    await TM._save(request, state)
+    return state
 
 async def _pick_base_image(request, payload, imr):
     rel = payload.get("path", "")
@@ -145,7 +169,7 @@ async def _pick_reference_image(request, payload, imr):
     rel = payload.get("path", "")
     fm = _fm()
     imr.oob(f'<input type="hidden" id="img-ref-path" name="reference_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-ref-path", swap="outerHTML")
-    imr.oob(f'<div style="display:flex;align-items:center;gap:.3rem;font-size:.6rem;color:var(--text_muted)"><img src="{_u("thumb", rel)}" style="width:2rem;height:2rem;object-fit:cover;border-radius:.2rem"> {_esc(rel)}</div>', "img-ref-status", swap="outerHTML")
+    imr.oob(f"""<div style="display:flex;align-items:center;gap:.3rem;font-size:.6rem;color:var(--text_muted)"><img src="{thumb_data_uri(fm, rel)}" style="width:2rem;height:2rem;object-fit:cover;border-radius:.2rem"> {_esc(rel)}</div>""", "img-ref-status", swap="outerHTML")
     return imr
 
 def _ensure_worker():
@@ -162,16 +186,6 @@ def _output_dir():
     return p
 def _lora_dir(): return Path(_cfg().get("lora_dir") or DATA_DIR / "models/loras")
 def _fm(): return ENV["tools"]["built_ins"].FileManager(_output_dir())
-
-def _parse_targets(raw) -> list:
-    if isinstance(raw, list): return raw
-    if isinstance(raw, str):
-        raw = raw.strip()
-        if raw.startswith("["):
-            try: return json.loads(raw)
-            except Exception: pass
-        return [raw] if raw else []
-    return []
 
 # --- Storage: prompts + job records ---
 
@@ -333,7 +347,13 @@ def _lora_row_html(idx, selected_path="", selected_scale=1.0):
                     <input type="number" name="lora_{idx}_scale" value="{selected_scale}" step="0.05" min="0" max="2" class="module-select" style="width:4rem;font-size:.72rem">
                 </div>""")
 
-def _generate_form_html(form, prompts, selected_prompt_id, system_status):
+def _image_model_select_html(models: list, selected: str) -> str:
+    """The node's image models (from its /models); blank = the Settings Model Filename. A saved choice the node no longer lists stays selectable."""
+    names = [m["name"] for m in models]
+    opts = [("", f"""(default: {_cfg().get("model_name", "")})""")] + [(n, n) for n in names] + ([(selected, f"{selected} (not listed by the node)")] if selected and selected not in names else [])
+    return f"""<select name="model" class="module-select" style="font-size:.8rem">{motion.options_html(opts, selected)}</select>"""
+
+def _generate_form_html(form, prompts, selected_prompt_id, system_status, image_models=()):
     p_opts = (('<option value="" disabled selected>— create a prompt first —</option>' if not prompts else "") + "".join(f"""<option value="{p["id"]}" {"selected" if p["id"]==selected_prompt_id else ""}>{_esc(p["title"])} {"&#x2713;" if p["status"]=="ready" else "&#x25CC;" if p["status"]=="encoding" else ""}</option>""" for p in prompts))
     loras = form.get("loras", [])
     lora_rows = "".join(_lora_row_html(i, (loras[i] or {}).get("path", "") if i < len(loras) else "", (loras[i] or {}).get("scale", 1.0) if i < len(loras) else 1.0) for i in range(3))
@@ -350,6 +370,10 @@ def _generate_form_html(form, prompts, selected_prompt_id, system_status):
                     <label style="font-size:.72rem;color:var(--text_muted)">
                         Prompt {status_dot}
                         <select name="prompt_id" class="module-select" style="font-size:.8rem" required>{p_opts}</select>
+                    </label>
+                    <label style="font-size:.72rem;color:var(--text_muted)">
+                        Model
+                        {_image_model_select_html(image_models, form.get("model", ""))}
                     </label>
                     <div style="display:flex;gap:.4rem;flex-wrap:wrap">
                         <label style="font-size:.72rem;color:var(--text_muted);flex:1;min-width:6rem">
@@ -426,7 +450,7 @@ async def generate_submit(request: Request):
     if prompt["status"] != "ready": return HTMLResponse('<span style="color:#ff5f5f">Prompt not encoded yet</span>')
     loras = [{"path": f.get(f"lora_{i}", ""), "scale": float(f.get(f"lora_{i}_scale", 1.0) or 1.0)} for i in range(3) if f.get(f"lora_{i}", "")]
     is_sequence = f.get("is_sequence") == "1"
-    base_form = {"width": int(f.get("width", 512)), "height": int(f.get("height", 512)), "steps": int(f.get("steps", 4)), "cfg": float(f.get("cfg", 1.0)), "shift": float(f.get("shift", 1.0)), "seed": int(f.get("seed", -1)), "batch": (max(1, int(f.get("batch", 1))) if not is_sequence else 1), "output_prefix": f.get("output_prefix", "img").strip() or "img", "loras": loras, "offload_mode": f.get("offload_mode", "none")}
+    base_form = {"width": int(f.get("width", 512)), "height": int(f.get("height", 512)), "steps": int(f.get("steps", 4)), "cfg": float(f.get("cfg", 1.0)), "shift": float(f.get("shift", 1.0)), "seed": int(f.get("seed", -1)), "batch": (max(1, int(f.get("batch", 1))) if not is_sequence else 1), "output_prefix": f.get("output_prefix", "img").strip() or "img", "loras": loras, "offload_mode": f.get("offload_mode", "none"), "model": f.get("model", "")}
     if is_sequence:
         base_form["num_frames"] = max(2, min(int(f.get("num_frames", 8) or 8), 120))
         base_form["frame_strength"] = float(f.get("frame_strength", 0.35) or 0.35)
@@ -455,16 +479,6 @@ def _inpaint_panel_html(prompts, selected_prompt_id):
                         <div id="img-inpaint-base-hint" style="margin-top:.4rem; font-size:.7rem;color:var(--text_muted)">Select an image above</div>
                     </div>
                 </div>""")
-
-def _bottom_toolbar_generate_html(sequence_state: dict):
-    return f"""<div id="img-seq-fields" style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;padding:.4rem .6rem">
-                   <span style="font-size:.7rem;color:var(--text_muted);text-transform:uppercase">Assemble GIF</span>
-                   <input type="text" name="sequence_dir" value="{_esc(sequence_state.get("sequence_dir",""))}" placeholder="sequence name" class="module-select" style="flex:1;min-width:8rem;font-size:.7rem">
-                   <input type="number" name="frame_ms" value="{sequence_state.get("frame_ms",120)}" min="10" max="5000" class="module-select" style="width:5rem;font-size:.7rem" title="ms/frame"><label style="font-size:.7rem;color:var(--text_muted);display:flex;align-items:center;gap:.2rem">
-                   <input type="checkbox" name="loop" value="1" {"checked" if sequence_state.get("loop",True) else ""}> loop</label>
-                   <button class="button" hx-post="/im/in" hx-target="body" hx-swap="none" hx-include="#img-seq-fields" hx-vals='{json.dumps({"type": "image_assemble_gif", "branch": IM.branch_id, "lvl": 2})}'>&#x25B6; Assemble</button>
-                   <span id="img-assemble-status" style="font-size:.7rem;color:var(--text_muted);width:100%"></span>
-               </div>"""
 
 def _bottom_toolbar_inpaint_html(prompts, selected_prompt_id, selected_mask=""):
     p_opts = "".join(f'<option value="{p["id"]}" {"selected" if p["id"]==selected_prompt_id else ""}>{_esc(p["title"])} {"&#x2713;" if p["status"]=="ready" else ""}</option>' for p in prompts)
@@ -547,8 +561,9 @@ def _next_queued_job():
     jobs = [j for j in _list("job") if j["status"] == "queued"]
     return sorted(jobs, key=lambda j: j["created"])[0] if jobs else None
 
-async def _poll_progress(username: str, stop_evt: asyncio.Event):
-    conn = _conn("image_gen_conn_id")
+async def _poll_progress(username: str, stop_evt: asyncio.Event, conn=None, label=None):
+    """Pushes the node's step progress while a job runs. conn defaults to the image node; label() prefixes it (e.g. "gap 2/5")."""
+    conn = conn or _conn("image_gen_conn_id")
     if not conn: return
     try:
         while not stop_evt.is_set():
@@ -567,7 +582,7 @@ async def _poll_progress(username: str, stop_evt: asyncio.Event):
             if prog.get("status") != "running": continue
             filled = int(pct / 10)
             bar = "&#x2588;" * filled + "&#x2591;" * (10 - filled)
-            html = (f"""<div id="img-progress-bar" hx-swap-oob="innerHTML"><span style="color:#ffcc00">{bar}</span> step {step}/{total} ({pct}%)</div>""")
+            html = (f"""<div id="img-progress-bar" hx-swap-oob="innerHTML">{_esc(label() if label else "")} <span style="color:#ffcc00">{bar}</span> step {step}/{total} ({pct}%)</div>""")
             await WS.send_personal_message(html, username)
     finally:
         await WS.send_personal_message('<div id="img-progress-bar" hx-swap-oob="innerHTML"></div>', username)
@@ -577,6 +592,7 @@ async def _run_job(job):
     job["started"] = datetime.utcnow().isoformat()
     _save("job", job)
     await _push_job(job)
+    if job["kind"] in ("video", "animatic"): return await motion.run_job(job)
     cfg = _cfg()
     mock = cfg.get("mock_mode")
     conn = _conn("image_gen_conn_id")
@@ -622,7 +638,7 @@ async def _run_job(job):
                    "embed_job_id": job.get("prompt_id", ""),"width": p["width"], "height": p["height"],
                    "steps": p["steps"], "guidance_scale": p["cfg"],
                    "shift": p["shift"], "seed": p["seed"],
-                   "model_path": cfg.get("model_name", "flux-2-klein-9b-Q6_K.gguf"),
+                   "model_path": p.get("model") or cfg.get("model_name", "flux-2-klein-9b-Q6_K.gguf"),
                    "vae_path": cfg.get("vae_name", "flux2"),
                    "vae_tiling": cfg.get("vae_tiling", True),
                    "offload_mode": p.get("offload_mode", cfg.get("offload_mode", "none")),
@@ -658,6 +674,7 @@ async def _run_job(job):
     job["finished"] = datetime.utcnow().isoformat()
     _save("job", job)
     await _push_job(job)
+    if job.get("storyboard"): await motion.keyframe_done(job)
 
 async def _push_job(job): await WS.send_personal_message(f'<div id="img-queue-status" hx-swap-oob="innerHTML">{_queue_status_html()}</div>', job["username"])
 
@@ -707,7 +724,7 @@ async def _right_panel_html():
     return (f"""<div style="display:flex;flex-direction:column;height:100%;overflow:hidden">
                     <div style="padding:.5rem;border-bottom:var(--border-thick) solid var(--border);flex-shrink:0">
                         <div style="font-size:.7rem; text-transform:uppercase; color:var(--text_muted); margin-bottom:.3rem">Image Node</div>
-                        <div style="font-size:.7rem">{"<span style=color:#00ffa2>&#x25CF; loaded</span>" if loaded else "<span style=color:var(--text_muted)>&#x25CF; not loaded</span>"}</div>
+                        <div style="font-size:.7rem">{"<span style=color:#00ffa2>&#x25CF; loaded</span>" if loaded else "<span style=color:var(--text_muted)>&#x25CF; not loaded</span>"} <span style="color:var(--text_muted)">{_esc(status.get("loaded_model") or "")}</span></div>
                         {lora_html}
                         {err_html}
                         {no_conn_html}
@@ -754,6 +771,8 @@ def _settings_html():
             <button type="submit" class="button">Save</button>
             <div id="img-settings-status" style="font-size:.75rem;min-height:1rem"></div>
         </form>
+        <hr style="margin:1.5rem 0;border-color:var(--border)">
+        <div id="img-pipes">{motion.pipelines_html()}</div>
         <hr style="margin:1.5rem 0;border-color:var(--border)">
         <div style="display:flex;align-items:center;gap:.6rem">
             <button class="ui-btn" hx-post="{_u("jobs/clear")}" hx-target="#img-jobs-clear-status" hx-confirm="Delete all job history records? Outputs on disk are not affected.">Clear job records</button>
@@ -837,19 +856,21 @@ async def _render_panel(request, state):
     if active == "inpaint": return state, _inpaint_panel_html(_list("prompt"), s["selected_prompt_id"])
     if active == "gallery": return state, f'<div style="height:100%">{_gallery_tool.render_shell()}</div>'
     if active == "settings": return state, _settings_html()
+    if active == "video": return state, await motion.video_panel_html(request)
+    if active == "animatic": return state, await motion.animatic_panel_html(request)
     if _cfg().get("mock_mode"):
         status = {"loaded": True, "active_loras": ["mock"], "last_error": ""}
     else:
         conn = _conn("image_gen_conn_id")
         status = (await AIM.connections.flux2_system_status(conn)) if conn else {"_no_conn": True}
-    return state, f'<div id="img-gen-panel" style="height:100%">{_generate_form_html(s["form"], _list("prompt"), s["selected_prompt_id"], status)}</div>'
+    return state, f"""<div id="img-gen-panel" style="height:100%">{_generate_form_html(s["form"], _list("prompt"), s["selected_prompt_id"], status, (await motion.models()).get("image", []))}</div>"""
 
 @router.get("")
 @router.get("/")
 async def root(request: Request):
     _ensure_worker()
     username = request.state.user.username
-    state = await TM._load(request)
+    state = await _load_tabs(request)
     state, panel_html = await _render_panel(request, state)
     tab_bar = await TM.tab_bar_fn(state, "img-tab-bar", "image", 2, allow_new=False, closable=False)
     s = await _ui_state(request)
