@@ -20,7 +20,8 @@ TOOL_META = {"label": "Voice", "icon": "&#x1F3A4;", "group": "chat", "descriptio
 router = APIRouter(redirect_slashes=False)
 DATA_DIR = Path("./data/ai_tools/voice")
 AUDIO_DIR = DATA_DIR / "audio"
-SPEAKER_DIR = DATA_DIR / "speakers"   # one file per login: enrolled voiceprints (embeddings only - no recordings are kept for them)
+SPEAKER_DIR = DATA_DIR / "speakers"   # one file per login: enrolled voice profiles (voiceprints + the names of their sample recordings, kept under audio/<login>/)
+DEFAULTS_DIR = DATA_DIR / "defaults"  # one file per login: the settings a conversation starts from when there is none to copy (written by every settings save)
 _DONE = ("done", "error", "stopped", "interrupted")
 ENV = {}
 PREFIX = ""
@@ -36,12 +37,16 @@ BARGE_WAIT_S, BARGE_GRACE_S = 0.25, 0.6   # how long an utterance waits for a St
 
 def _dp(sid): return DATA_DIR / f"{Path(sid).name}.json"
 def _load(sid): return json.loads(_dp(sid).read_text()) if sid and _dp(sid).exists() else None
-def _save(doc): doc["modified"] = datetime.utcnow().isoformat(); _dp(doc["id"]).write_text(json.dumps(doc, indent=2))
+def _save(doc): doc["modified"] = datetime.utcnow().isoformat(); BI.write_json_atomic(_dp(doc["id"]), doc)
 def _list(username): return sorted((d for d in (json.loads(f.read_text()) for f in DATA_DIR.glob("*.json")) if d.get("username") == username), key=lambda d: d.get("modified", ""), reverse=True)
 def _owned(request, sid): doc = _load(sid); return doc if doc and doc.get("username") == request.state.user.username else None
 
+def _def_path(username: str) -> Path: return DEFAULTS_DIR / f"{Path(username).name}.json"
+def _defaults(username: str) -> dict: return {**{f.name: f.default for f in _FIELDS.fields}, **(json.loads(_def_path(username).read_text()) if _def_path(username).exists() else {})}   # this login's last saved settings over the field defaults, so fields added later keep theirs
+def _spk_save(username: str, doc: dict): BI.write_json_atomic(_spk_path(username), doc, indent=1)
+
 def _new(username, settings=None) -> dict:
-    doc = {"id": f"vc_{uuid.uuid4().hex[:8]}", "username": username, "title": "New conversation", "settings": settings or {f.name: f.default for f in _FIELDS.fields}, "turns": [], "created": datetime.utcnow().isoformat()}
+    doc = {"id": f"vc_{uuid.uuid4().hex[:8]}", "username": username, "title": "New conversation", "settings": settings or _defaults(username), "turns": [], "created": datetime.utcnow().isoformat()}
     _save(doc)
     return doc
 
@@ -82,20 +87,26 @@ def _backfill(doc: dict) -> dict:
     return doc
 
 # --- Speakers (per login) ---
-# A profile: {id, name, code (4-digit signature), role (owner / trusted / guest), samples: [embedding...], embedding (normalized mean), created}.
-# Roles describe this login's view: on one login the owner is that person and a partner is trusted; the partner's own login keeps its own profiles.
+# A profile: {id, name, code (4-digit signature), role (owner / trusted / guest), samples, embedding (normalized mean of the samples' voiceprints), created}.
+# A sample is {audio (file under audio/<login>/), embedding (or None when measuring failed)}; profiles enrolled before recordings were kept hold bare voiceprints (lists) - both forms are read.
 
 SPEAKER_ROLES = [("owner", "Owner - this account's person"), ("trusted", "Trusted - known, not the owner"), ("guest", "Guest")]
 
 def _spk_path(username: str) -> Path: return SPEAKER_DIR / f"{Path(username).name}.json"
 def _spk(username: str) -> dict: return json.loads(_spk_path(username).read_text()) if _spk_path(username).exists() else {"profiles": []}
-def _spk_save(username: str, doc: dict): _spk_path(username).write_text(json.dumps(doc, indent=1))
+def _spk_save(username: str, doc: dict): BI.write_json_atomic(_spk_path(username), doc, indent=1)
 def _spk_get(doc: dict, pid: str): return next((p for p in doc["profiles"] if p["id"] == pid), None)
 
 def _mean(vectors: list) -> list:
     m = [sum(c) / len(vectors) for c in zip(*vectors)]
     n = sum(a * a for a in m) ** 0.5 or 1.0
     return [round(a / n, 6) for a in m]
+
+def _sample_vec(x): return x if isinstance(x, list) else x.get("embedding")
+def _voiceprint(p: dict) -> list: return _mean([v for v in map(_sample_vec, p["samples"]) if v])
+def _sample_note(p: dict) -> str:
+    n, missing = len(p["samples"]), sum(1 for x in p["samples"] if not _sample_vec(x))
+    return f"{n} sample(s), {missing} without voiceprint" if missing else f"{n} sample(s)"
 
 def _tag(s: dict, p: dict, guess: str = "") -> str: return str(_opt(s, "speaker_tag_format")).format(name=p["name"], code=p.get("code", ""), role=p.get("role", ""), guess=guess)
 
@@ -115,8 +126,8 @@ async def _embed(s: dict, audio_b64: str) -> dict:
 
 # --- Settings (per conversation) ---
 
-def _conn_opts(capability):
-    def _opts(values=None): return [("", "(pool / first available)")] + [(c["_id"], c.get("display_name", c["_id"])) for c in AIM.connections.conns_matching(capability)]
+def _conn_opts(capability: str, key: str):
+    def _opts(values=None): return _listed(values, key, [(c["_id"], c.get("display_name", c["_id"])) for c in AIM.connections.conns_matching(capability)], "(pool / first available)", note=f"saved - no connection with this id declares {capability}")
     return _opts
 
 def _conn_for(values, key: str, capability: str):
@@ -125,9 +136,9 @@ def _conn_for(values, key: str, capability: str):
     return AIM.connections.get_conn(cid) if cid else next(iter(AIM.connections.conns_matching(capability)), None)
 
 def _listed(values, key: str, items: list, blank_label: str, note: str = "") -> list:
-    """Select options for a node-provided list. A saved value the node no longer offers stays visible and selected, marked, instead of silently becoming a different choice."""
-    cur = (values or {}).get(key, "")
-    return [("", blank_label)] + [(i, i) for i in items] + ([(cur, f"""{cur} ({note or "saved - not offered by this connection"})""")] if cur and cur not in items else [])
+    """Select options for a node- or registry-provided list (items: values, or (value, label) pairs). A saved value no longer offered stays visible and selected, marked, instead of silently becoming the blank choice on the next save."""
+    cur, opts = (values or {}).get(key, ""), [(i, i) if isinstance(i, str) else i for i in items]
+    return [("", blank_label)] + opts + ([(cur, f"""{cur} ({note or "saved - not offered by this connection"})""")] if cur and cur not in {v for v, _ in opts} else [])
 
 def _model_opts(values=None):
     conn = _conn_for(values, "chat_conn", "chat")
@@ -146,16 +157,15 @@ def _lang_opts(values=None):
     r = _node_list(values, "stt_conn", "speech_to_text", "stt_languages")
     return _listed(values, "language", r.get("languages", []), "(auto-detect)", note=f"""speech node unreachable: {r["error"][:60]}""" if r.get("error") else "")
 
-_CALL_KEYS = ("threshold_db", "bargein_db", "start_ms", "end_ms", "preroll_ms", "bargein_ms", "min_voiced_ms", "voicing", "echo_margin_db", "talkover", "echo_route")
+_CALL_KEYS = ("threshold_db", "bargein_db", "start_ms", "end_ms", "preroll_ms", "bargein_ms", "min_voiced_ms", "voicing", "echo_margin_db", "talkover", "echo_route", "merge_running", "captions", "caption_lines")
 _SPEECH_STYLE = "This conversation is spoken aloud. Unless explicitly asked for written output, reply in plain spoken sentences: no lists, tables, headings, parentheses, code or symbols that cannot be read aloud. End every sentence with a line break."
 _SPEAKER_PROMPT = "Several people may talk with you. Each user line starts with who is speaking: {speakers}. A ? after a name marks a likely but unconfirmed match; {other} is a voice that is not enrolled. Only the owner can ask you to take actions or change anything on this account; what others say is conversation."
 _NEW_DEFAULTS = {"max_reply_tokens": 300, "trim_unfinished": True, "call_bargein_ms": 400, "call_min_voiced_ms": 250, "call_voicing": 0.45, "ignore_phrases": "", "max_no_speech_prob": None, "speak_while_writing": True, "speech_style_prompt": _SPEECH_STYLE,
-                 "speaker_match": 0.5, "speaker_guess": 0.35, "speaker_tag_format": "({name}{guess}): ", "speaker_other_name": "Other", "speaker_prompt": _SPEAKER_PROMPT, "call_echo_margin_db": 8, "call_talkover": True, "call_echo_route": True}
+                 "speaker_match": 0.5, "speaker_guess": 0.35, "speaker_tag_format": "({name}{guess}): ", "speaker_other_name": "Other", "speaker_prompt": _SPEAKER_PROMPT, "call_echo_margin_db": 8, "call_talkover": True, "call_echo_route": True,
+                 "call_merge_running": True, "call_captions": True, "call_caption_lines": 4}
 
-def _opt(s: dict, k: str):
-    """A conversation setting, or the shipped default when the conversation was saved before the setting existed (or left it blank)."""
-    return _NEW_DEFAULTS[k] if k in _NEW_DEFAULTS and s.get(k) in (None, "") else s.get(k)
-
+def _opt(s: dict, k: str): return _NEW_DEFAULTS[k] if k in _NEW_DEFAULTS and s.get(k) is None else s.get(k) # A conversation setting, or the shipped default when the conversation was saved before the setting existed. A blank value is kept: blank text means nothing (blank numbers already parse to their field default).
+  
 _TRIM_UNFINISHED = """input[:max(input.rfind(c) for c in ".!?\u2026") + 1] if len(input) >= {cut} and max(input.rfind(c) for c in ".!?\u2026") > 0 else input"""   # transform expr: a reply near the cap ends at its last . ! ? or ellipsis; shorter replies pass unchanged
 
 def _tune_flow(flow: dict, s: dict) -> dict:
@@ -197,15 +207,16 @@ def _build_fields():
     return BI.SettingsGroup("voice", "", [
         F("consent_prefix", "System Prompt Prefix (consent / standing terms)", "textarea", "", hint="Sent first, before the system prompt, on every turn. It stays in the model's prompt cache, so after the first turn it costs almost nothing - see Prepare."),
         F("system_prompt", "System Prompt", "textarea", "You are a friendly voice assistant. Answer in short, natural spoken sentences - no lists, tables or code unless asked."),
-        F("chat_conn", "Chat Connection", "select", "", options=_conn_opts("chat"), **refresh),
+        F("chat_conn", "Chat Connection", "select", "", options=_conn_opts("chat", "chat_conn"), **refresh),
+        F("tts_conn", "Text-to-Speech Connection", "select", "", options=_conn_opts("text_to_speech", "tts_conn"), **refresh),
+        F("stt_conn", "Speech-to-Text Connection", "select", "", options=_conn_opts("speech_to_text", "stt_conn"), advanced=True, **refresh),
+        F("speaker_conn", "Speaker Identification Connection", "select", "", options=_conn_opts("speaker_embed", "speaker_conn"), advanced=True),
         F("model", "Model", "select", "", options=_model_opts),
-        F("tts_conn", "Text-to-Speech Connection", "select", "", options=_conn_opts("text_to_speech"), **refresh),
         F("voice", "Voice", "select", "", options=_voice_opts),
         F("speak_replies", "Speak replies", "checkbox", True),
         F("language", "Spoken Language", "select", "", options=_lang_opts),
         F("keep_recordings", "Keep my recordings (replayable in the conversation)", "checkbox", True, hint="Off: your audio is transcribed and discarded; only the text is kept."),
-        F("pipeline_id", "Pipeline", "select", "", options=lambda values=None: [("", "(built-in: transcribe -> generate -> speak)")] + [(p["id"], p.get("name", p["id"])) for p in AIM.engine.list_pipelines()], advanced=True, hint="A saved pipeline must follow the key convention: in audio_b64 or transcript + history, out transcript / reply / reply_audio."),
-        F("stt_conn", "Speech-to-Text Connection", "select", "", options=_conn_opts("speech_to_text"), advanced=True, **refresh),
+        F("pipeline_id", "Pipeline", "select", "", options=lambda values=None: _listed(values, "pipeline_id", [(p["id"], p.get("name", p["id"])) for p in AIM.engine.list_pipelines()], "(built-in: transcribe -> generate -> speak)", note="saved - pipeline no longer exists"), advanced=True, hint="A saved pipeline must follow the key convention: in audio_b64 or transcript + history, out transcript / reply / reply_audio."),
         F("length_scale", "Speaking Pace (length scale, >1 slower)", "number", None, advanced=True),
         F("num_ctx", "Context Window Tokens", "number", 16384, step=1, advanced=True),
         F("history_chars", "History Carried Into Each Turn (chars)", "number", 8000, step=1, advanced=True),
@@ -227,8 +238,10 @@ def _build_fields():
         F("call_talkover", "Call: Talking Over a Reply Pauses It", "checkbox", True, hint="Off = half-duplex: while a reply plays the mic is ignored (the most robust setting on a loudspeaker)."),
         F("call_echo_route", "Call: Route Replies Through Echo Cancellation", "checkbox", True, advanced=True, hint="Plays replies through a local WebRTC loopback so the browser's echo canceller knows what the speaker is playing. Off = plain audio elements."),
         F("call_echo_margin_db", "Call: Echo Gate Margin (dB over the learned echo, 0 = off)", "number", 8, advanced=True, hint="While a reply plays, the mic must exceed the echo level learned from the speaker output by this much to count as talking over it. Raise if replies still interrupt themselves."),
+        F("call_merge_running", "Call: Talking Again Before the Reply Is Spoken Continues Your Turn", "checkbox", True, advanced=True, hint="A pause mid-thought sends what you said so far; if you go on talking while that reply is still being written, it is cut and both parts are answered together. Off = every utterance gets its own reply."),
+        F("call_captions", "Captions for Spoken Replies", "checkbox", True, hint="Shows each sentence above the input as it is spoken - including sentences the speech node could not speak."),
+        F("call_caption_lines", "Caption Lines Kept", "number", 4, step=1, advanced=True),
         F("identify_speakers", "Identify Speakers (voiceprints)", "checkbox", False, hint="Prefixes each spoken turn with who said it, e.g. (Joshua): ... Enroll voices under Speakers. Needs speaker_id.py on the speech node."),
-        F("speaker_conn", "Speaker Identification Connection", "select", "", options=_conn_opts("speaker_embed"), advanced=True),
         F("speaker_match", "Same Person At Or Above (cosine 0-1)", "number", 0.5, advanced=True, hint="Same voice usually scores 0.6-0.8, different voices under 0.3. The score shows in the status line after each turn."),
         F("speaker_guess", "Likely Match At Or Above", "number", 0.35, advanced=True, hint="Between this and the match threshold the name gets a ? mark."),
         F("speaker_tag_format", "Speaker Tag Format", "text", "({name}{guess}): ", advanced=True, hint="Fields {name} {code} {role} {guess}. '({code}): ' uses number signatures; the system prompt lists what each means."),
@@ -328,18 +341,20 @@ def _list_html(username: str, active: str) -> str:
 def _main_html(doc: dict, username: str, status: str = "") -> str:
     sid = doc["id"]
     return f"""<div class="voice-head"><b>{UI.escape(doc["title"])}</b>
-                   <details class="status-details" {"open" if status else ""}><summary>Settings</summary><form {_post("settings_save", sid=sid)} hx-include="this" class="node-form"><div id="voice-settings-fields">{_FIELDS.render(doc["settings"], name_prefix="vs_")}</div><div class="form-actions"><button type="submit" class="ui-btn">Save</button><button type="button" class="ui-btn" {_post("save_flow", sid=sid)}>Save built-in flow as pipeline</button><span id="voice-saved"></span></div></form></details>
+                   <details class="status-details" {"open" if status else ""}><summary>Settings</summary><form {_post("settings_save", sid=sid)} hx-include="this" hx-trigger="change delay:300ms, submit" class="node-form"><div id="voice-settings-fields">{_FIELDS.render(doc["settings"], name_prefix="vs_")}</div><div class="form-actions"><button type="submit" class="ui-btn">Save</button><button type="button" class="ui-btn" {_post("save_flow", sid=sid)}>Save built-in flow as pipeline</button><span id="voice-saved"></span></div></form></details>
                    <details class="status-details"><summary>Speakers</summary><div id="voice-speakers">{_speakers_html(username)}</div></details>
                    <div class="form-actions"><button class="ui-btn" {_post("prepare", sid=sid)} title="Loads the model and caches the system prompt so the first real turn starts fast">Prepare</button><button class="ui-btn" {_post("new")} title="Starts a fresh conversation with these settings; this one stays in the list">Restart conversation</button><span id="voice-status">{status}</span></div></div>
                <div class="voice-chat">{CM.shell(sid, messages=[_msg(t, username) for t in doc["turns"]], viewer_name=username, voice_opts=_call_cfg(doc["settings"]))}</div>"""
 
+def _rebuild_btn(p: dict, armed) -> str: return f"""<button class="ui-btn" {_post("spk_rebuild", pid=p["id"])} {"disabled" if armed else ""} title="Measure this person's kept recordings again - after a speaker-model change, or for samples without a voiceprint">Rebuild</button>""" if any(isinstance(x, dict) for x in p["samples"]) else ""
+
 def _speakers_html(username: str, note: str = "") -> str:
     armed = _ENROLL.get(username)
     roles = lambda p: "".join(f"""<option value="{k}" {"selected" if p.get("role") == k else ""}>{UI.escape(v)}</option>""" for k, v in SPEAKER_ROLES)
-    rows = "".join(f"""<div class="voice-spk-row"><b>{UI.escape(p["name"])}</b><span class="status-label">({p.get("code", "")})</span><select name="role" {_post("spk_role", pid=p["id"])} hx-trigger="change" hx-include="this">{roles(p)}</select><span class="status-label">{len(p.get("samples", []))} sample(s)</span><button class="ui-btn" {_post("spk_sample", pid=p["id"])} {"disabled" if armed else ""}>Record sample</button><button class="btn-icon" style="color:#ff5f5f" {_post("spk_delete", pid=p["id"])} hx-confirm="Delete this voice profile and its voiceprints?">&#x2715;</button></div>""" for p in _spk(username)["profiles"])
+    rows = "".join(f"""<div class="voice-spk-row"><b>{UI.escape(p["name"])}</b><span class="status-label">({p.get("code", "")})</span><select name="role" {_post("spk_role", pid=p["id"])} hx-trigger="change" hx-include="this">{roles(p)}</select><span class="status-label">{_sample_note(p)}</span><button class="ui-btn" {_post("spk_sample", pid=p["id"])} {"disabled" if armed else ""}>Record sample</button>{_rebuild_btn(p, armed)}<button class="btn-icon" style="color:#ff5f5f" {_post("spk_delete", pid=p["id"])} hx-confirm="Delete this voice profile, its voiceprints and its recordings?">&#x2715;</button></div>""" for p in _spk(username)["profiles"])
     wait = f"""<div class="voice-spk-note">Next recording is a voice sample for <b>{UI.escape((_spk_get(_spk(username), armed) or {}).get("name", "?"))}</b>: hold the mic and speak naturally for 5-10 s. <button class="ui-btn" {_post("spk_cancel")}>Cancel</button></div>""" if armed else ""
     form = f"""<form class="voice-spk-row" {_post("spk_add")} hx-include="this"><input name="name" placeholder="Name" required><select name="role">{roles({"role": "trusted"})}</select><button type="submit" class="ui-btn" {"disabled" if armed else ""}>Add and record a sample</button></form>"""
-    return f"""{rows or '<div class="list-empty">No voices enrolled.</div>'}{wait}{form}<div class="status-label">Voiceprints only (numbers derived from the samples); recordings used for enrollment are not kept. 3+ samples per person, in the rooms you use, work best.{" " + note if note else ""}</div>"""
+    return f"""{rows or '<div class="list-empty">No voices enrolled.</div>'}{wait}{form}<div class="status-label">Voiceprints and the recordings they come from are kept on this portal, under this login only; deleting a profile deletes both. 3+ samples per person, in the rooms you use, work best.{" " + note if note else ""}</div>"""
 
 def _side_html(username: str, doc: dict) -> str: return f"""<div class="list-panel voice-side"><div class="list-panel-hd"><span class="list-panel-title">Conversations</span><button class="btn-icon" {_post("new")}>+</button></div><div id="voice-list" class="list-body">{_list_html(username, doc["id"])}</div></div>"""
 
@@ -372,12 +387,14 @@ async def _h_delete(request, payload, imr):
     return _refresh(imr, request.state.user.username, await _active(request))
 
 async def _h_settings_save(request, payload, imr):
-    """Saves, then re-renders the conversation so footer-level options (call detection) take effect. An open call is ended by the re-render - start it again to use the new values."""
+    """Saves on every form change and on Save, and makes these settings this login's defaults for new conversations.
+    Re-renders the conversation only when call-detection values changed - they live in the footer, and an open call ends with that re-render (start it again to use them)."""
     doc = _owned(request, payload.get("sid", ""))
     if not doc: return imr
-    doc["settings"] = _FIELDS.parse(payload, name_prefix="vs_")
-    _save(doc)
-    return _refresh(imr, request.state.user.username, doc, '<span class="status-label">&#x2713; Saved</span>')
+    old, doc["settings"] = _call_cfg(doc["settings"]), _FIELDS.parse(payload, name_prefix="vs_")
+    _save(doc); _save_defaults(doc["username"], doc["settings"])
+    if _call_cfg(doc["settings"]) != old: return _refresh(imr, request.state.user.username, doc, '<span class="status-label">&#x2713; Saved</span>')
+    return imr.oob('<span class="status-label">&#x2713; Saved</span>', "voice-saved")
 
 async def _h_save_flow(request, payload, imr):
     doc = _owned(request, payload.get("sid", ""))
@@ -386,7 +403,7 @@ async def _h_save_flow(request, payload, imr):
     AIM.engine.save_pipeline(pl)
     return imr.oob(f"""<span class="status-label">&#x2713; Saved as pipeline {pl["id"]} - edit it in a pipeline builder, then pick it as this conversation's Pipeline.</span>""", "voice-saved")
 
-async def _h_settings_refresh(request, payload, imr): return imr.raw(_FIELDS.render(_FIELDS.parse(payload, name_prefix="vs_"), name_prefix="vs_"))   # main swap into #voice-settings-fields (the select carries hx-target); unsaved edits ride along in the payload
+async def _h_settings_refresh(request, payload, imr): return imr.oob(_FIELDS.render(_FIELDS.parse(payload, name_prefix="vs_"), name_prefix="vs_"), "voice-settings-fields")   # OOB: the select inherits the settings form's hx-swap="none", so a main swap never lands; unsaved edits ride along in the payload
 
 async def _h_prepare(request, payload, imr):
     """One short generation with the real system prompt, model and context size: loads the model and fills its prompt cache, so the first spoken turn only processes the new words. The reply is not added to the conversation."""
@@ -446,13 +463,16 @@ async def _stop_unless_talked_over(job_id: str):
     _STOP_ASKED.pop(job_id, None)
 
 async def _enroll(username: str, s: dict, audio_b64: str, imr):
-    """The recording armed by Record sample: its voiceprint joins the profile and the profile's mean is recomputed. The audio itself is not stored."""
+    """The recording armed by Record sample: kept as audio/<login>/spk_<profile>_<id>.wav, measured, and its voiceprint joins the profile's mean.
+    A failed measurement still keeps the recording, so Rebuild can measure it once the speaker connection works."""
     pid, r = _ENROLL.pop(username), await _embed(s, audio_b64)
-    doc = _spk(username); p = _spk_get(doc, pid)
-    if r.get("error") or not p: return imr.oob(_speakers_html(username, f"""<span class="err-box">Sample not added: {UI.escape(r.get("error") or "profile was deleted")}</span>"""), "voice-speakers")
-    p["samples"].append(r["embedding"]); p["embedding"] = _mean(p["samples"])
+    doc = _spk(username); p = _spk_get(doc, pid)   # read after the measurement, so a change made meanwhile is not overwritten
+    if not p: return imr.oob(_speakers_html(username, '<span class="err-box">Sample not added: the profile was deleted</span>'), "voice-speakers")
+    p["samples"].append({"audio": _write_audio(username, f"spk_{pid}_{uuid.uuid4().hex[:6]}", audio_b64), "embedding": None if r.get("error") else r["embedding"]})
+    p["embedding"] = _voiceprint(p)
     _spk_save(username, doc)
-    return imr.oob(_speakers_html(username, f"""&#x2713; Sample {len(p["samples"])} added for {UI.escape(p["name"])} ({r.get("duration_s", 0)} s)."""), "voice-speakers")
+    note = f"""<span class="err-box">Recording kept, but no voiceprint was made: {UI.escape(r["error"])} - press Rebuild once the speaker connection works.</span>""" if r.get("error") else f"""&#x2713; Sample {len(p["samples"])} added for {UI.escape(p["name"])} ({r.get("duration_s", 0)} s)."""
+    return imr.oob(_speakers_html(username, note), "voice-speakers")
 
 async def _h_spk_add(request, payload, imr):
     username, name = request.state.user.username, str(payload.get("name", "")).strip()
@@ -474,10 +494,33 @@ async def _h_spk_role(request, payload, imr):
     return imr.oob(_speakers_html(username), "voice-speakers")
 
 async def _h_spk_delete(request, payload, imr):
-    username = request.state.user.username; doc = _spk(username)
-    doc["profiles"] = [p for p in doc["profiles"] if p["id"] != payload.get("pid")]; _spk_save(username, doc)
+    username = request.state.user.username; doc = _spk(username); p = _spk_get(doc, payload.get("pid", ""))
+    if p:
+        for x in p["samples"]:
+            if isinstance(x, dict): _audio_path(username, x["audio"]).unlink(missing_ok=True)
+        doc["profiles"].remove(p); _spk_save(username, doc)
     if _ENROLL.get(username) == payload.get("pid"): _ENROLL.pop(username)
     return imr.oob(_speakers_html(username), "voice-speakers")
+
+async def _h_spk_rebuild(request, payload, imr):
+    """Measures every kept recording of a profile again with the active conversation's speaker connection and replaces those voiceprints - after a speaker-model change, or for samples whose measurement failed.
+    A recording that fails keeps its previous voiceprint; bare voiceprints (no recording) are left as they are."""
+    username, pid = request.state.user.username, payload.get("pid", "")
+    s, p = (await _active(request))["settings"], _spk_get(_spk(username), pid)
+    if not p: return imr.oob(_speakers_html(username), "voice-speakers")
+    new, failed = {}, []
+    for x in (x for x in p["samples"] if isinstance(x, dict)):
+        r = await _embed(s, base64.b64encode(_audio_path(username, x["audio"]).read_bytes()).decode())
+        if r.get("error"): failed.append(r["error"])
+        else: new[x["audio"]] = r["embedding"]
+    doc = _spk(username); p = _spk_get(doc, pid)   # re-read: samples recorded during the measurements stay
+    if not p: return imr.oob(_speakers_html(username), "voice-speakers")
+    for x in p["samples"]:
+        if isinstance(x, dict) and x["audio"] in new: x["embedding"] = new[x["audio"]]
+    p["embedding"] = _voiceprint(p)
+    _spk_save(username, doc)
+    note = f"""&#x2713; {len(new)} voiceprint(s) rebuilt for {UI.escape(p["name"])}.""" + (f""" <span class="err-box">{len(failed)} failed: {UI.escape(failed[0])}</span>""" if failed else "")
+    return imr.oob(_speakers_html(username, note), "voice-speakers")
 
 # --- Init / routes ---
 
@@ -491,11 +534,11 @@ def init_tool(env: dict, prefix: str):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     SPEAKER_DIR.mkdir(parents=True, exist_ok=True)
+    DEFAULTS_DIR.mkdir(parents=True, exist_ok=True)
     _FIELDS = _build_fields()
     IM = env["InterfaceManager"](nesting_level=2, db_path="voice_im.db")
     CM = BI.ChatManager(namespace="voice", base_url=prefix, view_style="bubble", stream_toggle=False, think_toggle=False, stop_enabled=True, pin_enabled=True, allow_edit=False, allow_delete=False, allow_copy=True, show_info=False, markdown_mode="standard", placeholder="Type, hold \U0001F3A4 to talk, or \u260E for a hands-free call (Ctrl+Enter sends)", branch_id=IM.branch_id, nesting_level=2, intent_name="voice_text", voice=True, audio_intent="voice_audio")
-    IM.scripts.update({f"voice_{k}": [fn] for k, fn in {"new": _h_new, "open": _h_open, "delete": _h_delete, "settings_save": _h_settings_save, "save_flow": _h_save_flow, "text": _h_text, "audio": _h_audio, "stop": _h_stop, "settings_refresh": _h_settings_refresh, "prepare": _h_prepare,
-                       "spk_add": _h_spk_add, "spk_sample": _h_spk_sample, "spk_cancel": _h_spk_cancel, "spk_role": _h_spk_role, "spk_delete": _h_spk_delete}.items()})
+    IM.scripts.update({f"voice_{k}": [fn] for k, fn in {"new": _h_new, "open": _h_open, "delete": _h_delete, "settings_save": _h_settings_save, "save_flow": _h_save_flow, "text": _h_text, "audio": _h_audio, "stop": _h_stop, "settings_refresh": _h_settings_refresh, "prepare": _h_prepare, "spk_add": _h_spk_add, "spk_sample": _h_spk_sample, "spk_cancel": _h_spk_cancel, "spk_role": _h_spk_role, "spk_delete": _h_spk_delete, "spk_rebuild": _h_spk_rebuild}.items()})
     print("[voice] ready")
 
 @router.get("")

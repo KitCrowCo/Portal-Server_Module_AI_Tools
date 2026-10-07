@@ -173,8 +173,11 @@ def _sub_scores(perf, model, hw, target_tps, speed_curve="cap"):
     needed = perf.get("total_mem_gb", 0)
     pop_raw = max(model.get("likes", 0) / 50.0, (model.get("downloads", 0) or 0) / 5000.0)
     intel_raw = _compute_intelligence(model.get("lb_detail", {}))  # 0-100 scale, or 0 if no fine-grained benchmarks matched
-    intel = intel_raw / 100.0 if intel_raw > 0 else raw_avg  # FIX: was stored un-normalized (0-100) against every other 0-1 dim, and fell to 0 with no fallback when lb_detail was empty even though leaderboard_avg had already been resolved
-    return {"lb_avg": round(lb_avg, 4), "quant_qual": round(perf.get("quality_idx", 0.0), 4), "speed": round(_speed_score(tps, target_tps, speed_curve), 4),
+    intel = intel_raw / 100.0 if intel_raw > 0 else raw_avg
+    return {"lb_avg": round(lb_avg, 4), "quant_qual": round(perf.get("quality_idx", 0.0), 4), "speed": round(_speed_score(tps, target_tps, speed_curve), 4),"mem_head": round(max(0.0, (tm - used) / max(tm, 1.0)), 4),
+            "ctx_fit": round(min(needed, vt) / max(needed, 0.001) if needed > 0 else 1.0, 4),
+            "popularity": round(min(pop_raw / 16.0, 1.0), 4),
+            "intel": round(intel, 4)}
 
 def _total_score(sub, weights): return round(sum(sub.get(d, 0) * weights.get(d, DEFAULT_WEIGHTS.get(d, 1)) for d in SCORE_DIMS) / max(sum(weights.get(d, DEFAULT_WEIGHTS.get(d, 1)) for d in SCORE_DIMS), 0.001), 4)
 
