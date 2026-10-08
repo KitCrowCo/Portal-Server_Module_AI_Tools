@@ -23,10 +23,11 @@ AUDIO_DIR = DATA_DIR / "audio"
 SPEAKER_DIR = DATA_DIR / "speakers"   # one file per login: enrolled voice profiles (voiceprints + the names of their sample recordings, kept under audio/<login>/)
 DEFAULTS_DIR = DATA_DIR / "defaults"  # one file per login: the settings a conversation starts from when there is none to copy (written by every settings save)
 MEMORY_DIR = DATA_DIR / "memory"      # one file per login: things to remember, sent with every turn's system prompt when Use Memory is on
+BACKUP_DIR = DATA_DIR / "backups"     # one folder per login: a full bundle written before every import
 _DONE = ("done", "error", "stopped", "interrupted")
 ENV = {}
 PREFIX = ""
-UI = WS = IM = BI = AIM = CM = _FIELDS = None
+UI = WS = IM = BI = AIM = CM = _FIELDS = BUNDLE = None
 _TURNS: dict = {}        # chat id -> job id of the turn running in it now (the one that owns the chat's working indicator and live text)
 _ENDED: dict = {}        # job id -> asyncio.Event set when that turn's watcher has finished
 _ENROLL: dict = {}       # username -> speaker profile id: that login's next recording is a voice sample for the profile, not a turn
@@ -110,9 +111,12 @@ def _sample_note(p: dict) -> str:
     n, missing = len(p["samples"]), sum(1 for x in p["samples"] if not _sample_vec(x))
     return f"{n} sample(s), {missing} without voiceprint" if missing else f"{n} sample(s)"
 
-def _new_profile(doc: dict, name: str, role: str) -> dict:
+def _free_code(doc: dict) -> str:
     used = {p.get("code") for p in doc["profiles"]}
-    p = {"id": f"sp_{uuid.uuid4().hex[:8]}", "name": name, "code": next(c for c in (f"{random.randrange(1000, 10000)}" for _ in iter(int, 1)) if c not in used and c != "0000"), "role": role if role in dict(SPEAKER_ROLES) else "guest", "samples": [], "embedding": [], "created": datetime.utcnow().isoformat()}
+    return next(c for c in (f"{random.randrange(1000, 10000)}" for _ in iter(int, 1)) if c not in used and c != "0000")
+
+def _new_profile(doc: dict, name: str, role: str) -> dict:
+    p = {"id": f"sp_{uuid.uuid4().hex[:8]}", "name": name, "code": _free_code(doc), "role": role if role in dict(SPEAKER_ROLES) else "guest", "samples": [], "embedding": [], "created": datetime.utcnow().isoformat()}
     doc["profiles"].append(p)
     return p
 
@@ -236,6 +240,52 @@ def _memory_html(username: str) -> str:
 
 def _memory_oob(username: str) -> str: return f"""<div id="voice-memory" hx-swap-oob="innerHTML">{_memory_html(username)}</div>"""
 
+# --- Bundle parts (built_ins.DataBundle does the transfer; these say what each part holds) ---
+
+def _owned_doc(username: str, ctx: dict) -> dict:
+    doc = _load(ctx["sid"])
+    if doc["username"] != username: raise PermissionError("voice bundle: that conversation belongs to another login")
+    return doc
+
+def _settings_out(username: str, ctx: dict) -> dict: return {"settings": _owned_doc(username, ctx)["settings"], "defaults": json.loads(_def_path(username).read_text()) if _def_path(username).exists() else {}}
+
+def _settings_in(username: str, ctx: dict, data: dict, replace: bool) -> str:
+    doc = _owned_doc(username, ctx)
+    doc["settings"] = dict(data["settings"]) if replace else {**doc["settings"], **data["settings"]}; _save(doc)
+    cur = {} if replace or not _def_path(username).exists() else json.loads(_def_path(username).read_text())
+    _save_defaults(username, {**cur, **(data.get("defaults") or {})})
+    return "settings"
+
+def _speakers_out(username: str, ctx: dict) -> dict:
+    spk = _spk(username); names = [x["audio"] for p in spk["profiles"] for x in p["samples"] if isinstance(x, dict)]
+    return {"profiles": spk["profiles"], "recordings": {n: base64.b64encode(_audio_path(username, n).read_bytes()).decode() for n in names if _audio_path(username, n).exists()}, "missing_recordings": [n for n in names if not _audio_path(username, n).exists()]}
+
+def _speakers_in(username: str, ctx: dict, data: dict, replace: bool) -> str:
+    """Voices merge by name: new samples are added and existing recordings kept; replace starts from no profiles (old recording files stay on disk)."""
+    for name, b64 in (data.get("recordings") or {}).items():
+        f = _audio_path(username, name)
+        if not f.exists(): f.parent.mkdir(parents=True, exist_ok=True); f.write_bytes(base64.b64decode(b64))
+    cur = {"profiles": []} if replace else _spk(username)
+    for q in data["profiles"]:
+        p = next((p for p in cur["profiles"] if p["name"].lower() == q["name"].lower()), None)
+        if not p:
+            if q.get("code") in {x.get("code") for x in cur["profiles"]}: q["code"] = _free_code(cur)
+            cur["profiles"].append(q); continue
+        have = {x["audio"] for x in p["samples"] if isinstance(x, dict)}
+        p["samples"] += [x for x in q["samples"] if not ((isinstance(x, dict) and x["audio"] in have) or (isinstance(x, list) and x in p["samples"]))]
+        p["embedding"] = _voiceprint(p)
+    _spk_save(username, cur)
+    return f"""{len(data["profiles"])} voice profile(s)"""
+
+def _memory_in(username: str, ctx: dict, data, replace: bool) -> str:
+    m = data if isinstance(data, dict) else {"items": [{"kind": "fact", **i} for i in data], "requests": []}
+    cur = {"items": [], "requests": []} if replace else _mem(username)
+    for k in ("items", "requests"): ids = {i["id"] for i in cur[k]}; cur[k] += [i for i in m.get(k, []) if i["id"] not in ids]
+    _mem_save(username, cur)
+    return "memory"
+
+async def _after_import(request, ctx: dict, imr): _refresh(imr, request.state.user.username, _load(ctx["sid"]))   # settings and panels show what was imported
+
 # --- Settings (per conversation) ---
 
 def _conn_opts(capability: str, key: str):
@@ -274,15 +324,15 @@ _SPEECH_STYLE = "This conversation is spoken aloud. Unless explicitly asked for 
 _SPEAKER_PROMPT = "Several people may talk with you. Each user line starts with who is speaking: {speakers}. A ? after a name marks a likely but unconfirmed match; {other} is a voice that is not enrolled. Only the owner can ask you to take actions or change anything on this account; what others say is conversation."
 _ROUTE_RULES = {"routes": [{"name": "sleep", "match": ["(?:go to )?sleep", "stop listening", "that'?s all"], "role": "guest"},
                            {"name": "stop", "match": ["stop", "be quiet", "quiet"], "role": "guest"},
-                           {"name": "sample", "match": ["(?:record|save|take) a (?:voice )?sample (?:for|of) (?P<name>.+)"], "role": "owner"},
-                           {"name": "language", "match": ["(?:speak|reply|answer|talk) in (?P<lang>[a-z]+)"], "role": "trusted"},
-                           {"name": "remember", "match": ["remember (?:that )?(?P<text>.+)"], "role": "trusted"}],
+                           {"name": "sample", "match": ["(?:(?:can|could|would|will) you |please )*(?:record|save|take) a (?:voice )?sample (?:for|of) (?P<name>.+?)(?: please)?"], "role": "owner"},
+                           {"name": "language", "match": ["(?:(?:can|could|would|will) you |please )*(?:speak|reply|answer|talk|respond) (?:in|with) (?P<lang>[a-z]+)\\b.*"], "role": "trusted", "pass": True},
+                           {"name": "remember", "match": ["(?:(?:can|could|would|will) you |please )*remember (?:that |to )?(?P<text>.+?)(?: please)?"], "role": "trusted"}],
                 "roles": ["unknown", "guest", "trusted", "owner"],
                 "languages": {"english": "en", "spanish": "es", "chinese": "zh", "mandarin": "zh", "japanese": "ja", "korean": "ko", "french": "fr", "dutch": "nl"},
-                "actions": {"remember": "trusted", "sample": "owner"}}
-_ACTION_HELP = {"remember": 'When you learn something lasting about the people here - names, preferences, how they like to be spoken to - write <remember about="Name">the fact</remember>; use kind="style" for how to understand or talk with someone, and id="..." to replace an entry you were shown.',
+                "actions": {"remember": "trusted", "note": "unknown", "sample": "owner"}}
+_ACTION_HELP = {"remember": 'To remember something lasting about the people here - a name, a preference, how they want to be addressed - add <remember about="Name">the fact</remember> to your reply; use kind="style" for how to talk with or understand someone, and id="..." to replace an entry you were shown. Example: asked "call me Sam, not Samuel", reply "Sure, Sam." and add <remember kind="style" about="Sam">Call him Sam, not Samuel.</remember>. Saying you will remember is not enough - only the tag saves it.',
                 "note": 'You have your own notes, kept for you between conversations and shown below; the owner can read them and asks before changing one. Write <note>text</note> to add one, <note id="..." action="edit">new text</note> or <note id="..." action="remove"/> to change your own, and answer a request with <note id="..." action="keep">your reason</note>, action="edit" or action="remove".',
-                "sample": 'To save the voice of the person speaking now as a sample, write <sample name="Their name"/>.'}
+                "sample": 'To save the voice of the person speaking now as a sample, add <sample name="Their name"/>.'}
 _TOOLS_PROMPT = 'Tags are read by the system and never spoken. Text in another language goes inside <lang code="xx">...</lang>, using one of these codes: {languages}; text outside tags is spoken in the default voice. {actions}'
 _NEW_DEFAULTS = {"max_reply_tokens": 300, "trim_unfinished": True, "call_bargein_ms": 400, "call_min_voiced_ms": 250, "call_voicing": 0.45, "ignore_phrases": "", "max_no_speech_prob": None, "speak_while_writing": True, "speech_style_prompt": _SPEECH_STYLE,
                  "speaker_match": 0.5, "speaker_guess": 0.35, "speaker_tag_format": "({name}{guess}): ", "speaker_other_name": "Other", "speaker_prompt": _SPEAKER_PROMPT, "call_echo_margin_db": 8, "call_talkover": True, "call_echo_route": True, "wake_fuzz": 0.8,
@@ -384,11 +434,6 @@ def _build_fields():
 
 # --- Routing (wake words, commands, model actions) ---    
 
-def _rules(s: dict) -> dict:
-    """The conversation's route rules over the shipped ones: saved routes, roles and wake words replace the shipped ones; languages and actions merge, so actions added later reach conversations saved earlier unless they were overridden."""
-    saved = _opt(s, "route_rules") or {}
-    return {**_ROUTE_RULES, **saved, "languages": {**_ROUTE_RULES["languages"], **(saved.get("languages") or {})}, "actions": {**_ROUTE_RULES["actions"], **(saved.get("actions") or {})}}
-
 def _rank(s: dict, role: str) -> int: roles = _rules(s).get("roles") or _ROUTE_RULES["roles"]; return roles.index(role) if role in roles else 0
 def _action_tags(s: dict) -> list: return list(_rules(s).get("actions") or {})
 def _lang_code(s: dict, word: str) -> str: return (_rules(s).get("languages") or {}).get(str(word).lower(), str(word).lower())
@@ -403,11 +448,19 @@ def _voice_for(s: dict) -> str:
     """The default voice: the reply language's voice when one is set and mapped, else the Voice setting."""
     return ((_opt(s, "lang_voices") or {}).get(_lang_code(s, s["reply_language"])) if s.get("reply_language") else "") or s.get("voice", "")
 
+def _rules(s: dict) -> dict:
+    """The shipped route rules with the conversation's saved ones over them: routes merge by name (a saved route with "off": true removes a shipped one), languages and actions merge by key, roles and wake words are replaced when saved."""
+    saved = _opt(s, "route_rules") or {}
+    routes = {r["name"]: r for r in _ROUTE_RULES["routes"]}
+    routes.update({r["name"]: r for r in saved.get("routes") or []})
+    return {**_ROUTE_RULES, **saved, "routes": [r for r in routes.values() if not r.get("off")], "languages": {**_ROUTE_RULES["languages"], **(saved.get("languages") or {})}, "actions": {**_ROUTE_RULES["actions"], **(saved.get("actions") or {})}}
+
 def _tools_text(s: dict) -> str:
-    """The tag instruction for this conversation: only languages that have a voice, only actions that are on. Empty when neither applies."""
+    """The tag instruction, placed last in the system prompt so no earlier style rule (no symbols in spoken replies) overrides it. Only languages that have a voice and actions that are on; empty when neither applies."""
     langs = ", ".join(sorted(_opt(s, "lang_voices") or {}))
     acts = " ".join(_ACTION_HELP[a] for a in _action_tags(s) if a in _ACTION_HELP) if _opt(s, "ai_actions") else ""
-    return str(_opt(s, "tools_prompt") or "").replace("{languages}", langs or "none (speak only the default language)").replace("{actions}", acts).strip() if langs or acts else ""
+    body = str(_opt(s, "tools_prompt") or "").replace("{languages}", langs or "none (speak only the default language)").replace("{actions}", acts).strip()
+    return f"""Tags are the one exception to the spoken-style rules above: write them exactly as shown. {body}""" if body and (langs or acts) else ""
 
 async def _run_command(username: str, sid: str, s: dict, name: str, args: dict) -> str:
     """A routed command, run by this module; returns the status text (HTML). A rule naming a command this module has no handler for says so."""
@@ -441,7 +494,7 @@ async def _run_actions(username: str, s: dict, actions: list, role: str, audio: 
 
 # --- Turn execution ---
 
-def _system(s: dict) -> str: return "\n\n".join(p for p in (str(s.get("consent_prefix") or "").strip(), str(s.get("system_prompt") or "").strip(), _tools_text(s), f"""Reply in {s["reply_language"]} unless asked otherwise.""" if s.get("reply_language") else "") if p)   # prefix first and unchanged turn to turn, so it is the cached part of every prompt
+def _system(s: dict) -> str: return "\n\n".join(p for p in (str(s.get("consent_prefix") or "").strip(), str(s.get("system_prompt") or "").strip(), f"""Reply in {s["reply_language"]} unless asked otherwise.""" if s.get("reply_language") else "") if p)   # prefix first and unchanged turn to turn, so it is the cached part of every prompt
 
 def _flow(s: dict) -> dict:
     """The built-in turn as an ordinary inline flow - 'Save as pipeline' writes exactly this, so it can be edited in the pipeline builder and selected above.
@@ -459,7 +512,10 @@ def _flow(s: dict) -> dict:
     if _opt(s, "route_turns"):
         by["stt"]["key_map"] = {"text": "heard"}
         nodes.insert(1, {"id": "route", "name": "Route", "type": "route_text", "config": {"rules_json": _rules(s), "wake_words": _opt(s, "wake_words") or "", "wake_fuzz": _opt(s, "wake_fuzz")}, "key_map": {"input": "heard", "role": "speaker_role", "text": "transcript"}, "extra_in_keys": ["awake", "speaker_role"]})
-    return _tune_flow({"nodes": [{**n, "status": "idle"} for n in nodes]}, s)
+    flow = _tune_flow({"nodes": [{**n, "status": "idle"} for n in nodes]}, s)
+    tools = _tools_text(s)
+    if tools: llm = next(n for n in flow["nodes"] if n["id"] == "llm"); llm["config"]["system_prompt"] = f"""{llm["config"]["system_prompt"]}\n\n{tools}"""   # last, after the spoken-style instruction, so that rule cannot cancel the tags
+    return flow
 
 def _history(doc: dict) -> str:
     """Prior turns as plain text, newest kept whole, oldest dropped first to fit history_chars. Appending a turn only extends the text, so the model's cached prefix stays valid."""
@@ -556,6 +612,7 @@ def _main_html(doc: dict, username: str, status: str = "") -> str:
                    <details class="status-details" {"open" if status else ""}><summary>Settings</summary><form {_post("settings_save", sid=sid)} hx-include="this" hx-trigger="change delay:300ms, submit" class="node-form"><div id="voice-settings-fields">{_FIELDS.render(doc["settings"], name_prefix="vs_")}</div><div class="form-actions"><button type="submit" class="ui-btn">Save</button><button type="button" class="ui-btn" {_post("save_flow", sid=sid)}>Save built-in flow as pipeline</button><span id="voice-saved"></span></div></form></details>
                    <details class="status-details"><summary>Speakers</summary><div id="voice-speakers">{_speakers_html(username)}</div></details>
                    <details class="status-details"><summary>Memory</summary><div id="voice-memory">{_memory_html(username)}</div></details>
+                   <details class="status-details"><summary>Backup / Transfer</summary>{BUNDLE.panel_html({"sid": sid})}</details>
                    <div class="form-actions"><button class="ui-btn" {_post("prepare", sid=sid)} title="Loads the model and caches the system prompt so the first real turn starts fast">Prepare</button><button class="ui-btn" {_post("new")} title="Starts a fresh conversation with these settings; this one stays in the list">Restart conversation</button><span id="voice-status">{status}</span></div></div>
                <div class="voice-chat">{CM.shell(sid, messages=[_msg(t, username) for t in doc["turns"]], viewer_name=username, voice_opts=_call_cfg(doc["settings"]))}</div>"""
 
@@ -600,13 +657,13 @@ async def _h_delete(request, payload, imr):
     return _refresh(imr, request.state.user.username, await _active(request))
 
 async def _h_settings_save(request, payload, imr):
-    """Saves on every form change and on Save, and makes these settings this login's defaults for new conversations.
+    """Saves on every form change and on Save, and makes these settings this login's defaults for new conversations. Values equal to the shipped defaults are not stored, so improved defaults reach existing conversations.
     Re-renders the conversation only when call-detection values changed - they live in the footer, and an open call ends with that re-render (start it again to use them)."""
     doc = _owned(request, payload.get("sid", ""))
     if not doc: return imr
     try: new = _FIELDS.parse(payload, name_prefix="vs_")
     except BI.SettingsError as e: return imr.oob(f"""<span class="err-box">Not saved - {UI.escape(str(e))}</span>""", "voice-saved")
-    old, doc["settings"] = _call_cfg(doc["settings"]), new
+    old, doc["settings"] = _call_cfg(doc["settings"]), {k: v for k, v in new.items() if not (k in _NEW_DEFAULTS and v == _NEW_DEFAULTS[k])}
     _save(doc); _save_defaults(doc["username"], doc["settings"])
     if _call_cfg(doc["settings"]) != old: return _refresh(imr, request.state.user.username, doc, '<span class="status-label">&#x2713; Saved</span>')
     return imr.oob('<span class="status-label">&#x2713; Saved</span>', "voice-saved")
@@ -766,7 +823,7 @@ async def _h_note_force(request, payload, imr):
 # --- Init / routes ---
 
 def init_tool(env: dict, prefix: str):
-    global ENV, PREFIX, UI, WS, IM, BI, AIM, CM, _FIELDS
+    global ENV, PREFIX, UI, WS, IM, BI, AIM, CM, _FIELDS, BUNDLE
     ENV, PREFIX = env, prefix
     UI = env["templates"].env.globals.get("UI")
     WS = env["ws"]
@@ -779,6 +836,7 @@ def init_tool(env: dict, prefix: str):
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     _FIELDS = _build_fields()
     IM = env["InterfaceManager"](nesting_level=2, db_path="voice_im.db")
+    BUNDLE = BI.DataBundle("voice", IM, {"settings": ("Settings (this conversation and your defaults)", _settings_out, _settings_in), "speakers": ("Voices (profiles, voiceprints, recordings)", _speakers_out, _speakers_in), "memory": ("Memory", lambda u, ctx: _mem(u), _memory_in)}, BACKUP_DIR, nesting_level=2, on_import=_after_import)
     CM = BI.ChatManager(namespace="voice", base_url=prefix, view_style="bubble", stream_toggle=False, think_toggle=False, stop_enabled=True, pin_enabled=True, allow_edit=False, allow_delete=False, allow_copy=True, show_info=False, markdown_mode="standard", placeholder="Type, hold \U0001F3A4 to talk, or \u260E for a hands-free call (Ctrl+Enter sends)", branch_id=IM.branch_id, nesting_level=2, intent_name="voice_text", voice=True, audio_intent="voice_audio")
     IM.scripts.update({f"voice_{k}": [fn] for k, fn in {"new": _h_new, "open": _h_open, "delete": _h_delete, "settings_save": _h_settings_save, "save_flow": _h_save_flow, "text": _h_text, "audio": _h_audio, "stop": _h_stop, "settings_refresh": _h_settings_refresh, "prepare": _h_prepare, "spk_add": _h_spk_add, "spk_sample": _h_spk_sample, "spk_cancel": _h_spk_cancel, "spk_role": _h_spk_role, "spk_delete": _h_spk_delete, "spk_rebuild": _h_spk_rebuild, "mem_add": _h_mem_add, "mem_delete": _h_mem_delete, "mem_edit": _h_mem_edit, "note_ask": _h_note_ask, "note_force": _h_note_force}.items()})
     print("[voice] ready")
@@ -788,7 +846,7 @@ def init_tool(env: dict, prefix: str):
 async def root(request: Request):
     doc = await _active(request)
     left = UI.toolbar(side="left", content=_side_html(request.state.user.username, doc), size="16rem", overlay=False, start_open=True, resizable=True, id="voice-left-bar", nesting_level=2)
-    return ENV["templates"].TemplateResponse(name="base.html", request=request, context={"request": request, "user": request.state.user, "nesting_level": 2, "shell_id": IM.branch_id, "toolbars": {"left": left}, "content": _page_html(request.state.user.username, doc), "extra_css": CSS + CM.CSS, "extra_script": CM.SCRIPT + SCRIPT})
+    return ENV["templates"].TemplateResponse(name="base.html", request=request, context={"request": request, "user": request.state.user, "nesting_level": 2, "shell_id": IM.branch_id, "toolbars": {"left": left}, "content": _page_html(request.state.user.username, doc), "extra_css": CSS + CM.CSS + BI.DATA_BUNDLE_CSS, "extra_script": CM.SCRIPT + BI.DATA_BUNDLE_JS + SCRIPT})
 
 @router.get("/audio/{name}")
 async def audio(request: Request, name: str):
