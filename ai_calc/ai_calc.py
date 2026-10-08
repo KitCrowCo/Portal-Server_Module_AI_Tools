@@ -126,6 +126,7 @@ def full_perf(params_b, quant, ctx, hw, kv_type=None, kv_frac=1.0, mtp_gain=1.0)
     if fits and kv_in_ram > 0 and tps > 0:
         pen = 1.0 - (kv_in_ram / total_used) * 0.20
         tps, tps_mid, mode = round(tps * pen, 2), round(tps_mid * pen, 2), mode + f" +KV({kv_in_ram:.1f}->RAM)"
+    qi, pf_s = QUANTS.get(quant, QUANTS["Q4_K_M"]), prefill_time_s(params_b, ctx, hw)
     return {**p, "tps": tps, "tps_start": p["tps"] if fits else 0.0, "tps_mid": tps_mid, "mode": mode, "kv_gb": round(kv, 3), "kv_in_vram": round(kv_in_vram, 3), "kv_in_ram": round(kv_in_ram, 3),
             "total_mem_gb": round(total_used, 2), "mem_ok": fits, "time_10k_s": round(10000 / tps, 0) if tps > 0 and fits else None, "prefill_s_full": round(pf_s, 1), "prefill_tps_avg": round(ctx / pf_s, 1) if pf_s > 0 else 0.0,
             "quality_idx": qi["quality"], "creative_ok": qi["creative_ok"], "quant": quant, "params_b": params_b, "kv_type": kv_type or DEFAULT_KV}
