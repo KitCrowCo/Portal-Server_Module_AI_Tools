@@ -21,7 +21,7 @@ router = APIRouter(redirect_slashes=False)
 DATA_DIR = Path("./data/ai_tools/voice")
 AUDIO_DIR = DATA_DIR / "audio"
 SPEAKER_DIR = DATA_DIR / "speakers"   # one file per login: enrolled voice profiles (voiceprints + the names of their sample recordings, kept under audio/<login>/)
-DEFAULTS_DIR = DATA_DIR / "defaults"  # one file per login: the settings a conversation starts from when there is none to copy (written by every settings save)
+SETTINGS_PATH = DATA_DIR / "settings.json"   # the module's settings, shared by every conversation and login and kept until changed; only values that differ from the shipped defaults are stored
 MEMORY_DIR = DATA_DIR / "memory"      # one file per login: things to remember, sent with every turn's system prompt when Use Memory is on
 BACKUP_DIR = DATA_DIR / "backups"     # one folder per login: a full bundle written before every import
 _DONE = ("done", "error", "stopped", "interrupted")
@@ -39,27 +39,40 @@ BARGE_WAIT_S, BARGE_GRACE_S = 0.25, 0.6   # how long an utterance waits for a St
 # --- Conversation storage ---
 
 def _dp(sid): return DATA_DIR / f"{Path(sid).name}.json"
-def _load(sid): return json.loads(_dp(sid).read_text()) if sid and _dp(sid).exists() else None
-def _save(doc): doc["modified"] = datetime.utcnow().isoformat(); BI.write_json_atomic(_dp(doc["id"]), doc)
-def _list(username): return sorted((d for d in (json.loads(f.read_text()) for f in DATA_DIR.glob("*.json")) if d.get("username") == username), key=lambda d: d.get("modified", ""), reverse=True)
+def _save(doc): doc["modified"] = datetime.utcnow().isoformat(); BI.write_json_atomic(_dp(doc["id"]), {k: v for k, v in doc.items() if k != "settings"})   # settings live in SETTINGS_PATH, never in a conversation
+def _list(username): return sorted((d for d in (json.loads(f.read_text()) for f in DATA_DIR.glob("*.json") if f != SETTINGS_PATH) if d.get("username") == username), key=lambda d: d.get("modified", ""), reverse=True)
 def _owned(request, sid): doc = _load(sid); return doc if doc and doc.get("username") == request.state.user.username else None
 
-def _def_path(username: str) -> Path: return DEFAULTS_DIR / f"{Path(username).name}.json"
-def _defaults(username: str) -> dict: return {**{f.name: f.default for f in _FIELDS.fields}, **(json.loads(_def_path(username).read_text()) if _def_path(username).exists() else {})}   # this login's last saved settings over the field defaults, so fields added later keep theirs
-def _spk_save(username: str, doc: dict): BI.write_json_atomic(_spk_path(username), doc, indent=1)
+def _load(sid):
+    """A conversation with the module's current settings attached as doc["settings"]. A conversation saved when each one carried its own copy keeps that copy as "old_settings" (read by nothing; kept so no saved value is lost)."""
+    if not (sid and _dp(sid).exists()): return None
+    doc = json.loads(_dp(sid).read_text())
+    if "settings" in doc: doc.setdefault("old_settings", doc.pop("settings"))
+    return {**doc, "settings": _settings()}
 
-def _new(username, settings=None) -> dict:
-    doc = {"id": f"vc_{uuid.uuid4().hex[:8]}", "username": username, "title": "New conversation", "settings": settings or _defaults(username), "turns": [], "created": datetime.utcnow().isoformat()}
+def _new(username) -> dict:
+    doc = {"id": f"vc_{uuid.uuid4().hex[:8]}", "username": username, "title": "New conversation", "turns": [], "created": datetime.utcnow().isoformat()}
     _save(doc)
-    return doc
+    return {**doc, "settings": _settings()}
 
+# --- Settings storage (module-wide) ---
+
+def _shipped() -> dict: return {**{f.name: f.default for f in _FIELDS.fields}, **_NEW_DEFAULTS}   # field defaults, with settings added after the first release at the defaults they shipped with
+def _settings() -> dict: return {**_shipped(), **json.loads(SETTINGS_PATH.read_text())}   # SETTINGS_PATH is created at init
+def _settings_put(new: dict): d = _shipped(); BI.write_json_atomic(SETTINGS_PATH, {k: v for k, v in new.items() if k not in d or v != d[k]})   # values equal to the shipped default are not stored, so improved defaults reach everyone
+
+def _settings_seed():
+    """First start after settings became module-wide: the most recently saved conversation's own settings become the module's, so nothing set before is lost. Their stored copies stay in each conversation file (as old_settings once loaded)."""
+    newest = next((d for d in sorted((json.loads(f.read_text()) for f in DATA_DIR.glob("*.json")), key=lambda d: d.get("modified", ""), reverse=True) if d.get("settings")), None)
+    _settings_put({**_shipped(), **(newest["settings"] if newest else {})})
+    
 async def _active(request) -> dict:
     """The user's active conversation, creating the first one on demand. A new conversation inherits the previous one's settings."""
     username = request.state.user.username
     doc = _owned(request, await ENV["get_state"](request, scope="user", namespace="voice", key="active_sid"))
     if not doc:
         recent = _list(username)
-        doc = recent[0] if recent else _new(username)
+        doc = _load(recent[0]["id"]) if recent else _new(username)
         await ENV["set_state"](request, doc["id"], scope="user", namespace="voice", key="active_sid")
     return doc
 
@@ -175,7 +188,7 @@ _MEM_KINDS = {"style": "How to understand and talk with the people here", "fact"
 
 def _mem_path(username: str) -> Path: return MEMORY_DIR / f"{Path(username).name}.json"
 def _mem_save(username: str, d: dict): BI.write_json_atomic(_mem_path(username), d)
-def _mem_budget(username: str) -> int: return int(_defaults(username).get("memory_chars") or 0) or 10**9   # memory is per login, so its budget comes from the login's last saved settings; 0 = no limit
+def _mem_budget(username: str) -> int: return int(_settings().get("memory_chars") or 0) or 10**9   # 0 = no limit
 def _mem_line(i: dict) -> str: return f"""- [{i["id"]}] {"(" + i["about"] + ") " if i.get("about") else ""}{i["text"]}"""
 def _now_iso() -> str: return datetime.utcnow().isoformat()
 
@@ -247,13 +260,11 @@ def _owned_doc(username: str, ctx: dict) -> dict:
     if doc["username"] != username: raise PermissionError("voice bundle: that conversation belongs to another login")
     return doc
 
-def _settings_out(username: str, ctx: dict) -> dict: return {"settings": _owned_doc(username, ctx)["settings"], "defaults": json.loads(_def_path(username).read_text()) if _def_path(username).exists() else {}}
+def _settings_out(username: str, ctx: dict) -> dict: return {"settings": json.loads(SETTINGS_PATH.read_text())}   # the stored (non-default) values
 
 def _settings_in(username: str, ctx: dict, data: dict, replace: bool) -> str:
-    doc = _owned_doc(username, ctx)
-    doc["settings"] = dict(data["settings"]) if replace else {**doc["settings"], **data["settings"]}; _save(doc)
-    cur = {} if replace or not _def_path(username).exists() else json.loads(_def_path(username).read_text())
-    _save_defaults(username, {**cur, **(data.get("defaults") or {})})
+    """Settings are module-wide, so an import changes them for every conversation. Replace starts from the shipped defaults; merge keeps current values the bundle does not name. Bundles from when settings were per conversation import the same way (their "defaults" part is not used)."""
+    _settings_put({**(_shipped() if replace else _settings()), **data["settings"]})
     return "settings"
 
 def _speakers_out(username: str, ctx: dict) -> dict:
@@ -469,10 +480,10 @@ async def _run_command(username: str, sid: str, s: dict, name: str, args: dict) 
     if name == "stop": return "Stopped."
     if name == "remember": return _mem_note(_mem_put(username, "fact", args.get("text", ""), "command"))
     if name == "language":
-        doc = _load(sid); doc["settings"]["reply_language"] = str(args.get("lang", "")).lower(); _save(doc)
-        await _push(username, f"""<div id="voice-settings-fields" hx-swap-oob="innerHTML">{_FIELDS.render(doc["settings"], name_prefix="vs_")}</div>""")   # the open settings form autosaves, so it must show the new value or it would write the old one back
-        mapped = (_opt(s, "lang_voices") or {}).get(_lang_code(s, doc["settings"]["reply_language"]))
-        return f"""Replies in {UI.escape(doc["settings"]["reply_language"])} from the next turn{"" if mapped else " (no voice is mapped for it - set Voice per Language)"}."""
+        lang = str(args.get("lang", "")).lower(); _settings_put({**_settings(), "reply_language": lang})
+        await _push(username, f"""<div id="voice-settings-fields" hx-swap-oob="innerHTML">{_FIELDS.render(_settings(), name_prefix="vs_")}</div>""")   # the open settings form autosaves, so it must show the new value or it would write the old one back
+        mapped = (_opt(s, "lang_voices") or {}).get(_lang_code(s, lang))
+        return f"""Replies in {UI.escape(lang)} from the next turn{"" if mapped else " (no voice is mapped for it - set Voice per Language)"}."""
     if name == "sample":
         p = _profile_named(username, args.get("name", ""))
         _ENROLL[username] = p["id"]
@@ -637,11 +648,10 @@ def _refresh(imr, username: str, doc: dict, status: str = ""):
 # --- Intent handlers ---
 
 async def _h_new(request, payload, imr):
-    prev = await _active(request)
-    doc = _new(request.state.user.username, dict(prev["settings"]))
+    doc = _new(request.state.user.username)
     await ENV["set_state"](request, doc["id"], scope="user", namespace="voice", key="active_sid")
     return _refresh(imr, request.state.user.username, doc)
-
+    
 async def _h_open(request, payload, imr):
     doc = _owned(request, payload.get("sid", ""))
     if not doc: return imr
@@ -657,14 +667,14 @@ async def _h_delete(request, payload, imr):
     return _refresh(imr, request.state.user.username, await _active(request))
 
 async def _h_settings_save(request, payload, imr):
-    """Saves on every form change and on Save, and makes these settings this login's defaults for new conversations. Values equal to the shipped defaults are not stored, so improved defaults reach existing conversations.
+    """Saves on every form change and on Save. Settings are module-wide and kept until changed: every conversation and login uses them. Values equal to the shipped defaults are not stored, so improved defaults still arrive.
     Re-renders the conversation only when call-detection values changed - they live in the footer, and an open call ends with that re-render (start it again to use them)."""
     doc = _owned(request, payload.get("sid", ""))
     if not doc: return imr
     try: new = _FIELDS.parse(payload, name_prefix="vs_")
     except BI.SettingsError as e: return imr.oob(f"""<span class="err-box">Not saved - {UI.escape(str(e))}</span>""", "voice-saved")
-    old, doc["settings"] = _call_cfg(doc["settings"]), {k: v for k, v in new.items() if not (k in _NEW_DEFAULTS and v == _NEW_DEFAULTS[k])}
-    _save(doc); _save_defaults(doc["username"], doc["settings"])
+    old = _call_cfg(doc["settings"])
+    _settings_put(new); doc = _load(doc["id"])
     if _call_cfg(doc["settings"]) != old: return _refresh(imr, request.state.user.username, doc, '<span class="status-label">&#x2713; Saved</span>')
     return imr.oob('<span class="status-label">&#x2713; Saved</span>', "voice-saved")
 
@@ -832,11 +842,11 @@ def init_tool(env: dict, prefix: str):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     SPEAKER_DIR.mkdir(parents=True, exist_ok=True)
-    DEFAULTS_DIR.mkdir(parents=True, exist_ok=True)
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     _FIELDS = _build_fields()
+    if not SETTINGS_PATH.exists(): _settings_seed()
     IM = env["InterfaceManager"](nesting_level=2, db_path="voice_im.db")
-    BUNDLE = BI.DataBundle("voice", IM, {"settings": ("Settings (this conversation and your defaults)", _settings_out, _settings_in), "speakers": ("Voices (profiles, voiceprints, recordings)", _speakers_out, _speakers_in), "memory": ("Memory", lambda u, ctx: _mem(u), _memory_in)}, BACKUP_DIR, nesting_level=2, on_import=_after_import)
+    BUNDLE = BI.DataBundle("voice", IM, {"settings": ("Settings (shared by every conversation)", _settings_out, _settings_in), "speakers": ("Voices (profiles, voiceprints, recordings)", _speakers_out, _speakers_in), "memory": ("Memory", lambda u, ctx: _mem(u), _memory_in)}, BACKUP_DIR, nesting_level=2, on_import=_after_import)
     CM = BI.ChatManager(namespace="voice", base_url=prefix, view_style="bubble", stream_toggle=False, think_toggle=False, stop_enabled=True, pin_enabled=True, allow_edit=False, allow_delete=False, allow_copy=True, show_info=False, markdown_mode="standard", placeholder="Type, hold \U0001F3A4 to talk, or \u260E for a hands-free call (Ctrl+Enter sends)", branch_id=IM.branch_id, nesting_level=2, intent_name="voice_text", voice=True, audio_intent="voice_audio")
     IM.scripts.update({f"voice_{k}": [fn] for k, fn in {"new": _h_new, "open": _h_open, "delete": _h_delete, "settings_save": _h_settings_save, "save_flow": _h_save_flow, "text": _h_text, "audio": _h_audio, "stop": _h_stop, "settings_refresh": _h_settings_refresh, "prepare": _h_prepare, "spk_add": _h_spk_add, "spk_sample": _h_spk_sample, "spk_cancel": _h_spk_cancel, "spk_role": _h_spk_role, "spk_delete": _h_spk_delete, "spk_rebuild": _h_spk_rebuild, "mem_add": _h_mem_add, "mem_delete": _h_mem_delete, "mem_edit": _h_mem_edit, "note_ask": _h_note_ask, "note_force": _h_note_force}.items()})
     print("[voice] ready")
