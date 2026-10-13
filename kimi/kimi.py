@@ -5,12 +5,12 @@ Sub-module of ai_tools. Mounted at /module/ai_tools/kimi.
 Sources: the shared _knowledge dir (also used by Tessa/Athena pipelines) and the server-wide _common dir.
 All LightRAG protocol logic lives in AIM.connections.lightrag_* - this module is the UI, nothing duplicated here.
 """
-import json, asyncio, docx
+import json, asyncio, docx, re
 from datetime import datetime
 from pathlib import Path
 from typing import List
-from fastapi import APIRouter, Request, Form, UploadFile, File
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Request, Form, UploadFile, File, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse
 
 TOOL_META = {"label": "Kimi", "group": "knowledge", "icon": "&#x1F4DA;", "description": "Knowledge Integration Manager Interface", "singleton": True}
 
@@ -43,7 +43,8 @@ def init_tool(env: dict, prefix: str):
         BI.SettingField("preserve_structure", "Preserve folder structure on ingest", "checkbox", True, hint="Uses the file's relative path as its source label instead of just the filename - prevents same-named files in different folders from colliding."),
         BI.SettingField("sync_enabled", "Enable scheduled sync", "checkbox", False),
         BI.SettingField("sync_window", "Sync window (24h, HH:MM-HH:MM)", "text", "02:00-08:00", hint="Watched folders are re-ingested for changed files only while the current time falls in this window."),
-    ], json_path="data/ai_tools/kimi_settings.json")])
+        BI.SettingField("sync_conn_id", "Sync Knowledge Group", "select", "", options=lambda values=None: [("", "(none - scheduled sync does nothing)")] + [(c["_id"], c.get("display_name", c["_id"])) for c in AIM.connections.list_conns(conn_type="lightrag")]),
+        BI.SettingField("sync_sourceset", "Sync Source Set (name)", "text", "", hint="A source set saved in Kimi's left panel: the files and folders the scheduled sync watches. Blank = scheduled sync does nothing.")], json_path="data/ai_tools/kimi_settings.json")])
     FM_KG = BI.FileManager(KG_DIR)
     FM_COMMON = BI.FileManager(COMMON_DIR)
     TM = BI.TabManager(namespace="kimi", tab_bar_id="kimi-tab-bar", content_id="kimi-panel", render_content_fn=_render_panel, intent_prefix="kimi", IM=IM, scope="user", nesting_level=2, allow_new=False, closable=False,
@@ -474,8 +475,13 @@ async def _h_doc_delete(request, payload, imr):
     return imr.raw(f'<div id="kimi-panel" style="height:100%;overflow:hidden">{await _panel_docs(request)}</div>')
 
 async def _h_sync_now(request, payload, imr):
-    asyncio.create_task(_run_sync_pass())
-    return imr.oob('<span style="color:var(--accent);font-size:.7rem">&#x2713; Sync started (running in background)</span>', "kg-sync-status")
+    """Re-ingests the checked files (a checked folder = every file in it) that changed since they were last synced into the SELECTED knowledge group. Runs in the background; results go to the server log."""
+    s = await _kg_state(request)
+    conn = AIM.connections.get_conn(s["conn_id"], conn_type="lightrag") if s["conn_id"] else None
+    sources = {"kg": s.get("selected_kg", []), "common": s.get("selected_common", [])}
+    if not conn or not any(sources.values()): return imr.oob('<span style="color:#ff5f5f;font-size:.7rem">Pick a knowledge group and check the files or folders to sync first.</span>', "kg-sync-status")
+    asyncio.create_task(_run_sync_pass(conn, sources))
+    return imr.oob(f"""<span style="color:var(--accent);font-size:.7rem">&#x2713; Sync started: {sum(len(v) for v in sources.values())} checked item(s) into {_esc(conn.get("display_name", conn["_id"]))} - changed files only</span>""", "kg-sync-status")
 
 def _md_to_docx(markdown_text: str, out_path: Path):
     """First-pass markdown->docx converter covering the common cases (headers, paragraphs, bold/italic, lists). Not a full transpile of every markdown extension this codebase supports - tables/images/code blocks are left for a later pass."""
@@ -513,31 +519,38 @@ def _in_window(window: str) -> bool:
         return (start <= now <= end) if start <= end else (now >= start or now <= end)
     except Exception: return False
 
-async def _run_sync_pass():
+def _sync_files(sources: dict) -> list:
+    """(prefix, file manager, file) for every checked file and every file inside a checked folder. Runs in a worker thread - a large folder must not stall the server."""
+    out = []
+    for prefix, fm in (("kg", FM_KG), ("common", FM_COMMON)):
+        for rel in sources.get(prefix, []):
+            p = fm.resolve(rel)
+            out += [(prefix, fm, f) for f in ([p] if p.is_file() else sorted(p.rglob("*")) if p.is_dir() else []) if f.is_file()]
+    return out
+
+async def _run_sync_pass(conn: dict, sources: dict):
+    """Ingests the given sources' new or changed files into conn. Changes are tracked per knowledge group, so the same file syncs separately into each group."""
     state = _load_sync_state()
-    conns = AIM.connections.list_conns(conn_type="lightrag")
-    if not conns: return
-    conn = conns[0]  # scheduled sync targets the default connection - per-connection schedules are future work
     preserve = cfg.get_group("general").load().get("preserve_structure", True)
-    for fm, prefix in ((FM_KG, "kg"), (FM_COMMON, "common")):
-        for f in fm.root.rglob("*"):
-            if not f.is_file(): continue
-            rel = str(f.relative_to(fm.root)).replace("\\","/")
-            key = f"{prefix}:{rel}"
-            mtime = f.stat().st_mtime
-            if state.get(key, 0) >= mtime: continue
-            try:
-                await AIM.connections.lightrag_insert_file(conn, rel if preserve else f.name, f.read_bytes())
-                state[key] = mtime
-            except Exception as e: print(f"[kimi] sync failed for {rel}: {e}")
+    for prefix, fm, f in await asyncio.to_thread(_sync_files, sources):
+        rel = str(f.relative_to(fm.root)).replace("\\","/")
+        key = f"""{conn["_id"]}:{prefix}:{rel}"""
+        mtime = f.stat().st_mtime
+        if state.get(key, 0) >= mtime: continue
+        try:
+            await AIM.connections.lightrag_insert_file(conn, rel if preserve else f.name, f.read_bytes())
+            state[key] = mtime
+        except Exception as e: print(f"[kimi] sync failed for {rel}: {e}")
     _save_sync_state(state)
 
 async def _scheduled_sync_loop():
-    """Default-off (sync_enabled checkbox) - checks every 15min; does real work only inside the configured window."""
     while True:
         try:
             settings = cfg.get_group("general").load()
-            if settings.get("sync_enabled") and _in_window(settings.get("sync_window", "")): await _run_sync_pass()
+            if settings.get("sync_enabled") and _in_window(settings.get("sync_window", "")):
+                conn, sources = AIM.connections.get_conn(settings.get("sync_conn_id", ""), conn_type="lightrag") if settings.get("sync_conn_id") else None, _load_sourcesets().get(settings.get("sync_sourceset", ""))
+                if conn and sources: await _run_sync_pass(conn, sources)
+                else: print("[kimi] scheduled sync skipped - set Sync Knowledge Group and Sync Source Set in Kimi settings")
         except Exception as e: print(f"[kimi] sync loop error: {e}")
         await asyncio.sleep(900)
 
