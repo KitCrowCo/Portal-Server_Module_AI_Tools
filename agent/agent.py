@@ -7,7 +7,7 @@ The form is the agent_loop node's own settings, so a field added to the node app
 Runs that share a toolset (or, without one, a chat connection) share one engine lane, so they execute one at a time in submission order.
 Data at data/ai_tools/agent/ (one small JSON record per run; the job record holds everything else).
 """
-import re, json, uuid, copy, traceback
+import re, json, uuid, copy, asyncio, traceback
 from datetime import datetime
 from pathlib import Path
 from fastapi import APIRouter, Request
@@ -18,8 +18,9 @@ router = APIRouter(redirect_slashes=False)
 DATA_DIR = Path("./data/ai_tools/agent")
 _OLD_DATA_DIR = Path("./data/ai_tools/code_agent")   # where run records lived while this was the Code Agent; moved once at startup
 _LIVE = ("queued", "running", "stopping")
+_WATCHERS = set()   # background report tasks; held here because the event loop keeps only weak references to tasks
 ENV = {}
-UI = IM = BI = AIM = AL = _FIELDS = None
+UI = IM = BI = AIM = AL = MN = _FIELDS = None
 
 # --- Run records ---
 
@@ -52,7 +53,8 @@ def _refreshing(f):
 def _build_fields():
     F = BI.SettingField
     return BI.SettingsGroup("agent", "", [*(_refreshing(f) if f.name == "conn_id" else f for f in _node_fields()), F("base", "Branch From (ref)", "text", "", advanced=True, hint="Toolset connections with sessions (git branches) only. Blank = the node's BASE_REF (normally its current HEAD)."),
-        F("pipeline_id", "Pipeline", "select", "", options=_pipeline_opts, advanced=True, hint="Instead of the built-in node: a saved pipeline that gets the task as 'input' and produces the agent_loop keys.")], json_path="")
+        F("pipeline_id", "Pipeline", "select", "", options=_pipeline_opts, advanced=True, hint="Instead of the built-in node: a saved pipeline that gets the task as 'input' and produces the agent_loop keys."),
+        F("muninn_thread", "Muninn thread", "text", "", hint="When set, the run's outcome (status, task, summary) is added to this Muninn thread once the run finishes. Needs the Muninn tool.")], json_path="")
 
 def _flow(s: dict) -> dict:
     cfg = {f.name: s.get(f.name, f.default) for f in _node_fields()}
@@ -60,6 +62,29 @@ def _flow(s: dict) -> dict:
     return {"nodes": [{"id": "agent", "name": "Agent", "type": "agent_loop", "config": cfg, "key_map": {}, "status": "idle"}]}
 
 def _lane(s: dict) -> str: return f"""agent:{s.get("tools_conn_id") or s.get("conn_id") or "pool"}"""
+
+# --- Muninn (a run's outcome added to a thread, once) ---
+
+def _report(rid: str):
+    """Adds a settled run's outcome to its Muninn thread. Idempotent: the record keeps the capture's id, and it is re-read here so two callers cannot both add it."""
+    rec = _load(rid)
+    if not rec or not rec["settings"].get("muninn_thread") or rec.get("muninn_entry"): return
+    job = _job(rec)
+    if job["status"] in _LIVE: return
+    d = job.get("data", {})
+    err = next((f"""{n.get("name") or n["id"]}: {n.get("message", "")}""" for n in job["flow"]["nodes"] if n.get("status") == "error"), "")
+    text = f"""Agent run {job["status"]}{" - " + str(d["agent_status"]) if d.get("agent_status") else ""}, {d.get("steps", "?")} step(s): {rec["task"][:300]}\n\n{str(d.get("summary") or err or "(no summary)")[:4000]}"""
+    rec["muninn_entry"] = MN.capture(rec["username"], text, source="agent", author="agent", refs=[f"""agent:{rec["id"]}"""], threads=[rec["settings"]["muninn_thread"]], plain=True)["id"]
+    _save(rec)
+
+def _spawn(coro):
+    t = asyncio.create_task(coro)
+    _WATCHERS.add(t); t.add_done_callback(_WATCHERS.discard)
+
+async def _report_when_settled(rid: str):
+    """Waits for the run in the background (it may sit queued behind other runs for hours), then reports it. Runs cut off by a restart are reported by the startup sweep in init_tool."""
+    while (rec := _load(rid)) and _job(rec)["status"] in _LIVE: await asyncio.sleep(15)
+    if rec: _report(rid)
 
 # --- HTML ---
 
@@ -137,6 +162,7 @@ def _result_html(rec: dict, job: dict, v: dict) -> str:
                  <div class="status-label">Merging is yours: on the repo host, <span class="ca-mono">git diff HEAD...{branch}</span> then <span class="ca-mono">git merge {branch}</span>.</div>""" if branch and not rec.get("discarded") else ("""<div class="status-label">Branch discarded.</div>""" if branch else "")
     err_html = f"""<div class="err-box">{UI.escape(err)}</div>""" if err else ""
     space = f"""<span>space <b class="ca-mono">{UI.escape(data["space"])}</b></span>""" if data.get("space") else ""
+    space += f"""<span class="status-label">added to Muninn #{UI.escape(rec["settings"]["muninn_thread"])}</span>""" if rec.get("muninn_entry") else ""
     summary = f"""<div class="glass ca-summary">{UI.escape(str(data["summary"]))}</div>""" if data.get("summary") else ""
     return f"""<div class="info-bar">{_status_badge(status)} <span>{UI.escape(str(data.get("agent_status", "")))}</span><span>{data.get("steps", "?")} step(s)</span>{space}<button class="ui-btn" {_post("again", rid=rec["id"])} title="Queue this task again with the same settings, as a new run">&#x21BB; Run again</button><button class="ui-btn" {_post("edit", rid=rec["id"])} title="Open this run's task and settings in the form, to change them before queueing a new run">&#x270E; Edit &amp; run</button>{_view_controls(rec["id"], v)}</div>
                {err_html}{summary}
@@ -189,11 +215,13 @@ async def _submit(request, imr, task: str, s: dict, again_of: str = ""):
     """Queues one run of task with settings s and opens it. again_of names the run this one repeats."""
     username = request.state.user.username
     if s.get("files_root") and request.state.user.role != "admin": return imr.oob('<div class="err-box">Only an admin can give the agent a Files folder.</div>', "ca-form-msg")
+    if s.get("muninn_thread") and not MN: return imr.oob('<div class="err-box">A Muninn thread is set but the Muninn tool is not installed - clear the field or install tools/muninn.</div>', "ca-form-msg")
     kind, extra = ("id", {"pipeline_id": s["pipeline_id"]}) if s.get("pipeline_id") else ("inline", {"inline_flow": _flow(s)})
     job_id, err = AIM.engine.submit(username, kind=kind, inputs={"input": task}, lane=_lane(s), **extra)
     if err: return imr.oob(f"""<div class="err-box">{UI.escape(err)}</div>""", "ca-main")
     rec = {"id": f"car_{uuid.uuid4().hex[:8]}", "username": username, "task": task, "job_id": job_id, "settings": s, "created": datetime.utcnow().isoformat(), **({"again_of": again_of} if again_of else {})}
     _save(rec)
+    if s.get("muninn_thread"): _spawn(_report_when_settled(rec["id"]))
     await ENV["set_state"](request, rec["id"], scope="user", namespace="agent", key="open_rid")
     imr.oob(_run_html(rec, await _view(request)), "ca-main")
     return imr.oob(_list_html(username, rec["id"]), "ca-list")
@@ -230,7 +258,9 @@ async def _h_status(request, payload, imr):
     rec = _owned(request, payload.get("rid", ""))
     if not rec: return imr
     job, v = _job(rec), await _view(request)
-    if job["status"] not in _LIVE: imr.oob(_result_html(rec, job, v), "ca-result"); return imr.oob(_list_html(request.state.user.username, rec["id"]), "ca-list")
+    if job["status"] not in _LIVE:
+        _report(rec["id"])
+        imr.oob(_result_html(_load(rec["id"]), job, v), "ca-result"); return imr.oob(_list_html(request.state.user.username, rec["id"]), "ca-list")
     msgs, seen = _messages(job), int(payload.get("seen") or 0)
     if len(msgs) > seen: imr.oob(_rows(msgs, v["detail"], seen) if seen else _rows(msgs, v["detail"]), "ca-tx", swap="beforeend" if seen else "innerHTML")
     return imr.oob(_live_bar(rec, job, v, len(msgs)), "ca-live-bar")
@@ -297,15 +327,18 @@ async def _h_session_close(request, payload, imr):
 # --- Init / route ---
 
 def init_tool(env: dict, prefix: str):
-    global ENV, UI, IM, BI, AIM, AL, _FIELDS
+    global ENV, UI, IM, BI, AIM, AL, MN, _FIELDS
     ENV = env
     UI = env["templates"].env.globals.get("UI")
     BI = env["tools"]["built_ins"]
     AIM = env["tools"]["ai_manager"]
+    MN = env["tools"].get("muninn")   # optional: without it the Muninn thread field is refused at queue time
     from tools.ai_manager import agent_loop as AL   # the node's own module: its review store for Files folders
     if _OLD_DATA_DIR.is_dir() and not DATA_DIR.exists(): _OLD_DATA_DIR.rename(DATA_DIR)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     _FIELDS = _build_fields()
+    if MN:   # runs that finished (or were cut off) while the server was down: report them now
+        for f in DATA_DIR.glob("*.json"): _report(f.stem)
     IM = env["InterfaceManager"](nesting_level=2, db_path="agent_im.db")
     IM.scripts.update({f"agent_{k}": [fn] for k, fn in {"home": _h_home, "queue": _h_queue, "open": _h_open, "status": _h_status, "stop": _h_stop, "diff": _h_diff, "discard": _h_discard, "sessions": _h_sessions, "session_close": _h_session_close, "form_refresh": _h_form_refresh, "shadow": _h_shadow, "view": _h_view, "delete": _h_delete, "again": _h_again, "edit": _h_edit}.items()})
     print("[agent] ready")
