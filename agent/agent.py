@@ -86,6 +86,52 @@ async def _report_when_settled(rid: str):
     while (rec := _load(rid)) and _job(rec)["status"] in _LIVE: await asyncio.sleep(15)
     if rec: _report(rid)
 
+# --- Runs for any caller (the form, and other tools through the "agent" service) ---
+
+def submit_run(username: str, task: str, settings: dict, again_of: str = "", origin: str = "") -> dict:
+    """Queues one run and returns its record. settings are the form's values (missing ones take the form's defaults); origin names a tool that queued it (shown with the run). Raises RuntimeError when it cannot be queued."""
+    s = {**{f.name: f.default for f in _FIELDS.fields}, **settings}
+    if s.get("muninn_thread") and not MN: raise RuntimeError("a Muninn thread is set but the Muninn tool is not installed - clear the field or install tools/muninn")
+    kind, extra = ("id", {"pipeline_id": s["pipeline_id"]}) if s.get("pipeline_id") else ("inline", {"inline_flow": _flow(s)})
+    job_id, err = AIM.engine.submit(username, kind=kind, inputs={"input": task}, lane=_lane(s), **extra)
+    if err: raise RuntimeError(err)
+    rec = {"id": f"car_{uuid.uuid4().hex[:8]}", "username": username, "task": task, "job_id": job_id, "settings": s, "created": datetime.utcnow().isoformat(), **({"again_of": again_of} if again_of else {}), **({"origin": origin} if origin else {})}
+    _save(rec)
+    if s.get("muninn_thread"): _spawn(_report_when_settled(rec["id"]))
+    return rec
+
+def run_status(rid: str) -> dict:
+    """{"status", "summary", "task", "created"} of a run; None once it was deleted."""
+    rec = _load(rid)
+    if not rec: return None
+    job = _job(rec)
+    return {"status": job["status"], "summary": str(job.get("data", {}).get("summary", "")), "task": rec["task"], "created": rec["created"]}
+
+def last_settings(username: str) -> dict:
+    """The settings of the newest run username queued from the form themselves; None when there is none."""
+    return next((r["settings"] for r in _runs(username) if not r.get("origin")), None)
+
+def settings_summary(s: dict) -> str:
+    """One line: model and what the agent can reach with these settings."""
+    reach = [x for x in (s.get("space") and f"""space {s["space"]}""", s.get("files_root") and f"""files {s["files_root"]}""", s.get("knowledge_conn_id") and f"""knowledge {s["knowledge_conn_id"]}""", s.get("tools_conn_id") and f"""toolset {s["tools_conn_id"]}""", s.get("pipeline_tool_tag") and f"""pipelines tagged {s["pipeline_tool_tag"]}""") if x]
+    return f"""{s.get("conn_id") or "first chat connection"} / {s.get("model") or "auto"} - {", ".join(reach) or "no tools beyond finish"}{" - read-only" if s.get("read_only") else ""}"""
+
+# --- Command: "@agent <task>" in a Muninn capture queues a run with the settings of your last run; the outcome comes back to the capture's thread ---
+
+_CMD_HELP = "@agent <task> - queues an Agent run with the settings of your last run in Agent; the outcome comes back to the capture's #thread (or #agent-runs)"
+
+async def _cmd_parse(request, text: str, ctx: dict) -> dict:
+    s, thread = last_settings(request.state.user.username), (ctx.get("threads") or ["agent-runs"])[0]
+    if not text.strip(): return {"error": "write the task after @agent"}
+    if not s: return {"error": "queue one run in Agent first - @agent uses the settings of your last run there"}
+    return {"summary": f"Queue an agent run: {settings_summary(s)}; the outcome goes to #{thread}", "args": {"task": text.strip(), "thread": thread}}
+
+async def _cmd_run(request, args: dict) -> str:
+    user = request.state.user.username
+    try: rec = submit_run(user, args["task"], {**last_settings(user), "muninn_thread": args["thread"]}, origin="muninn")
+    except RuntimeError as e: raise ValueError(str(e))
+    return f"""queued agent run {rec["id"]} (see Agent) - the outcome comes back to #{args["thread"]}"""
+
 # --- HTML ---
 
 def _post(action: str, **extra) -> str: return f"""hx-post="/im/in" hx-target="body" hx-swap="none" hx-vals='{json.dumps({"type": f"agent_{action}", "lvl": 2, **extra})}'"""
@@ -98,7 +144,7 @@ def _run_row(r: dict, active: str) -> str:
     delete = "" if status in _LIVE else f"""<button class="cm-qbtn" {_post("delete", rid=r["id"])} hx-confirm="Delete this run and its job record? Changes it proposed stay in their folder's review list." onclick="event.stopPropagation()">&#x2715;</button>"""
     return f"""<div class="side-list-item{" active" if r["id"] == active else ""}" {_post("open", rid=r["id"])}>
                    <div style="display:flex;align-items:center;gap:.2rem;width:100%"><span class="side-list-item-title" style="flex:1">{title}</span><span class="side-list-actions">{delete}</span></div>
-                   <div class="status-label">{_status_badge(status)} {r["created"][:16].replace("T", " ")}</div>
+                   <div class="status-label">{_status_badge(status)} {r["created"][:16].replace("T", " ")}{" &#xB7; by " + UI.escape(r["origin"]) if r.get("origin") else ""}</div>
                </div>"""
 
 def _list_html(username: str, active: str = "") -> str: return f"""<div class="list-panel-hd"><span class="list-panel-title">Runs</span><button class="btn-icon" {_post("home")} title="New task">+</button></div>{"".join(_run_row(r, active) for r in _runs(username)) or '<div class="list-empty">No runs yet.</div>'}"""
@@ -177,7 +223,8 @@ def _staged_html(rec: dict, data: dict) -> str:
 def _run_html(rec: dict, v: dict) -> str:
     job = _job(rec)
     live = f"""<div class="status-label">Model output as it is written</div><pre class="log-box ca-pre ca-live" data-stream-job="{rec["job_id"]}" data-stream-node="agent"></pre>""" if job["status"] in _LIVE else ""
-    return f"""<div class="ca-run"><div class="ca-task">{UI.escape(rec["task"])}</div>{live}<div id="ca-result">{_result_html(rec, job, v)}</div></div>"""
+    origin = f"""<div class="status-label">Queued by {UI.escape(rec["origin"])}</div>""" if rec.get("origin") else ""
+    return f"""<div class="ca-run">{origin}<div class="ca-task">{UI.escape(rec["task"])}</div>{live}<div id="ca-result">{_result_html(rec, job, v)}</div></div>"""
 
 def _close_btn(conn_id: str, s: dict) -> str: return f"""<button class="ui-btn" {_post("session_close", conn_id=conn_id, session=s["id"])} hx-confirm="Commit what is in this worktree to its branch and remove the worktree? Only do this when no run is still using it - a running agent would fail on its next step.">Close &amp; commit</button>""" if s["status"] == "open" else ""
 
@@ -212,16 +259,10 @@ async def _h_queue(request, payload, imr):
         return imr.oob(f"""<span class="err-box">Not queued - {UI.escape(type(e).__name__)}: {UI.escape(str(e))}</span>""", "ca-form-msg")
 
 async def _submit(request, imr, task: str, s: dict, again_of: str = ""):
-    """Queues one run of task with settings s and opens it. again_of names the run this one repeats."""
+    """Queues one run of task with settings s from this page and opens it. again_of names the run this one repeats. Errors raise (the caller shows them)."""
     username = request.state.user.username
-    if s.get("files_root") and request.state.user.role != "admin": return imr.oob('<div class="err-box">Only an admin can give the agent a Files folder.</div>', "ca-form-msg")
-    if s.get("muninn_thread") and not MN: return imr.oob('<div class="err-box">A Muninn thread is set but the Muninn tool is not installed - clear the field or install tools/muninn.</div>', "ca-form-msg")
-    kind, extra = ("id", {"pipeline_id": s["pipeline_id"]}) if s.get("pipeline_id") else ("inline", {"inline_flow": _flow(s)})
-    job_id, err = AIM.engine.submit(username, kind=kind, inputs={"input": task}, lane=_lane(s), **extra)
-    if err: return imr.oob(f"""<div class="err-box">{UI.escape(err)}</div>""", "ca-main")
-    rec = {"id": f"car_{uuid.uuid4().hex[:8]}", "username": username, "task": task, "job_id": job_id, "settings": s, "created": datetime.utcnow().isoformat(), **({"again_of": again_of} if again_of else {})}
-    _save(rec)
-    if s.get("muninn_thread"): _spawn(_report_when_settled(rec["id"]))
+    if s.get("files_root") and request.state.user.role != "admin": raise RuntimeError("only an admin can give the agent a Files folder")
+    rec = submit_run(username, task, s, again_of=again_of)
     await ENV["set_state"](request, rec["id"], scope="user", namespace="agent", key="open_rid")
     imr.oob(_run_html(rec, await _view(request)), "ca-main")
     return imr.oob(_list_html(username, rec["id"]), "ca-list")
@@ -229,7 +270,9 @@ async def _submit(request, imr, task: str, s: dict, again_of: str = ""):
 async def _h_again(request, payload, imr):
     """Runs a finished run's task again with the same settings, as a new run - e.g. after the model server died mid-run. The earlier run and anything it proposed stay as they are."""
     rec = _owned(request, payload.get("rid", ""))
-    return await _submit(request, imr, rec["task"], rec["settings"], again_of=rec["id"]) if rec and _job(rec)["status"] not in _LIVE else imr
+    if not rec or _job(rec)["status"] in _LIVE: return imr
+    try: return await _submit(request, imr, rec["task"], rec["settings"], again_of=rec["id"])
+    except RuntimeError as e: return imr.oob(f"""<div class="err-box">Not queued - {UI.escape(str(e))}</div>""", "ca-diff")
 
 async def _h_edit(request, payload, imr):
     """A run's task and settings loaded into the form, to change before queueing - the new run records which run it came from."""
@@ -339,6 +382,7 @@ def init_tool(env: dict, prefix: str):
     _FIELDS = _build_fields()
     if MN:   # runs that finished (or were cut off) while the server was down: report them now
         for f in DATA_DIR.glob("*.json"): _report(f.stem)
+    env["register_service"]("agent", {"submit_run": submit_run, "run_status": run_status, "last_settings": last_settings, "settings_summary": settings_summary, "command": {"help": _CMD_HELP, "parse": _cmd_parse, "run": _cmd_run}})
     IM = env["InterfaceManager"](nesting_level=2, db_path="agent_im.db")
     IM.scripts.update({f"agent_{k}": [fn] for k, fn in {"home": _h_home, "queue": _h_queue, "open": _h_open, "status": _h_status, "stop": _h_stop, "diff": _h_diff, "discard": _h_discard, "sessions": _h_sessions, "session_close": _h_session_close, "form_refresh": _h_form_refresh, "shadow": _h_shadow, "view": _h_view, "delete": _h_delete, "again": _h_again, "edit": _h_edit}.items()})
     print("[agent] ready")

@@ -42,6 +42,9 @@ def _esc(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">",
 
 # --- Init ---
 
+_OFFLOAD = [("none", "None (fastest, most VRAM)"), ("vae_cpu", "VAE CPU offload (~1 GB freed)"), ("sequential", "Sequential block offload (slowest, max VRAM - overnight renders)")]
+def _offload_opts(cur: str) -> str: return "".join(f"""<option value="{v}"{" selected" if v == cur else ""}>{l}</option>""" for v, l in _OFFLOAD)
+
 def _conn_options(values=None): return [("", "(none)")] + [(c["_id"], f'{c.get("display_name", c["_id"])} [{c.get("connection_type","?")}]') for c in AIM.connections.list_conns(get_all=True)]
 def _video_conn_options(values=None): return [("", "(the Image Generation Connection)")] + [(c["_id"], f"""{c.get("display_name", c["_id"])} [{c.get("connection_type", "?")}]""") for c in AIM.connections.list_conns(get_all=True) if any(AIM.connections.has_capability(c, k) for k in ("text_to_video", "image_to_video", "start_end_to_video"))]
 
@@ -65,7 +68,7 @@ def init_tool(env: dict, prefix: str):
         BI.SettingField("lora_dir", "LoRA Directory (local path)", "text", str(DATA_DIR / "models/loras"), hint="Full path on THIS container — for dropdown scanning"),
         BI.SettingField("max_sequence_length", "Max Sequence Length", "number", 1024, hint="Tokens; 512–2048. Longer needs more VRAM on encoder node."),
         BI.SettingField("vae_tiling", "VAE Tiling", "checkbox", True),
-        BI.SettingField("offload_mode", "Memory Offload Mode", "select", "none", options=[("none", "None (fastest, most VRAM)"), ("vae_cpu", "VAE CPU Offload (~1 GB freed, slower)")]),
+        BI.SettingField("offload_mode", "Memory Offload Mode", "select", "none", options=_OFFLOAD, hint="The default; Generate and Inpaint can each choose their own."),
     ], json_path=str(DATA_DIR / "settings.json"))])
     IM = env["InterfaceManager"](nesting_level=2, db_path="ai_tools/image_im.db")
     TM = BI.TabManager(namespace="image", tab_bar_id="img-tab-bar", content_id="img-panel", render_content_fn=_render_panel, intent_prefix="image", IM=IM, scope="user", nesting_level=2, allow_new=False, closable=False,
@@ -91,15 +94,14 @@ def init_tool(env: dict, prefix: str):
     async def _im_select_mask(request, payload, imr):
         rel = payload.get("path", "")
         await _ui_state(request, {"selected_mask": rel})
-        imr.oob(f'<input id="img-mask-path" type="hidden" name="mask_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-mask-path", swap="outerHTML")
+        imr.raw(_mask_input(rel, oob=True))
         imr.oob(f'<span id="img-mask-status" style="font-size:.7rem;color:var(--text_muted);flex:1">&#x2713; Using saved mask: {_esc(rel)}</span>', "img-mask-status")
         return imr
 
     async def _im_select_reference(request, payload, imr):
         rel = payload.get("path", "")
-        imr.oob(f'<input id="img-ref-path" type="hidden" name="reference_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-ref-path", swap="outerHTML")
-        imr.oob(f'<span id="img-ref-status" style="font-size:.6rem;color:var(--text_muted)">Reference: {_esc(rel)}</span>', "img-ref-status", swap="outerHTML")
-        return imr
+        imr.raw(_ref_input(rel, oob=True))
+        return imr.oob(f"""Reference: {_esc(rel)}""", "img-ref-status")
 
     async def _im_save_mask(request, payload, imr):
         mask_data = payload.get("mask_data", "")
@@ -122,9 +124,9 @@ def init_tool(env: dict, prefix: str):
             traceback.print_exc()
             imr.oob(f'<span style="color:#ff5f5f">Save failed: {_esc(str(e)[:80])}</span>', "img-mask-status")
             return imr
-        imr.oob(f'<span style="color:#00ffa2">&#x2713; Saved {_esc(fname)}</span>', "img-mask-status")
-        imr.oob(f'<input id="img-mask-path" type="hidden" value="{_esc(rel_path)}">', "img-mask-path", swap="outerHTML")
-        return imr
+        await _ui_state(request, {"selected_mask": rel_path})
+        imr.oob(f"""<span style="color:#00ffa2">&#x2713; Saved and using {_esc(fname)}</span>""", "img-mask-status")
+        return imr.raw(_mask_input(rel_path, oob=True))
 
     for _intent in ("open", "focus", "close"): IM.scripts[f"image_{_intent}_tab"] = [_wrap_tab_action(getattr(TM, f"_{_intent}"))]
     IM.scripts["image_select_reference"] = [_im_select_reference]
@@ -151,28 +153,21 @@ async def _load_tabs(request) -> dict:
     return state
 
 async def _pick_base_image(request, payload, imr):
+    """The picked base image: its path into the form, and onto the canvas. Scripts only run inside swapped elements (these intents answer with swap none), so the loader rides in the hint."""
     rel = payload.get("path", "")
-    fm = _fm()
-    imr.oob(f'<input type="hidden" id="img-base-path" value="{_esc(rel)}"><input type="hidden" name="image_path" id="img-base-path-mirror" form="img-inpaint-form" value="{_esc(rel)}">', "img-base-path-mirror", swap="outerHTML")
-    imr.oob(f'<div style="font-size:.7rem;color:var(--accent)">{_esc(rel)}</div>', "img-inpaint-base-hint", swap="outerHTML")
-    imr.raw(f'<script>imgLoadBaseCanvas({json.dumps(_data_uri(rel, fm))})</script>')
-    return imr
+    imr.raw(f"""<input type="hidden" id="img-base-path" value="{_esc(rel)}" hx-swap-oob="true"><input type="hidden" name="image_path" id="img-base-path-mirror" form="img-inpaint-form" value="{_esc(rel)}" hx-swap-oob="true">""")
+    return imr.oob(f"""<div style="font-size:.7rem;color:var(--accent)">{_esc(rel)}</div><script>imgLoadBaseCanvas({json.dumps(_u("full", rel))})</script>""", "img-inpaint-base-hint")
 
 async def _pick_mask_image(request, payload, imr):
     rel = payload.get("path", "")
-    fm = _fm()
     await _ui_state(request, {"selected_mask": rel})
-    imr.oob(f'<input type="hidden" id="img-mask-path" name="mask_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-mask-path", swap="outerHTML")
-    imr.oob(f'<span style="font-size:.7rem;color:var(--accent)">&#x2713; Using saved mask: {_esc(rel)}</span>', "img-mask-status", swap="outerHTML")
-    imr.raw(f'<script>imgLoadMaskCanvas({json.dumps(_data_uri(rel, fm))})</script>')
-    return imr
+    imr.raw(_mask_input(rel, oob=True))
+    return imr.oob(f"""<span style="color:var(--accent)">&#x2713; Using saved mask: {_esc(rel)}</span><script>imgLoadMaskCanvas({json.dumps(_u("full", rel))})</script>""", "img-mask-status")
 
 async def _pick_reference_image(request, payload, imr):
     rel = payload.get("path", "")
-    fm = _fm()
-    imr.oob(f'<input type="hidden" id="img-ref-path" name="reference_path" form="img-inpaint-form" value="{_esc(rel)}">', "img-ref-path", swap="outerHTML")
-    imr.oob(f"""<div style="display:flex;align-items:center;gap:.3rem;font-size:.6rem;color:var(--text_muted)"><img src="{thumb_data_uri(fm, rel)}" style="width:2rem;height:2rem;object-fit:cover;border-radius:.2rem"> {_esc(rel)}</div>""", "img-ref-status", swap="outerHTML")
-    return imr
+    imr.raw(_ref_input(rel, oob=True))
+    return imr.oob(f"""<div style="display:flex;align-items:center;gap:.3rem"><img src="{thumb_data_uri(_fm(), rel)}" style="width:2rem;height:2rem;object-fit:cover;border-radius:.2rem"> {_esc(rel)}</div>""", "img-ref-status")
 
 def _ensure_worker():
     global _WORKER_TASK
@@ -361,8 +356,7 @@ def _generate_form_html(form, prompts, selected_prompt_id, system_status, image_
     loras = form.get("loras", [])
     lora_rows = "".join(_lora_row_html(i, (loras[i] or {}).get("path", "") if i < len(loras) else "", (loras[i] or {}).get("scale", 1.0) if i < len(loras) else 1.0) for i in range(3))
     cfg = _cfg()
-    offload_now = cfg.get("offload_mode", "none")
-    offload_opts = "".join(f'<option value="{v}" {"selected" if v==offload_now else ""}>{l}</option>' for v, l in [("none", "None (fastest, most VRAM)"), ("vae_cpu", "VAE CPU offload (~1 GB freed)"), ("sequential", "Sequential block offload (slowest, max VRAM — overnight renders)")])
+    offload_opts = _offload_opts(form.get("offload_mode") or cfg.get("offload_mode", "none"))   # the person's last choice, else the settings default
     no_conn_html = ('<div style="font-size:.7rem;color:#ffaa44">&#x26A0; No image-gen connection — set one in Settings.</div>' if system_status.get("_no_conn") else "")
     active_loras = system_status.get("active_loras", [])
     lora_active = (f'<div style="font-size:.7rem;color:#ffcc00">Active LoRAs: {", ".join(active_loras)}</div>' if active_loras else "")
@@ -483,9 +477,21 @@ def _inpaint_panel_html(prompts, selected_prompt_id):
                     </div>
                 </div>""")
 
-def _bottom_toolbar_inpaint_html(prompts, selected_prompt_id, selected_mask=""):
+def _mask_input(rel: str, oob: bool = False) -> str:
+    """The mask the next Inpaint uses. data-src lets the canvas show it again when a base image loads, so what is drawn is always what is sent. oob: replaces the one on the page."""
+    return f"""<input type="hidden" id="img-mask-path" name="mask_path" form="img-inpaint-form" value="{_esc(rel)}" data-src="{_esc(_u("full", rel)) if rel else ""}"{' hx-swap-oob="true"' if oob else ""}>"""
+
+def _ref_input(rel: str, oob: bool = False) -> str: return f"""<input type="hidden" id="img-ref-path" name="reference_path" form="img-inpaint-form" value="{_esc(rel)}"{' hx-swap-oob="true"' if oob else ""}>"""
+
+def _carried_html(form: dict) -> str:
+    """What Inpaint takes from the last Generate submit (its own bar sets steps, strength and offload; the size follows the base image)."""
+    loras = ", ".join(Path(l.get("path", "")).stem for l in form.get("loras", []) if l and l.get("path")) or "none"
+    return f"""<span class="status-label" title="Change these on the Generate tab">From Generate: model {_esc(form.get("model") or "(settings default)")}, cfg {form.get("cfg", 1.0)}, shift {form.get("shift", 1.0)}, seed {form.get("seed", -1)}, LoRAs {_esc(loras)}, prefix {_esc(form.get("output_prefix", "img"))}</span>"""
+
+def _bottom_toolbar_inpaint_html(prompts, selected_prompt_id, selected_mask="", form=None):
+    form = form or _default_form()
     p_opts = "".join(f'<option value="{p["id"]}" {"selected" if p["id"]==selected_prompt_id else ""}>{_esc(p["title"])} {"&#x2713;" if p["status"]=="ready" else ""}</option>' for p in prompts)
-    mask_status = f"&#x2713; Using saved mask: {_esc(selected_mask)}" if selected_mask else "No mask saved yet — draw then Save Mask, or pick a saved one above."
+    mask_status = f"&#x2713; Using saved mask: {_esc(selected_mask)}" if selected_mask else "No mask yet - draw one (it is saved when you queue), or pick a saved one below."
     return f"""<div style="display:flex;flex-direction:column;gap:.05rem;padding:.05rem .2rem">
                    <input type="hidden" id="img-base-path" value="">
                    <div style="display:flex;gap:.05rem;flex-wrap:wrap;align-items:center">
@@ -493,26 +499,26 @@ def _bottom_toolbar_inpaint_html(prompts, selected_prompt_id, selected_mask=""):
                        <label style="font-size:.7rem;color:var(--text_muted);display:flex;align-items:center;gap:.05rem">Brush<input type="range" min="5" max="200" value="40" oninput="ImgMask.setBrush(this.value)" style="width:5rem"></label>
                        <input type="number" id="img-inpaint-strength" name="strength" form="img-inpaint-form" value="1" step="0.05" min="0.05" max="1" class="module-select" style="width:3.5rem" title="Strength">
                        <input type="number" id="img-inpaint-steps" name="steps" form="img-inpaint-form" value="20" min="4" max="50" class="module-select" style="width:3.5rem" title="Steps (inpaint needs more than txt2img)">
+                       <select name="offload_mode" form="img-inpaint-form" class="module-select" style="font-size:.7rem;width:auto" title="Memory offload for this inpaint">{_offload_opts(form.get("offload_mode") or _cfg().get("offload_mode", "none"))}</select>
                        <button type="button" class="cm-qbtn" onclick="ImgMask.clear()">Clear</button>
                        <button type="button" class="ui-btn" style="flex-shrink:0" onclick="imgSaveMask('{IM.branch_id}')">&#x1F4BE; Save Mask</button>
                        <form id="img-inpaint-form" hx-post="{_u("inpaint/submit")}" hx-target="#img-inpaint-status" style="display:flex;gap:.05rem;align-items:center">
                            <input type="hidden" name="image_path" id="img-base-path-mirror" form="img-inpaint-form" value="">
-                           <input type="hidden" name="mask_path" id="img-mask-path" form="img-inpaint-form" value="">
+                           {_mask_input(selected_mask)}
                            <button type="button" class="button" onclick="imgQueueInpaint('{IM.branch_id}')">&#x25B6; Queue Inpaint</button>
                        </form>
                    </div>
-                   <div id="img-mask-debug" style="font-size:.65rem;color:var(--text_muted);font-family:var(--font-mono)">save-mask: idle (never clicked)</div>
+                   <div class="row"><span id="img-mask-status" style="font-size:.7rem;color:var(--text_muted)">{mask_status}</span><span id="img-mask-debug" style="font-size:.65rem;color:var(--text_muted);font-family:var(--font-mono)"></span></div>
+                   <div>{_carried_html(form)}</div>
                    <details style="border-top:var(--border-thick) solid var(--border);padding-top:.3rem">
                        <summary style="cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none">Or use a previously saved mask</summary>
                        <div style="max-height:20rem;overflow-y:auto">{_mask_picker.render_shell(include_css=False)}</div>
                    </details>
                    <details style="border-top:var(--border-thick) solid var(--border);padding-top:.3rem">
-                       <summary style="cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none">Reference image (optional)</summary>
-                       {mask_status}
+                       <summary style="cursor:pointer;font-size:.7rem;color:var(--text_muted);list-style:none">Reference image (optional)</summary>{_ref_input("")}<div id="img-ref-status" style="font-size:.6rem;color:var(--text_muted)">No reference image.</div>
                        <div style="max-height:20rem;overflow-y:auto">{_ref_picker.render_shell(include_css=False)}</div>
                    </details>
                    <div id="img-inpaint-status" style="font-size:.7rem;color:var(--text_muted);width:100%"></div>
-                   <span id="img-mask-status" style="font-size:.7rem;color:var(--text_muted);flex:1">No mask saved yet — draw then Save Mask, or pick a saved one above.</span>
                </div>"""
 
 def _data_uri(rel: str, fm) -> str:
@@ -533,11 +539,12 @@ async def inpaint_submit(request: Request):
     prompt_id = f.get("prompt_id", "")
     strength = float(f.get("strength", 0.75) or 0.75)
     if not image_path: return HTMLResponse('<span style="color:#ff5f5f">Select a base image first</span>')
-    if not mask_path: return HTMLResponse('<span style="color:#ff5f5f">Save a mask first (draw then click &#x1F4BE; Save Mask)</span>')
+    if not mask_path: return HTMLResponse('<span style="color:#ff5f5f">Draw a mask first (or pick a saved one)</span>')
     prompt = _load("prompt", prompt_id)
     if not prompt or prompt["status"] != "ready": return HTMLResponse('<span style="color:#ff5f5f">Select a ready (encoded) prompt</span>')
-    form = dict((await _ui_state(request))["form"])
+    form = dict((await _ui_state(request))["form"])   # model, cfg, shift, seed, LoRAs, prefix: the last Generate submit
     form["steps"] = int(f.get("steps", 20) or 20)
+    form["offload_mode"] = f.get("offload_mode") or form.get("offload_mode") or _cfg().get("offload_mode", "none")
     try:
         with PILImage.open(_output_dir() / image_path) as im:
             iw, ih = im.size
@@ -799,7 +806,7 @@ async def settings_save(request: Request):
 # --- Bottom toolbar ---
 
 async def _bottom_toolbar_html(request, active: str, prompts, selected_prompt_id, selected_mask):
-    if active == "inpaint": return _bottom_toolbar_inpaint_html(prompts, selected_prompt_id, selected_mask)
+    if active == "inpaint": return _bottom_toolbar_inpaint_html(prompts, selected_prompt_id, selected_mask, (await _ui_state(request))["form"])
     if active == "generate":
         seq = await ENV["get_state"](request, scope="user", namespace="image_sequence") or {}
         return _bottom_toolbar_generate_html(seq)
@@ -910,16 +917,16 @@ CSS = """
 """
 
 SCRIPT = """
-const ImgMask = (() => {
-    let canvas, ctx, drawing = false, brush = 40;
+window.ImgMask = window.ImgMask || (() => {   /* once per page: this script can be inserted again when the panel is shown in a second tab */
+    let canvas, ctx, drawing = false, brush = 40, dirty = false;   /* dirty: drawn on (or cleared) since the mask in use was saved or loaded */
     function init(c) {
         canvas = c; ctx = c.getContext('2d');
         ctx.strokeStyle = 'white'; ctx.lineWidth = brush;
         ctx.lineCap = 'round'; ctx.lineJoin = 'round';
-        canvas.onmousedown = e => { drawing = true; ctx.beginPath(); move(e); };
+        canvas.onmousedown = e => { drawing = true; dirty = true; ctx.beginPath(); move(e); };
         canvas.onmousemove = e => { if (!drawing) return; const p = pos(e); ctx.lineTo(p.x,p.y); ctx.stroke(); ctx.beginPath(); ctx.moveTo(p.x,p.y); };
         canvas.onmouseup = canvas.onmouseleave = () => drawing = false;
-        canvas.ontouchstart = e => { e.preventDefault(); drawing = true; ctx.beginPath(); move(e.touches[0]); };
+        canvas.ontouchstart = e => { e.preventDefault(); drawing = true; dirty = true; ctx.beginPath(); move(e.touches[0]); };
         canvas.ontouchmove = e => { e.preventDefault(); if (!drawing) return; const p = tpos(e); ctx.lineTo(p.x,p.y); ctx.stroke(); ctx.beginPath(); ctx.moveTo(p.x,p.y); };
         canvas.ontouchend = () => drawing = false;
     }
@@ -927,8 +934,8 @@ const ImgMask = (() => {
     function pos(e)  { const r = canvas.getBoundingClientRect(); return {x:(e.clientX-r.left)*canvas.width/r.width,y:(e.clientY-r.top)*canvas.height/r.height}; }
     function tpos(e) { return pos(e.touches[0]); }
     function setBrush(sz) { brush = parseInt(sz); if(ctx) ctx.lineWidth = brush; }
-    function clear() { if(ctx) ctx.clearRect(0,0,canvas.width,canvas.height); }
-    return {init, setBrush, clear};
+    function clear() { if(ctx) ctx.clearRect(0,0,canvas.width,canvas.height); dirty = true; var mp = document.getElementById('img-mask-path'); if (mp) mp.value = ''; }
+    return {init, setBrush, clear, isDirty: () => dirty, setClean: () => { dirty = false; }};
 })();
 
 function imgLoadBaseCanvas(dataUri) {
@@ -943,7 +950,9 @@ function imgLoadBaseCanvas(dataUri) {
         baseC.style.height = maskC.style.height = 'auto';
         baseC.getContext('2d').drawImage(img, 0, 0);
         maskC.getContext('2d').clearRect(0, 0, maskC.width, maskC.height);
-        ImgMask.init(maskC);
+        ImgMask.init(maskC); ImgMask.setClean();
+        var mp = document.getElementById('img-mask-path');
+        if (mp && mp.value && mp.dataset.src) imgLoadMaskCanvas(mp.dataset.src);   /* the mask in use shows on the new base image (Clear removes it) */
     };
     img.src = dataUri;
 }
@@ -956,6 +965,7 @@ function imgLoadMaskCanvas(dataUri) {
         var mctx = mc.getContext('2d');
         mctx.clearRect(0, 0, mc.width, mc.height);
         mctx.drawImage(img, 0, 0, mc.width, mc.height);
+        ImgMask.setClean();
     };
     img.src = dataUri;
 }
@@ -984,19 +994,19 @@ function imgSaveMask(branchId) {
         } catch (e) { setDbg('FAILED - canvas extraction threw: ' + e.message, '#ff5f5f'); reject(e); return; }
         const basePath = document.getElementById('img-base-path').value || 'mask';
         htmx.ajax('POST', '/im/in', { values: { type: 'image_save_mask', branch: branchId, lvl: 2, mask_data: dataUrl, base_name: basePath }, swap: 'none' })
-            .then(function(){ setDbg('saved', '#00ffa2'); resolve(); })
+            .then(function(){ setDbg('saved', '#00ffa2'); ImgMask.setClean(); resolve(); })
             .catch(function(e){ setDbg('FAILED - request rejected: ' + e, '#ff5f5f'); reject(e); });
     });
 }
 
 function imgQueueInpaint(branchId) {
-    const maskPathInput = document.getElementById('img-mask-path');
+    /* What is on the mask canvas is what gets used: a drawing changed since the mask in use was saved or loaded is saved first (it becomes the mask in use). */
     const mc = document.getElementById('img-mask-canvas');
     const form = document.getElementById('img-inpaint-form');
-    if (!maskPathInput.value && mc && mc.width && !imgCanvasIsBlank(mc)) {
-        imgSaveMask(branchId).then(function(){ htmx.trigger(form, 'submit'); });
+    if (ImgMask.isDirty() && mc && mc.width && !imgCanvasIsBlank(mc)) {
+        imgSaveMask(branchId).then(function(){ htmx.trigger(document.getElementById('img-inpaint-form'), 'submit'); });
     } else {
         htmx.trigger(form, 'submit');
     }
 }
-""" + f'const _IMG_BASE = "{_u()}";'
+""" + f"""var _IMG_BASE = "{_u()}";"""   # var: the script may be inserted again (a second tab), and const cannot be declared twice
