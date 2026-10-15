@@ -270,7 +270,7 @@ async def _h_shadow_action(request, payload, imr):
     if action == "diff":
         imr.oob(f'<pre style="white-space:pre-wrap;margin:0">{_esc(shadow.diff(path))}</pre>', payload.get("diff_target",""))
         return imr
-    if action == "accept": shadow.accept(path)
+    if action == "accept": shadow.accept(path, force=payload.get("force") == "1")   # a stale change (the file changed since) needs the review list's "Accept anyway"
     elif action == "reject": shadow.reject(path)
     imr.oob(BI.shadow_review_html(shadow, "tessa_shadow_action", {"scope": scope}, list_id=f"shadow-list-{scope}"), f"shadow-list-{scope}", swap="innerHTML")
     return imr

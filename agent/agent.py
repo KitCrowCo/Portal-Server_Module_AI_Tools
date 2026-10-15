@@ -88,14 +88,14 @@ async def _report_when_settled(rid: str):
 
 # --- Runs for any caller (the form, and other tools through the "agent" service) ---
 
-def submit_run(username: str, task: str, settings: dict, again_of: str = "", origin: str = "") -> dict:
-    """Queues one run and returns its record. settings are the form's values (missing ones take the form's defaults); origin names a tool that queued it (shown with the run). Raises RuntimeError when it cannot be queued."""
+def submit_run(username: str, task: str, settings: dict, again_of: str = "", origin: str = "", label: str = "") -> dict:
+    """Queues one run and returns its record. settings are the form's values (missing ones take the form's defaults); origin names a tool that queued it (shown with the run); label is shown instead of the task's first words. Raises RuntimeError when it cannot be queued."""
     s = {**{f.name: f.default for f in _FIELDS.fields}, **settings}
     if s.get("muninn_thread") and not MN: raise RuntimeError("a Muninn thread is set but the Muninn tool is not installed - clear the field or install tools/muninn")
     kind, extra = ("id", {"pipeline_id": s["pipeline_id"]}) if s.get("pipeline_id") else ("inline", {"inline_flow": _flow(s)})
     job_id, err = AIM.engine.submit(username, kind=kind, inputs={"input": task}, lane=_lane(s), **extra)
     if err: raise RuntimeError(err)
-    rec = {"id": f"car_{uuid.uuid4().hex[:8]}", "username": username, "task": task, "job_id": job_id, "settings": s, "created": datetime.utcnow().isoformat(), **({"again_of": again_of} if again_of else {}), **({"origin": origin} if origin else {})}
+    rec = {"id": f"car_{uuid.uuid4().hex[:8]}", "username": username, "task": task, "job_id": job_id, "settings": s, "created": datetime.utcnow().isoformat(), **({"again_of": again_of} if again_of else {}), **({"origin": origin} if origin else {}), **({"label": label} if label else {})}
     _save(rec)
     if s.get("muninn_thread"): _spawn(_report_when_settled(rec["id"]))
     return rec
@@ -115,6 +115,68 @@ def settings_summary(s: dict) -> str:
     """One line: model and what the agent can reach with these settings."""
     reach = [x for x in (s.get("space") and f"""space {s["space"]}""", s.get("files_root") and f"""files {s["files_root"]}""", s.get("knowledge_conn_id") and f"""knowledge {s["knowledge_conn_id"]}""", s.get("tools_conn_id") and f"""toolset {s["tools_conn_id"]}""", s.get("pipeline_tool_tag") and f"""pipelines tagged {s["pipeline_tool_tag"]}""") if x]
     return f"""{s.get("conn_id") or "first chat connection"} / {s.get("model") or "auto"} - {", ".join(reach) or "no tools beyond finish"}{" - read-only" if s.get("read_only") else ""}"""
+
+# --- Projects: a goal worked through by a chain of runs - the first plans (plan.md, notes.md in the project's own space), each next run does one unchecked step and records it (log.md) ---
+# Every run is a normal run in the list. The runs share one Files author, so each builds on the changes the earlier ones proposed; all of them wait in the folder's review store until a person accepts them.
+# A project runs on the terms it was started with: it stops at its run budget, pauses after two runs in a row that changed nothing in plan.md, and after a server restart waits for Resume.
+
+_PLAN_TASK = """Project goal:
+{goal}
+
+This is the project's first run: plan it and change nothing yet.
+1. Find where the goal touches the code: search_code, find_symbol, references, file_map, read_symbol. Read only what you need.
+2. Write notes.md in your space: the files, functions, intents and conventions that matter (with paths and line numbers), and anything risky.
+3. Write plan.md in your space: a checklist, one step per line, each "- [ ] " followed by one change small enough to make and check in one run (one function, or one small new file), naming the file and the function. Order the steps so each builds on the ones before.
+4. Call finish with a short summary of the plan."""
+
+_STEP_TASK = """Project goal:
+{goal}
+
+You are continuing this project. Earlier runs left plan.md, notes.md and log.md in your space - read them first.
+Do the first unchecked step of plan.md, and only that step:
+1. Look at the code it touches (read_symbol, references, file_map). The code map shows the files as they are on disk; read_file and read_symbol show this project's pending changes, which earlier steps proposed and you build on.
+2. Make the change with propose_edit (propose_file for a new file).
+3. Check it: check_files, and references for anything you renamed or whose arguments changed.
+4. Update your space: mark the step "- [x]" in plan.md, add one line to log.md (what changed, where, how you checked it), and add to notes.md what later steps need to know.
+If the step is wrong, too large or already done, rewrite plan.md instead (split, correct or check off steps) and say why in log.md.
+Then call finish."""
+
+_PDIR = DATA_DIR / "projects"
+_PROJECT_TASKS = {}   # pid -> its running loop task
+
+def _pp(pid): return _PDIR / f"{Path(pid).name}.json"
+def _pload(pid): return json.loads(_pp(pid).read_text()) if pid and _pp(pid).exists() else None
+def _psave(p): _pp(p["id"]).write_text(json.dumps(p, indent=2))
+def _projects(username): return sorted((p for p in (json.loads(f.read_text()) for f in _PDIR.glob("*.json")) if p.get("username") == username), key=lambda p: p["created"], reverse=True)
+def _pset(pid, **kw): p = _pload(pid); p.update(kw); _psave(p); return p
+def _space_file(p: dict, name: str) -> str: f = AL.SPACES_DIR / f"""project-{p["id"]}""" / name; return f.read_text(errors="replace") if f.is_file() else ""
+def _open_steps(plan: str) -> int: return len(re.findall(r"(?m)^\s*[-*]\s*\[ \]", plan))
+
+def _project_run_settings(p: dict, planning: bool) -> dict:
+    """A step's settings: the project's own, its space and Files author; the planning run may not propose changes, and step runs with a Files folder must pass check_files before finishing."""
+    s = {**p["settings"], "space": f"""project-{p["id"]}""", "author": p["id"], "read_only": False}
+    if planning: s["deny_tools"] = ",".join(x for x in [s.get("deny_tools", ""), "propose_edit,propose_file"] if x)
+    elif s.get("files_root") and not s.get("check_tool"): s["check_tool"] = "check_files"
+    return s
+
+async def _project_loop(pid: str):
+    while (p := _pload(pid)) and p["status"] == "running":
+        if len(p["runs"]) >= int(p["max_runs"]): _pset(pid, status="paused", message=f"""Run budget reached ({p["max_runs"]} runs). Raise it and Resume to go on."""); break
+        plan = _space_file(p, "plan.md")
+        try: rec = submit_run(p["username"], (_STEP_TASK if plan.strip() else _PLAN_TASK).format(goal=p["goal"]), _project_run_settings(p, not plan.strip()), origin=f"""project: {p["title"]}""", label=f"""{p["title"]}: {f"step {plan.count('[x]') + 1}" if plan.strip() else "plan"}""")
+        except RuntimeError as e: _pset(pid, status="paused", message=f"Could not queue the next run: {e}"); break
+        p["runs"].append(rec["id"]); p["message"] = f"""Run {len(p["runs"])} {"(planning)" if not plan.strip() else ""} queued."""; _psave(p)
+        while _job(rec)["status"] in _LIVE: await asyncio.sleep(10)
+        job, p, after = _job(rec), _pload(pid), _space_file(_pload(pid), "plan.md")
+        if after.strip() and _open_steps(after) == 0: _pset(pid, status="done", message="Every step in plan.md is checked. Review the proposed changes below."); break
+        stalls = 0 if after != plan and job["status"] == "done" else p.get("stalls", 0) + 1
+        p = _pset(pid, stalls=stalls, message=f"""Last run: {job["status"]}{" - " + str(job.get("data", {}).get("agent_status", "")) if job.get("data") else ""}. {_open_steps(after)} step(s) open.""")
+        if stalls >= 2: _pset(pid, status="paused", message="Two runs in a row changed nothing in plan.md (or failed). Look at the last runs, adjust the goal or plan.md (in the project's space), then Resume."); break
+        if p["status"] == "running" and float(p.get("gap_min") or 0): await asyncio.sleep(float(p["gap_min"]) * 60)
+    _PROJECT_TASKS.pop(pid, None)
+
+def _start_loop(pid: str):
+    if pid not in _PROJECT_TASKS: _PROJECT_TASKS[pid] = asyncio.create_task(_project_loop(pid))   # held here: the event loop keeps only weak references to tasks
 
 # --- Command: "@agent <task>" in a Muninn capture queues a run with the settings of your last run; the outcome comes back to the capture's thread ---
 
@@ -140,14 +202,19 @@ def _status_badge(status: str) -> str: return f"""<span class="status-badge" sty
 
 def _run_row(r: dict, active: str) -> str:
     """One run in the list: opens on click; the delete button asks first. A run still working cannot be deleted (stop it first)."""
-    status, title = _job(r)["status"], UI.escape(r["task"][:70])
+    status, title = _job(r)["status"], UI.escape((r.get("label") or r["task"])[:70])
     delete = "" if status in _LIVE else f"""<button class="cm-qbtn" {_post("delete", rid=r["id"])} hx-confirm="Delete this run and its job record? Changes it proposed stay in their folder's review list." onclick="event.stopPropagation()">&#x2715;</button>"""
     return f"""<div class="side-list-item{" active" if r["id"] == active else ""}" {_post("open", rid=r["id"])}>
                    <div style="display:flex;align-items:center;gap:.2rem;width:100%"><span class="side-list-item-title" style="flex:1">{title}</span><span class="side-list-actions">{delete}</span></div>
                    <div class="status-label">{_status_badge(status)} {r["created"][:16].replace("T", " ")}{" &#xB7; by " + UI.escape(r["origin"]) if r.get("origin") else ""}</div>
                </div>"""
 
-def _list_html(username: str, active: str = "") -> str: return f"""<div class="list-panel-hd"><span class="list-panel-title">Runs</span><button class="btn-icon" {_post("home")} title="New task">+</button></div>{"".join(_run_row(r, active) for r in _runs(username)) or '<div class="list-empty">No runs yet.</div>'}"""
+def _project_row(p: dict, active: str) -> str:
+    return f"""<div class="side-list-item{" active" if p["id"] == active else ""}" {_post("project_open", pid=p["id"])}><span class="side-list-item-title">&#x1F5C2; {UI.escape(p["title"])}</span>
+                   <div class="status-label">{_status_badge(p["status"])} {len(p["runs"])} / {p["max_runs"]} runs</div></div>"""
+
+def _list_html(username: str, active: str = "") -> str: return f"""<div class="list-panel-hd"><span class="list-panel-title">Projects</span><button class="btn-icon" {_post("project_new")} title="New project: a goal worked through by a chain of runs">+</button></div>{"".join(_project_row(p, active) for p in _projects(username)) or '<div class="list-empty">No projects yet.</div>'}
+               <div class="list-panel-hd"><span class="list-panel-title">Runs</span><button class="btn-icon" {_post("home")} title="New task">+</button></div>{"".join(_run_row(r, active) for r in _runs(username) if not r.get("origin", "").startswith("project:")) or '<div class="list-empty">No runs yet.</div>'}"""   # a project's runs are listed in the project
 
 def _form_html(values: dict, task: str = "", again_of: str = "") -> str:
     """The task form; with again_of, prefilled from that run (Edit & run) and the new run records where it came from."""
@@ -157,6 +224,39 @@ def _form_html(values: dict, task: str = "", again_of: str = "") -> str:
                    <div id="ca-fields">{_FIELDS.render(values, name_prefix="ca_")}</div><span id="ca-form-msg"></span>
                    <div class="form-actions"><button type="submit" class="ui-btn">Queue</button><button type="button" class="ui-btn" {_post("sessions")} hx-include="closest form">Workspace sessions</button></div>
                </form>"""
+
+def _project_form_html(values: dict) -> str:
+    return f"""<form {_post("project_start")} hx-include="this" class="node-form glass" style="padding:.6rem">
+                   <span class="form-title">New project</span>
+                   <div class="status-label">A goal too large for one run. The first run studies the code and writes a plan (plan.md, notes.md in the project's own space); each next run does one step, checks it and records it, building on the changes the earlier runs proposed. Nothing is applied until you accept it in the review list. Set Files to the folder the work is in.</div>
+                   <input name="title" class="module-select" placeholder="Short title" required>
+                   <textarea name="goal" class="cm-input" rows="6" placeholder="The goal: what should be different when it is done, where (files, modules) if you know, and what must not change." required></textarea>
+                   <div class="row"><label class="status-label">Run budget <input type="number" name="max_runs" value="12" min="1" class="module-select" style="width:5rem"></label><label class="status-label">Minutes between runs <input type="number" name="gap_min" value="0" min="0" step="any" class="module-select" style="width:5rem" title="0 = one after another; more lets other work use the model in between"></label></div>
+                   <div id="ca-fields">{_FIELDS.render(values, name_prefix="ca_")}</div><span id="ca-form-msg"></span>
+                   <div class="form-actions"><button type="submit" class="ui-btn">Start project</button></div>
+               </form>"""
+
+def _space_box(p: dict, name: str, open_: bool = False) -> str:
+    text = _space_file(p, name)
+    return f"""<details class="sec"{" open" if open_ else ""}><summary>{name}{f" - {_open_steps(text)} open step(s)" if name == "plan.md" and text else ""}</summary><pre class="ca-pre log-box">{UI.escape(text) or "(not written yet)"}</pre></details>"""
+
+def _project_live_html(p: dict) -> str:
+    """Status, controls and the runs - redrawn every 10 seconds while the project runs."""
+    ctl = {"running": f"""<button class="ui-btn" {_post("project_ctl", pid=p["id"], op="pause")} title="The current run finishes, then the project waits">&#x23F8; Pause</button>""",
+           "paused": f"""<form class="row" {_post("project_ctl", pid=p["id"], op="resume")} hx-include="this"><label class="status-label">budget <input type="number" name="max_runs" value="{p["max_runs"]}" min="1" class="module-select" style="width:4.5rem"></label><button class="ui-btn">&#x25B6; Resume</button></form>"""}.get(p["status"], "")
+    stop = f"""<button class="ui-btn" style="color:#ff5f5f" {_post("project_ctl", pid=p["id"], op="stop")} hx-confirm="Stop the project and its current run? Its proposed changes stay in the review list.">&#x25FC; Stop</button>""" if p["status"] in ("running", "paused") else ""
+    runs = "".join(_run_row(r, "") for r in (_load(rid) for rid in reversed(p["runs"])) if r)
+    poll = f"""<div {_post("project_live", pid=p["id"])} hx-trigger="load delay:10s"></div>""" if p["status"] == "running" else ""
+    return f"""<div class="info-bar">{_status_badge(p["status"])}<span>{len(p["runs"])} / {p["max_runs"]} runs</span><span>{UI.escape(p.get("message", ""))}</span>{ctl}{stop}</div>{poll}
+               <div class="status-label">Runs (newest first)</div>{runs or '<div class="list-empty">The first run is being queued.</div>'}"""
+
+def _project_html(p: dict) -> str:
+    last = next((r for r in (_load(rid) for rid in reversed(p["runs"])) if r), None)
+    review = f"""<div class="status-label">Proposed changes in <b class="ca-mono">{UI.escape(p["settings"]["files_root"])}</b> - this project's runs share the author agent:{p["id"]}. Accept or reject them here or from any of its runs.</div><div class="row"><button class="ui-btn" {_post("project_accept", pid=p["id"])} hx-confirm="Write every pending change of this project into the folder? Files that changed since a change was proposed are left for you to look at.">Accept all of this project's changes</button></div><div id="ca-shadow">{BI.shadow_review_html(AL.shadow_for(p["settings"]["files_root"]), "agent_shadow", {"rid": last["id"]}, list_id="ca-shadow")}</div>""" if p["settings"].get("files_root") and last else ""
+    return f"""<div class="ca-run"><div class="row"><span class="form-title grow">&#x1F5C2; {UI.escape(p["title"])}</span><span class="status-label">{settings_summary(p["settings"])}</span></div><div class="ca-task">{UI.escape(p["goal"])}</div>
+               <div id="ca-proj-live">{_project_live_html(p)}</div>
+               <div class="row"><span class="status-label grow">The project's space (project-{p["id"]}) - what the runs planned, did and learned</span><button class="ui-btn" {_post("project_open", pid=p["id"])}>&#x21BB; Reload</button></div>
+               {_space_box(p, "plan.md", True)}{_space_box(p, "log.md")}{_space_box(p, "notes.md")}<div id="ca-diff"></div>{review}</div>"""
 
 # --- Transcript (live while a run works, at a chosen level of detail) ---
 
@@ -267,6 +367,64 @@ async def _submit(request, imr, task: str, s: dict, again_of: str = ""):
     imr.oob(_run_html(rec, await _view(request)), "ca-main")
     return imr.oob(_list_html(username, rec["id"]), "ca-list")
 
+def _owned_project(request, pid): p = _pload(pid); return p if p and p["username"] == request.state.user.username else None
+
+async def _show_project(request, imr, p: dict):
+    await ENV["set_state"](request, f"""project:{p["id"]}""", scope="user", namespace="agent", key="open_rid")
+    imr.oob(_project_html(p), "ca-main")
+    return imr.oob(_list_html(request.state.user.username, p["id"]), "ca-list")
+
+async def _h_project_new(request, payload, imr): return imr.oob(_project_form_html(await _defaults(request)), "ca-main")
+
+async def _h_project_start(request, payload, imr):
+    goal, title = str(payload.get("goal", "")).strip(), str(payload.get("title", "")).strip()
+    if not goal or not title: return imr.oob('<span class="err-box">A title and a goal are needed.</span>', "ca-form-msg")
+    try:
+        s = _FIELDS.parse(payload, name_prefix="ca_")
+        if s.get("files_root") and request.state.user.role != "admin": raise RuntimeError("only an admin can give the agent a Files folder")
+    except Exception as e: return imr.oob(f"""<span class="err-box">Not started - {UI.escape(str(e))}</span>""", "ca-form-msg")
+    await ENV["set_state"](request, s, scope="user", namespace="agent", key="defaults")
+    p = {"id": f"prj_{uuid.uuid4().hex[:8]}", "username": request.state.user.username, "title": title, "goal": goal, "settings": s, "status": "running", "max_runs": max(1, int(payload.get("max_runs") or 12)), "gap_min": float(payload.get("gap_min") or 0), "runs": [], "stalls": 0, "message": "Starting.", "created": datetime.utcnow().isoformat()}
+    _psave(p)
+    _start_loop(p["id"])
+    return await _show_project(request, imr, p)
+
+async def _h_project_open(request, payload, imr):
+    p = _owned_project(request, payload.get("pid", ""))
+    return await _show_project(request, imr, p) if p else imr
+
+async def _h_project_live(request, payload, imr):
+    p = _owned_project(request, payload.get("pid", ""))
+    if not p: return imr
+    imr.oob(_list_html(request.state.user.username, p["id"]), "ca-list")
+    return imr.oob(_project_live_html(p), "ca-proj-live")
+
+async def _h_project_ctl(request, payload, imr):
+    """pause: the current run finishes, then the project waits; resume (optionally with a new budget); stop: the current run is stopped too."""
+    p, action = _owned_project(request, payload.get("pid", "")), payload.get("op", "")
+    if not p: return imr
+    if action == "pause" and p["status"] == "running": p = _pset(p["id"], status="paused", message="Paused - the current run finishes first.")
+    elif action == "resume" and p["status"] == "paused":
+        p = _pset(p["id"], status="running", stalls=0, max_runs=max(1, int(payload.get("max_runs") or p["max_runs"])), message="Resumed.")
+        _start_loop(p["id"])
+    elif action == "stop" and p["status"] in ("running", "paused"):
+        p = _pset(p["id"], status="stopped", message="Stopped.")
+        for r in (_load(rid) for rid in p["runs"]):
+            if r and _job(r)["status"] in _LIVE: AIM.engine.stop(r["job_id"])
+    return await _show_project(request, imr, p)
+
+async def _h_project_accept(request, payload, imr):
+    """Accepts every pending change this project's runs proposed (admin only). A change whose file was edited since it was proposed is left pending, for its own review."""
+    p = _owned_project(request, payload.get("pid", ""))
+    if not p or not p["settings"].get("files_root"): return imr
+    if request.state.user.role != "admin": return imr.oob('<div class="err-box">Only an admin can accept changes into the folder.</div>', "ca-diff")
+    sh = AL.shadow_for(p["settings"]["files_root"])
+    mine = [e["path"] for e in sh.pending() if e.get("author") == f"""agent:{p["id"]}"""]
+    done = [x for x in mine if sh.accept(x)]
+    left = [x for x in mine if x not in done]
+    p = _pset(p["id"], message=f"""Accepted {len(done)} change(s){"; left for review (the file changed since): " + ", ".join(left) if left else ""}.""")
+    return await _show_project(request, imr, p)
+
 async def _h_again(request, payload, imr):
     """Runs a finished run's task again with the same settings, as a new run - e.g. after the model server died mid-run. The earlier run and anything it proposed stay as they are."""
     rec = _owned(request, payload.get("rid", ""))
@@ -358,7 +516,7 @@ async def _h_shadow(request, payload, imr):
     shadow, action, path = AL.shadow_for(root), payload.get("action", ""), payload.get("path", "")
     if action == "diff": return imr.oob(f"""<pre class="ca-pre">{UI.escape(shadow.diff(path)) or "(no differences)"}</pre>""", payload.get("diff_target", ""))
     if action == "accept" and request.state.user.role != "admin": return imr.oob('<div class="err-box">Only an admin can accept changes into the folder.</div>', "ca-diff")
-    if action == "accept": shadow.accept(path)
+    if action == "accept" and not shadow.accept(path, force=payload.get("force") == "1"): imr.oob(f"""<div class="err-box">{UI.escape(path)} changed after the change was proposed - see its diff; Accept anyway replaces the newer file.</div>""", "ca-diff")
     elif action == "reject": shadow.reject(path)
     return imr.oob(BI.shadow_review_html(shadow, "agent_shadow", {"rid": rec["id"]}, list_id="ca-shadow"), "ca-shadow")
 
@@ -380,11 +538,15 @@ def init_tool(env: dict, prefix: str):
     if _OLD_DATA_DIR.is_dir() and not DATA_DIR.exists(): _OLD_DATA_DIR.rename(DATA_DIR)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     _FIELDS = _build_fields()
+    _PDIR.mkdir(parents=True, exist_ok=True)
+    for f in _PDIR.glob("*.json"):   # a restart is a point to re-confirm: running projects wait for Resume
+        p = json.loads(f.read_text())
+        if p["status"] == "running": _pset(p["id"], status="paused", message="The server restarted - press Resume to continue.")
     if MN:   # runs that finished (or were cut off) while the server was down: report them now
         for f in DATA_DIR.glob("*.json"): _report(f.stem)
     env["register_service"]("agent", {"submit_run": submit_run, "run_status": run_status, "last_settings": last_settings, "settings_summary": settings_summary, "command": {"help": _CMD_HELP, "parse": _cmd_parse, "run": _cmd_run}})
     IM = env["InterfaceManager"](nesting_level=2, db_path="agent_im.db")
-    IM.scripts.update({f"agent_{k}": [fn] for k, fn in {"home": _h_home, "queue": _h_queue, "open": _h_open, "status": _h_status, "stop": _h_stop, "diff": _h_diff, "discard": _h_discard, "sessions": _h_sessions, "session_close": _h_session_close, "form_refresh": _h_form_refresh, "shadow": _h_shadow, "view": _h_view, "delete": _h_delete, "again": _h_again, "edit": _h_edit}.items()})
+    IM.scripts.update({f"agent_{k}": [fn] for k, fn in {"home": _h_home, "queue": _h_queue, "open": _h_open, "status": _h_status, "stop": _h_stop, "diff": _h_diff, "discard": _h_discard, "sessions": _h_sessions, "session_close": _h_session_close, "form_refresh": _h_form_refresh, "shadow": _h_shadow, "view": _h_view, "delete": _h_delete, "again": _h_again, "edit": _h_edit, "project_new": _h_project_new, "project_start": _h_project_start, "project_open": _h_project_open, "project_live": _h_project_live, "project_ctl": _h_project_ctl, "project_accept": _h_project_accept}.items()})
     print("[agent] ready")
 
 @router.get("")
