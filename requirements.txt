@@ -1,0 +1,5 @@
+psutil
+openpyxl
+pandas
+huggingface_hub
+python-docx
