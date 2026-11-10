@@ -1,0 +1,295 @@
+{
+ "_about": "Outside reference points, each dated and sourced: API prices per million tokens (input, cached input, output) of named models, and Epoch Capabilities Index where Epoch lists the model. The Catalog tab's lookups (OpenRouter, Epoch) refresh these on request; re-check before publishing anything.",
+ "apis": {
+  "claude-opus-5.5": {
+   "label": "Claude Opus 5.5 (Anthropic)",
+   "in": 4.0,
+   "cached": 0.2,
+   "out": 20.0,
+   "eci": 168.8,
+   "tps": {
+    "est": [
+     40,
+     70,
+     120
+    ]
+   },
+   "date": "2026-11-06",
+   "src": "platform.claude.com/docs/en/about-claude/pricing, read 2026-11-06; ECI from tech-insider.org's Epoch listing, Oct 27"
+  },
+  "claude-sonnet-5.5": {
+   "label": "Claude Sonnet 5.5 (Anthropic)",
+   "in": 2.0,
+   "cached": 0.1,
+   "out": 10.0,
+   "eci": null,
+   "tps": {
+    "est": [
+     50,
+     90,
+     150
+    ]
+   },
+   "date": "2026-11-06",
+   "src": "platform.claude.com/docs/en/about-claude/pricing, read 2026-11-06"
+  },
+  "claude-haiku-5.5": {
+   "label": "Claude Haiku 5.5 (Anthropic, prompts up to 100K)",
+   "in": 0.1,
+   "cached": 0.01,
+   "out": 0.5,
+   "eci": null,
+   "tps": {
+    "est": [
+     80,
+     150,
+     250
+    ]
+   },
+   "date": "2026-11-06",
+   "src": "platform.claude.com/docs/en/about-claude/pricing, read 2026-11-06; over 100K tokens: 0.50 / 0.05 / 2.50"
+  },
+  "gpt-6-astra": {
+   "label": "GPT-6 Astra (OpenAI)",
+   "in": 10.0,
+   "cached": 1.0,
+   "out": 50.0,
+   "eci": null,
+   "tps": {
+    "est": [
+     30,
+     60,
+     100
+    ]
+   },
+   "date": "2026-09-22",
+   "src": "morphllm.com/llm-api (prices verified 2026-09-22 by that site; OpenAI's own page lists none publicly)"
+  },
+  "gpt-6-sol": {
+   "label": "GPT-6 Sol (OpenAI)",
+   "in": 2.0,
+   "cached": 0.2,
+   "out": 10.0,
+   "eci": null,
+   "tps": {
+    "est": [
+     50,
+     90,
+     150
+    ]
+   },
+   "date": "2026-09-22",
+   "src": "morphllm.com/llm-api (prices verified 2026-09-22 by that site; OpenAI's own page lists none publicly); higher above 272K input tokens"
+  },
+  "gpt-6-luna": {
+   "label": "GPT-6 Luna (OpenAI)",
+   "in": 0.1,
+   "cached": 0.01,
+   "out": 0.5,
+   "eci": null,
+   "tps": {
+    "est": [
+     80,
+     150,
+     250
+    ]
+   },
+   "date": "2026-09-22",
+   "src": "morphllm.com/llm-api (prices verified 2026-09-22 by that site; OpenAI's own page lists none publicly)"
+  },
+  "gemini-3.1-pro": {
+   "label": "Gemini 3.1 Pro preview (Google)",
+   "in": 2.0,
+   "cached": 0.2,
+   "out": 12.0,
+   "eci": null,
+   "tps": {
+    "est": [
+     50,
+     90,
+     150
+    ]
+   },
+   "date": "2026-11-06",
+   "src": "ai.google.dev/gemini-api/docs/pricing, read 2026-11-06 (standard prompts up to 200K); over 200K: 4.00 / 0.40 / 18.00; cache storage billed per hour"
+  },
+  "gemini-3.5-flash": {
+   "label": "Gemini 3.5 Flash (Google)",
+   "in": 1.5,
+   "cached": 0.15,
+   "out": 9.0,
+   "eci": null,
+   "tps": {
+    "est": [
+     80,
+     150,
+     250
+    ]
+   },
+   "date": "2026-11-06",
+   "src": "ai.google.dev/gemini-api/docs/pricing, read 2026-11-06 (standard prompts up to 200K)"
+  },
+  "gemini-3.1-flash-lite": {
+   "label": "Gemini 3.1 Flash-Lite (Google)",
+   "in": 0.25,
+   "cached": 0.025,
+   "out": 1.5,
+   "eci": null,
+   "tps": {
+    "est": [
+     100,
+     200,
+     300
+    ]
+   },
+   "date": "2026-11-06",
+   "src": "ai.google.dev/gemini-api/docs/pricing, read 2026-11-06 (standard prompts up to 200K)"
+  },
+  "kimi-k3": {
+   "label": "Kimi K3 (Moonshot)",
+   "in": 3.0,
+   "cached": 0.3,
+   "out": 15.0,
+   "eci": null,
+   "tps": {
+    "est": [
+     30,
+     60,
+     100
+    ]
+   },
+   "date": "2026-09-22",
+   "src": "morphllm.com/llm-api"
+  },
+  "qwen3.8-max": {
+   "label": "Qwen3.8 Max (Alibaba)",
+   "in": 2.0,
+   "cached": 0.2,
+   "out": 6.0,
+   "eci": null,
+   "tps": {
+    "est": [
+     30,
+     60,
+     100
+    ]
+   },
+   "date": "2026-09-22",
+   "src": "morphllm.com/llm-api; cached rate not listed, 10% of input assumed"
+  },
+  "deepseek-v4-pro-api": {
+   "label": "DeepSeek V4 Pro API (peak)",
+   "in": 1.32,
+   "cached": 0.132,
+   "out": 3.96,
+   "eci": null,
+   "tps": {
+    "est": [
+     30,
+     60,
+     100
+    ]
+   },
+   "date": "2026-09-22",
+   "src": "morphllm.com/llm-api; off-peak half; cached rate not listed, 10% of input assumed"
+  },
+  "qwen3.8-27b-deepinfra": {
+   "label": "Qwen3.8 27B on DeepInfra",
+   "model": "qwen3.8-27b",
+   "in": 0.15,
+   "cached": 0.015,
+   "out": 1.88,
+   "tps": {
+    "est": [
+     30,
+     60,
+     100
+    ]
+   },
+   "date": "2026-10-09",
+   "src": "amcompute.com DeepInfra listing"
+  },
+  "qwen3.8-27b-openrouter": {
+   "label": "Qwen3.8 27B on OpenRouter",
+   "model": "qwen3.8-27b",
+   "in": 0.4,
+   "cached": 0.05,
+   "out": 3.0,
+   "tps": {
+    "est": [
+     30,
+     60,
+     100
+    ]
+   },
+   "date": "2026-08-23",
+   "src": "pricepertoken.com"
+  },
+  "deepseek-v4.1-flash-api": {
+   "label": "DeepSeek V4.1 Flash API",
+   "model": "deepseek-v4.1-flash-1017",
+   "in": 0.14,
+   "cached": 0.014,
+   "out": 0.42,
+   "tps": {
+    "est": [
+     30,
+     60,
+     100
+    ]
+   },
+   "date": "2026-10-05",
+   "src": "andrew.ooo provider comparison"
+  },
+  "epoch-open-best-may": {
+   "label": "Best open weights, May 2026 (Kimi K2.5)",
+   "eci": 148.22,
+   "date": "2026-05-29",
+   "src": "Epoch AI data insight: open models trail closed by ~4 months / 8 ECI"
+  },
+  "epoch-closed-best-may": {
+   "label": "Best closed, May 2026 (GPT-5.5 high)",
+   "eci": 158.22,
+   "date": "2026-05-29",
+   "src": "Epoch AI data insight"
+  }
+ },
+ "economics": {
+  "default": {
+   "electricity_usd_kwh": {
+    "est": [
+     0.12,
+     0.15,
+     0.2
+    ],
+    "better": "low"
+   },
+   "life_months": {
+    "est": [
+     36,
+     48,
+     60
+    ]
+   },
+   "internet_usd_month": {
+    "est": [
+     60,
+     80,
+     120
+    ],
+    "better": "low"
+   },
+   "space_usd_month": 0,
+   "labor_usd_hour": 0,
+   "cooling_cop": {
+    "est": [
+     2.5,
+     3.0,
+     4.0
+    ],
+    "_cop": "heat pump moving the heat; 0 = no cooling counted"
+   },
+   "payment_fee": 0.03
+  }
+ }
+}

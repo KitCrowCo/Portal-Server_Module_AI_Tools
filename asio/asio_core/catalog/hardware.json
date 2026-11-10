@@ -1,0 +1,824 @@
+{
+ "_about": "Machines. Bandwidth theory = MT/s x bus bits / 8000 (computed when mem_bw_gbs is absent). est values are planning ranges to be replaced by measurements; src says where each came from. Prices are what Joshua paid or quoted (Nov 2026) unless a src says otherwise.",
+ "nodes": {
+  "minipc": {
+   "abstract": true,
+   "kind": "minipc",
+   "bus_bits": 128,
+   "os_reserve_gb": {
+    "est": [
+     2.0,
+     2.5,
+     3.5
+    ],
+    "better": "low",
+    "src": "Magpie budget default 2.5 GB"
+   },
+   "ssd": [
+    {
+     "gb": 1000,
+     "read_gbs": {
+      "theory": 5.0,
+      "est": [
+       2.5,
+       3.4,
+       4.5
+      ],
+      "src": "PCIe 4 NVMe on colibri's 16 MiB random-read pattern: PLAN_2026-11_ROUND0 estimate; fio B2 replaces it"
+     }
+    }
+   ],
+   "ssd_slots": 2,
+   "ports": {
+    "usb4": 2,
+    "eth_gbps": [
+     2.5
+    ],
+    "wifi": true
+   },
+   "power_w": {
+    "idle": {
+     "est": [
+      6,
+      9,
+      14
+     ],
+     "better": "low",
+     "src": "planning range; wall meter (B8) replaces it"
+    },
+    "load": {
+     "est": [
+      45,
+      60,
+      85
+     ],
+     "better": "low",
+     "src": "Dispersed AI plan: 60-100 W per node under load"
+    }
+   },
+   "throttle": {
+    "est": [
+     0.85,
+     0.95,
+     1.0
+    ],
+    "src": "sustained/peak; mini PC cooling varies"
+   },
+   "price_usd": {
+    "est": [
+     700,
+     800,
+     950
+    ],
+    "better": "low",
+    "src": "Joshua: ~$800 for a 780M / 32 GB / 1 TB mini PC, Nov 2026"
+   }
+  },
+  "ryzen5_760m": {
+   "abstract": true,
+   "extends": "minipc",
+   "cpu": {
+    "name": "Ryzen 5 7640HS class",
+    "cores": 6,
+    "ghz": 4.3,
+    "tflops": {
+     "theory": 1.3,
+     "est": [
+      0.3,
+      0.5,
+      0.8
+     ],
+     "src": "6 Zen4 cores AVX-512 fp32 peak; est is what llama.cpp CPU paths reach"
+    }
+   },
+   "gpu": {
+    "name": "Radeon 760M",
+    "arch": "gfx1103",
+    "cu": 8,
+    "tflops_fp16": {
+     "theory": 10.6,
+     "src": "8 CU x 64 x 2 FMA x 2.6 GHz x 2 (dual issue / packed fp16)"
+    }
+   },
+   "ram_gb": 16,
+   "mem_mts": 5600,
+   "ports": {
+    "usb4": 1,
+    "eth_gbps": [
+     2.5
+    ],
+    "wifi": true
+   }
+  },
+  "ryzen7_780m": {
+   "abstract": true,
+   "extends": "minipc",
+   "cpu": {
+    "name": "Ryzen 7 8745HS class",
+    "cores": 8,
+    "ghz": 4.9,
+    "tflops": {
+     "theory": 2.0,
+     "est": [
+      0.4,
+      0.7,
+      1.1
+     ],
+     "src": "8 Zen4 cores AVX-512 fp32 peak; est is what llama.cpp CPU paths reach"
+    }
+   },
+   "gpu": {
+    "name": "Radeon 780M",
+    "arch": "gfx1103",
+    "cu": 12,
+    "tflops_fp16": {
+     "theory": 16.6,
+     "src": "12 CU x 64 x 2 FMA x 2.7 GHz x 2"
+    }
+   },
+   "ram_gb": 32,
+   "mem_mts": 5600
+  },
+  "ryzen9_890m": {
+   "abstract": true,
+   "extends": "minipc",
+   "cpu": {
+    "name": "Ryzen AI 9 HX 370 class",
+    "cores": 12,
+    "ghz": 5.1,
+    "tflops": {
+     "theory": 3.0,
+     "est": [
+      0.6,
+      1.0,
+      1.6
+     ],
+     "src": "4 Zen5 + 8 Zen5c cores fp32 peak; est is what llama.cpp CPU paths reach"
+    }
+   },
+   "gpu": {
+    "name": "Radeon 890M",
+    "arch": "gfx1150",
+    "cu": 16,
+    "tflops_fp16": {
+     "theory": 23.8,
+     "src": "16 CU x 64 x 2 FMA x 2.9 GHz x 2"
+    }
+   },
+   "npu": {
+    "name": "XDNA2",
+    "tops_int8": 50
+   },
+   "ram_gb": 32,
+   "mem_mts": 5600,
+   "ssd_slots": 3
+  },
+  "minisforum_x1pro": {
+   "extends": "ryzen9_890m",
+   "owned": true,
+   "label": "Minisforum AI X1 Pro (Node 1)",
+   "ram_gb": 32,
+   "mem_mts": 5600,
+   "ports": {
+    "usb4": 2,
+    "eth_gbps": [
+     2.5,
+     2.5
+    ],
+    "wifi": true
+   },
+   "price_usd": {
+    "est": [
+     430,
+     450,
+     470
+    ],
+    "better": "low",
+    "src": "Joshua: it and three 32 GB nodes cost about $1,800 total (Prime Day)"
+   }
+  },
+  "getorli_h255": {
+   "extends": "ryzen7_780m",
+   "owned": true,
+   "label": "GETORLI H255 780M (Node 4)",
+   "ram_gb": 32,
+   "mem_mts": 4800,
+   "ports": {
+    "usb4": 2,
+    "eth_gbps": [
+     2.5
+    ],
+    "wifi": true,
+    "oculink": 1
+   },
+   "price_usd": {
+    "est": [
+     430,
+     450,
+     470
+    ],
+    "better": "low",
+    "src": "Joshua: about $1,800 for four nodes"
+   }
+  },
+  "geekom_ax8": {
+   "extends": "ryzen7_780m",
+   "owned": true,
+   "label": "GEEKOM AX8 Max (Node 2)",
+   "ram_gb": 16,
+   "bus_bits": 64,
+   "_bus": "one 16 GB stick: single channel",
+   "ports": {
+    "usb4": 2,
+    "eth_gbps": [
+     2.5
+    ],
+    "wifi": true
+   },
+   "ssd_slots": 1
+  },
+  "wowe_7640hs": {
+   "extends": "ryzen5_760m",
+   "owned": true,
+   "label": "WO-WE 7640HS 760M (Node 3)",
+   "ram_gb": 16,
+   "bus_bits": 64,
+   "ssd": [
+    {
+     "gb": 512,
+     "read_gbs": {
+      "theory": 5.0,
+      "est": [
+       2.0,
+       3.0,
+       4.0
+      ]
+     }
+    }
+   ],
+   "ssd_slots": 1
+  },
+  "rpi500plus_16": {
+   "kind": "sbc",
+   "label": "Raspberry Pi 500+ 16 GB, 256 GB SSD",
+   "cpu": {
+    "name": "Cortex-A76 x4 2.4 GHz",
+    "cores": 4,
+    "ghz": 2.4,
+    "tflops": {
+     "theory": 0.15,
+     "est": [
+      0.04,
+      0.07,
+      0.1
+     ]
+    }
+   },
+   "gpu": null,
+   "ram_gb": 16,
+   "mem_mts": 4267,
+   "bus_bits": 32,
+   "mem_eff_cpu": {
+    "measured": {
+     "values": [
+      0.47,
+      0.5,
+      0.52
+     ],
+     "src": "Pi 5 llama.cpp/Ollama: 1B Q4 11.5 t/s, 3B Q4 4.7 t/s (stratospherelinuxips docs) against 17 GB/s",
+     "date": "2026"
+    }
+   },
+   "os_reserve_gb": {
+    "est": [
+     1.0,
+     1.5,
+     2.0
+    ],
+    "better": "low"
+   },
+   "ssd": [
+    {
+     "gb": 256,
+     "read_gbs": {
+      "theory": 0.9,
+      "est": [
+       0.4,
+       0.7,
+       0.85
+      ]
+     }
+    }
+   ],
+   "ssd_slots": 1,
+   "ports": {
+    "usb4": 0,
+    "eth_gbps": [
+     1.0
+    ],
+    "wifi": true
+   },
+   "power_w": {
+    "idle": {
+     "est": [
+      2.5,
+      3.5,
+      5
+     ],
+     "better": "low"
+    },
+    "load": {
+     "est": [
+      8,
+      11,
+      15
+     ],
+     "better": "low"
+    }
+   },
+   "throttle": {
+    "est": [
+     0.8,
+     0.9,
+     1.0
+    ]
+   },
+   "price_usd": {
+    "est": [
+     180,
+     200,
+     230
+    ],
+    "better": "low"
+   },
+   "owned": true
+  },
+  "rpi5_8": {
+   "extends": "rpi500plus_16",
+   "label": "Raspberry Pi 5 8 GB",
+   "ram_gb": 8,
+   "ssd": [
+    {
+     "gb": 256,
+     "read_gbs": {
+      "est": [
+       0.3,
+       0.4,
+       0.8
+      ]
+     }
+    }
+   ],
+   "price_usd": {
+    "est": [
+     90,
+     100,
+     120
+    ],
+    "better": "low"
+   }
+  },
+  "rpi4_4": {
+   "kind": "sbc",
+   "label": "Raspberry Pi 4 4 GB",
+   "cpu": {
+    "name": "Cortex-A72 x4 1.8 GHz",
+    "cores": 4,
+    "ghz": 1.8,
+    "tflops": {
+     "theory": 0.06,
+     "est": [
+      0.015,
+      0.025,
+      0.04
+     ]
+    }
+   },
+   "gpu": null,
+   "ram_gb": 4,
+   "mem_mts": 3200,
+   "bus_bits": 32,
+   "mem_eff_cpu": {
+    "est": [
+     0.3,
+     0.4,
+     0.5
+    ]
+   },
+   "os_reserve_gb": {
+    "est": [
+     0.8,
+     1.0,
+     1.3
+    ],
+    "better": "low"
+   },
+   "ssd": [
+    {
+     "gb": 256,
+     "read_gbs": {
+      "est": [
+       0.2,
+       0.3,
+       0.35
+      ]
+     }
+    }
+   ],
+   "ssd_slots": 0,
+   "ports": {
+    "usb4": 0,
+    "eth_gbps": [
+     1.0
+    ],
+    "wifi": true
+   },
+   "power_w": {
+    "idle": {
+     "est": [
+      2.5,
+      3,
+      4
+     ],
+     "better": "low"
+    },
+    "load": {
+     "est": [
+      5,
+      6.5,
+      8
+     ],
+     "better": "low"
+    }
+   },
+   "throttle": {
+    "est": [
+     0.7,
+     0.85,
+     1.0
+    ]
+   },
+   "price_usd": {
+    "est": [
+     55,
+     60,
+     75
+    ],
+    "better": "low"
+   },
+   "owned": true
+  },
+  "phone_sd8g2_8": {
+   "kind": "phone",
+   "label": "Phone, Snapdragon 8 Gen 2, 8 GB (Z Flip 5 class)",
+   "cpu": {
+    "name": "1+4+3 Kryo",
+    "cores": 8,
+    "ghz": 3.2,
+    "tflops": {
+     "est": [
+      0.1,
+      0.2,
+      0.35
+     ]
+    }
+   },
+   "gpu": null,
+   "_gpu": "Adreno 740: no Vulkan path in llama.cpp worth counting yet",
+   "ram_gb": 8,
+   "mem_mts": 8533,
+   "bus_bits": 64,
+   "mem_eff_cpu": {
+    "est": [
+     0.2,
+     0.3,
+     0.45
+    ]
+   },
+   "os_reserve_gb": {
+    "est": [
+     3.0,
+     3.5,
+     4.5
+    ],
+    "better": "low",
+    "src": "Android keeps a large share"
+   },
+   "ssd": [
+    {
+     "gb": 128,
+     "read_gbs": {
+      "est": [
+       1.0,
+       1.5,
+       2.5
+      ]
+     }
+    }
+   ],
+   "ssd_slots": 0,
+   "ports": {
+    "usb4": 0,
+    "eth_gbps": [],
+    "wifi": true
+   },
+   "power_w": {
+    "idle": {
+     "est": [
+      0.8,
+      1.2,
+      2
+     ],
+     "better": "low"
+    },
+    "load": {
+     "est": [
+      4,
+      6,
+      9
+     ],
+     "better": "low"
+    }
+   },
+   "throttle": {
+    "est": [
+     0.5,
+     0.7,
+     0.9
+    ],
+    "src": "phones throttle hard under sustained load"
+   },
+   "price_usd": {
+    "est": [
+     0,
+     0,
+     0
+    ],
+    "src": "spare device"
+   },
+   "owned": true
+  },
+  "phone_12": {
+   "extends": "phone_sd8g2_8",
+   "label": "Phone, 12 GB (Z Flip 7 class)",
+   "ram_gb": 12,
+   "mem_mts": 9600,
+   "cpu": {
+    "name": "current flagship",
+    "cores": 8,
+    "ghz": 3.4,
+    "tflops": {
+     "est": [
+      0.15,
+      0.25,
+      0.4
+     ]
+    }
+   }
+  },
+  "rented_gpu": {
+   "abstract": true,
+   "kind": "rented_gpu",
+   "os_reserve_gb": {
+    "est": [
+     0.5,
+     1.0,
+     1.5
+    ],
+    "better": "low",
+    "src": "VRAM kept by the driver and runtime"
+   },
+   "cpu": {
+    "name": "host CPU share",
+    "cores": 8,
+    "tflops": {
+     "est": [
+      0.5,
+      1.0,
+      2.0
+     ]
+    }
+   },
+   "ssd": [
+    {
+     "gb": 200,
+     "read_gbs": {
+      "est": [
+       0.5,
+       1.5,
+       3.0
+      ],
+      "src": "rented disks vary; loading weights reads from here"
+     }
+    }
+   ],
+   "ports": {
+    "eth_gbps": [
+     1
+    ]
+   },
+   "power_w": {
+    "idle": 0,
+    "load": 0
+   },
+   "price_usd": 0,
+   "throttle": 1.0,
+   "_about": "A rented GPU machine as the pool sees it: its memory is the GPU's VRAM (weights and KV must fit there), its bandwidth the VRAM's. Its power and hardware are in the hourly price; nothing is counted for them here. Reaching it from home goes over the internet: put long transfers (expert streaming, pipeline splits) on machines on one site."
+  },
+  "rent_rtx4090": {
+   "extends": "rented_gpu",
+   "label": "RTX 4090 24 GB, rented",
+   "ram_gb": 24,
+   "mem_bw_gbs": {
+    "theory": 1008,
+    "src": "NVIDIA specification"
+   },
+   "gpu": {
+    "name": "RTX 4090 24 GB",
+    "vendor": "nvidia",
+    "tflops_fp16": {
+     "theory": 165,
+     "src": "NVIDIA specification, dense FP16 tensor"
+    }
+   },
+   "rented": {
+    "usd_per_h": {
+     "est": [
+      0.3,
+      0.38,
+      0.5
+     ],
+     "better": "low",
+     "src": "frenzycap.com/gpu-prices snapshot 2026-11-05 (on-demand, 9 providers; storage and egress extra)"
+    },
+    "start_s": {
+     "est": [
+      60,
+      180,
+      600
+     ],
+     "better": "low",
+     "src": "planning range: machine start plus loading the model from its disk"
+    },
+    "bill_s": 60,
+    "provider": "any on-demand GPU cloud"
+   }
+  },
+  "rent_rtx5090": {
+   "extends": "rented_gpu",
+   "label": "RTX 5090 32 GB, rented",
+   "ram_gb": 32,
+   "mem_bw_gbs": {
+    "theory": 1792,
+    "src": "NVIDIA specification"
+   },
+   "gpu": {
+    "name": "RTX 5090 32 GB",
+    "vendor": "nvidia",
+    "tflops_fp16": {
+     "theory": 209,
+     "src": "NVIDIA specification, dense FP16 tensor"
+    }
+   },
+   "rented": {
+    "usd_per_h": {
+     "est": [
+      0.5,
+      0.62,
+      0.75
+     ],
+     "better": "low",
+     "src": "frenzycap.com/gpu-prices snapshot 2026-11-05 (on-demand, 9 providers; storage and egress extra)"
+    },
+    "start_s": {
+     "est": [
+      60,
+      180,
+      600
+     ],
+     "better": "low",
+     "src": "planning range: machine start plus loading the model from its disk"
+    },
+    "bill_s": 60,
+    "provider": "any on-demand GPU cloud"
+   }
+  },
+  "rent_l40s": {
+   "extends": "rented_gpu",
+   "label": "L40S 48 GB, rented",
+   "ram_gb": 48,
+   "mem_bw_gbs": {
+    "theory": 864,
+    "src": "NVIDIA specification"
+   },
+   "gpu": {
+    "name": "L40S 48 GB",
+    "vendor": "nvidia",
+    "tflops_fp16": {
+     "theory": 362,
+     "src": "NVIDIA specification, dense FP16 tensor"
+    }
+   },
+   "rented": {
+    "usd_per_h": {
+     "est": [
+      0.6,
+      0.8,
+      1.9
+     ],
+     "better": "low",
+     "src": "frenzycap.com/gpu-prices snapshot 2026-11-05 (on-demand, 9 providers; storage and egress extra)"
+    },
+    "start_s": {
+     "est": [
+      60,
+      180,
+      600
+     ],
+     "better": "low",
+     "src": "planning range: machine start plus loading the model from its disk"
+    },
+    "bill_s": 60,
+    "provider": "any on-demand GPU cloud"
+   }
+  },
+  "rent_a100_80": {
+   "extends": "rented_gpu",
+   "label": "A100 80 GB, rented",
+   "ram_gb": 80,
+   "mem_bw_gbs": {
+    "theory": 2039,
+    "src": "NVIDIA specification"
+   },
+   "gpu": {
+    "name": "A100 80 GB",
+    "vendor": "nvidia",
+    "tflops_fp16": {
+     "theory": 312,
+     "src": "NVIDIA specification, dense FP16 tensor"
+    }
+   },
+   "rented": {
+    "usd_per_h": {
+     "est": [
+      0.9,
+      1.2,
+      2.3
+     ],
+     "better": "low",
+     "src": "frenzycap.com/gpu-prices snapshot 2026-11-05 (on-demand, 9 providers; storage and egress extra)"
+    },
+    "start_s": {
+     "est": [
+      60,
+      180,
+      600
+     ],
+     "better": "low",
+     "src": "planning range: machine start plus loading the model from its disk"
+    },
+    "bill_s": 60,
+    "provider": "any on-demand GPU cloud"
+   }
+  },
+  "rent_h100_80": {
+   "extends": "rented_gpu",
+   "label": "H100 80 GB SXM, rented",
+   "ram_gb": 80,
+   "mem_bw_gbs": {
+    "theory": 3350,
+    "src": "NVIDIA specification"
+   },
+   "gpu": {
+    "name": "H100 80 GB SXM",
+    "vendor": "nvidia",
+    "tflops_fp16": {
+     "theory": 989,
+     "src": "NVIDIA specification, dense FP16 tensor"
+    }
+   },
+   "rented": {
+    "usd_per_h": {
+     "est": [
+      2.0,
+      2.5,
+      4.9
+     ],
+     "better": "low",
+     "src": "frenzycap.com/gpu-prices snapshot 2026-11-05 (on-demand, 9 providers; storage and egress extra)"
+    },
+    "start_s": {
+     "est": [
+      60,
+      180,
+      600
+     ],
+     "better": "low",
+     "src": "planning range: machine start plus loading the model from its disk"
+    },
+    "bill_s": 60,
+    "provider": "any on-demand GPU cloud"
+   }
+  }
+ }
+}

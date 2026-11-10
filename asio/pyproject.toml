@@ -1,0 +1,17 @@
+[project]
+name = "asio-sim"
+version = "0.1.0"
+description = "Simulates AI work on a pool of machines: bottlenecks, spread, cost, goal seeking"
+license = {text = "PolyForm-Noncommercial-1.0.0"}
+requires-python = ">=3.10"
+dependencies = ["numpy", "athene-opt"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["asio_core"]
+
+[tool.setuptools.package-data]
+asio_core = ["catalog/*.json"]

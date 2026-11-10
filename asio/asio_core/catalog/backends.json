@@ -1,0 +1,306 @@
+{
+ "_about": "How a program uses a machine. mem_eff: share of memory bandwidth a decode step reaches; compute_eff: share of peak compute in prefill and batched steps; step_ms: fixed cost per step. device gpu reads gpu.tflops_fp16, cpu reads cpu.tflops. The 27B and Pi measurements calibrate these; everything else is a planning range.",
+ "backends": {
+  "llama_vulkan": {
+   "label": "llama.cpp, Vulkan, iGPU",
+   "device": "gpu",
+   "mem_eff": {
+    "est": [
+     0.6,
+     0.72,
+     0.8
+    ],
+    "group": "llama_vulkan_mem_eff",
+    "improve": [
+     1.0,
+     1.05,
+     1.15
+    ],
+    "src": "fits Joshua's 27B at 3-7 t/s with MTP on the GETORLI (32 GB DDR5-4800)"
+   },
+   "compute_eff": {
+    "est": [
+     0.15,
+     0.25,
+     0.4
+    ],
+    "group": "llama_vulkan_compute_eff",
+    "improve": [
+     1.0,
+     1.3,
+     2.0
+    ],
+    "src": "planning range: Vulkan prefill on RDNA3 iGPUs reaches a small share of peak"
+   },
+   "step_ms": {
+    "est": [
+     1.5,
+     3,
+     6
+    ],
+    "better": "low"
+   },
+   "load_eff": {
+    "est": [
+     0.5,
+     0.7,
+     0.9
+    ]
+   }
+  },
+  "llama_cpu": {
+   "label": "llama.cpp, CPU",
+   "device": "cpu",
+   "mem_eff": {
+    "est": [
+     0.45,
+     0.55,
+     0.7
+    ],
+    "group": "llama_cpu_mem_eff"
+   },
+   "compute_eff": {
+    "est": [
+     0.3,
+     0.5,
+     0.7
+    ]
+   },
+   "step_ms": {
+    "est": [
+     1,
+     2,
+     4
+    ],
+    "better": "low"
+   },
+   "load_eff": {
+    "est": [
+     0.5,
+     0.7,
+     0.9
+    ]
+   }
+  },
+  "colibri": {
+   "label": "colibri, MoE experts from SSD",
+   "device": "gpu",
+   "mem_eff": {
+    "est": [
+     0.5,
+     0.65,
+     0.75
+    ]
+   },
+   "compute_eff": {
+    "est": [
+     0.1,
+     0.2,
+     0.35
+    ]
+   },
+   "step_ms": {
+    "est": [
+     2,
+     5,
+     10
+    ],
+    "better": "low"
+   },
+   "ssd_overlap": {
+    "est": [
+     0.0,
+     0.3,
+     0.6
+    ],
+    "src": "share of expert reads hidden behind compute; batched O_DIRECT reads"
+   },
+   "token_overhead_ms": {
+    "est": [
+     20,
+     150,
+     1500
+    ],
+    "better": "low",
+    "src": "wide on purpose: colibri's V4.1 engine reported 0.21-0.24 t/s on a CPU server with 68% of experts in RAM, far below what bandwidth alone gives. Fleet's backlog data narrows it"
+   },
+   "load_eff": {
+    "est": [
+     0.6,
+     0.8,
+     0.95
+    ]
+   }
+  },
+  "diffusers_rocm": {
+   "label": "diffusers, PyTorch ROCm, iGPU",
+   "device": "gpu",
+   "mem_eff": {
+    "est": [
+     0.5,
+     0.65,
+     0.75
+    ]
+   },
+   "compute_eff": {
+    "est": [
+     0.15,
+     0.3,
+     0.45
+    ],
+    "src": "planning range for attention-heavy DiT steps on gfx1103/1150"
+   },
+   "step_ms": {
+    "est": [
+     20,
+     50,
+     120
+    ],
+    "better": "low"
+   },
+   "load_eff": {
+    "est": [
+     0.4,
+     0.6,
+     0.8
+    ]
+   }
+  },
+  "diffusers_cpu": {
+   "label": "diffusers, CPU",
+   "device": "cpu",
+   "mem_eff": {
+    "est": [
+     0.4,
+     0.5,
+     0.6
+    ]
+   },
+   "compute_eff": {
+    "est": [
+     0.2,
+     0.35,
+     0.5
+    ]
+   },
+   "step_ms": {
+    "est": [
+     50,
+     100,
+     200
+    ],
+    "better": "low"
+   },
+   "load_eff": {
+    "est": [
+     0.4,
+     0.6,
+     0.8
+    ]
+   }
+  },
+  "onnx_cpu": {
+   "label": "ONNX Runtime / CTranslate2, CPU",
+   "device": "cpu",
+   "mem_eff": {
+    "est": [
+     0.4,
+     0.5,
+     0.6
+    ]
+   },
+   "compute_eff": {
+    "est": [
+     0.3,
+     0.45,
+     0.6
+    ]
+   },
+   "step_ms": {
+    "est": [
+     1,
+     2,
+     5
+    ],
+    "better": "low"
+   },
+   "load_eff": {
+    "est": [
+     0.5,
+     0.7,
+     0.9
+    ]
+   }
+  },
+  "torch_rocm": {
+   "label": "PyTorch ROCm, iGPU",
+   "device": "gpu",
+   "mem_eff": {
+    "est": [
+     0.45,
+     0.6,
+     0.7
+    ]
+   },
+   "compute_eff": {
+    "est": [
+     0.15,
+     0.3,
+     0.45
+    ]
+   },
+   "step_ms": {
+    "est": [
+     5,
+     15,
+     40
+    ],
+    "better": "low"
+   },
+   "load_eff": {
+    "est": [
+     0.4,
+     0.6,
+     0.8
+    ]
+   }
+  },
+  "llama_cuda": {
+   "label": "llama.cpp, CUDA, discrete NVIDIA GPU",
+   "device": "gpu",
+   "mem_eff": {
+    "est": [
+     0.6,
+     0.72,
+     0.85
+    ],
+    "group": "llama_cuda_mem_eff",
+    "src": "planning range: llama.cpp decode on a discrete GPU reaches most of its VRAM bandwidth; measure on the machine you rent"
+   },
+   "compute_eff": {
+    "est": [
+     0.25,
+     0.4,
+     0.6
+    ],
+    "group": "llama_cuda_compute_eff",
+    "src": "planning range: CUDA prefill on tensor cores"
+   },
+   "step_ms": {
+    "est": [
+     0.3,
+     0.8,
+     2
+    ],
+    "better": "low"
+   },
+   "load_eff": {
+    "est": [
+     0.5,
+     0.75,
+     0.9
+    ]
+   }
+  }
+ }
+}
